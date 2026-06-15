@@ -703,7 +703,7 @@ async def on_ready() -> None:
 def main() -> None:
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv(override=True)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
