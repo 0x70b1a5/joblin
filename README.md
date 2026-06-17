@@ -21,6 +21,7 @@ family chores.
   | ⏩ | **Fast-forward / snooze** — 1h, then 2h, 4h, 8h… (doubles each press). |
   | ℹ️ | **Info** — replies with the full description. *(Only shown if the task has one.)* |
   | ❌ | **Skip** — skips just *this* occurrence of a recurring task (it returns next cycle); deletes a one-off. To remove a recurring task entirely, use `/deletetask`. |
+  | ↩️ | **Undo** — appears right after a ✅/⏩/❌ and reverses it: a completion is un-logged (so it leaves the leaderboard too), a snooze is rolled back, and a skip/delete is restored. Survives restarts; only the most recent action on an occurrence is undoable, and only until that chore next comes due. |
 - If nobody completes or snoozes within the hour, the bot **re-posts hourly**
   until the chore is done (optionally pinging a role).
 - Everything survives restarts: due times, pending occurrences, snooze timers,
@@ -93,6 +94,12 @@ farmtracker/
 - A recurring task holds **one** pending occurrence at a time; if it's still
   unresolved when the next cycle would start, the existing nag carries it and the
   schedule rolls forward (no double-posting, no backlog flood) once it's resolved.
+- **Undo** works by stashing a snapshot of the task as it was just before each
+  ✅/⏩/❌ (in a persisted `undo` table) and self-reacting ↩️ on the result; it's
+  guarded so a stale ↩️ can't clobber a newer occurrence, and undoing a ✅ also
+  voids that entry in the completion log. Only the latest action per occurrence
+  is undoable.
 - Reaction tidying (removing a clicker's ⏩/ℹ️ tap so it can be pressed again, and
-  clearing reactions on completed tasks) needs **Manage Messages**; without it the
-  bot still works, it just leaves reactions in place.
+  clearing reactions on completed/undone tasks) needs **Manage Messages**; without
+  it the bot still works (it can always remove its own ↩️), it just leaves other
+  reactions in place.

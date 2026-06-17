@@ -49,6 +49,7 @@ EMOJI_DONE = "✅"
 EMOJI_FFWD = "⏩"
 EMOJI_INFO = "ℹ️"
 EMOJI_DELETE = "❌"
+EMOJI_UNDO = "↩️"  # appears after a ✅/⏩/❌ action so it can be reverted
 
 
 def emoji_key(emoji: object) -> str:

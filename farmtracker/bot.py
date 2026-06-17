@@ -15,15 +15,28 @@ Lifecycle of a task occurrence
      ℹ️  info      -> reply with the long description.
      ❌  skip      -> recurring: skip just this occurrence; one-off: delete it.
                       (Deleting an entire recurring task is /deletetask.)
+     ↩️  undo      -> reverse the most recent ✅/⏩/❌ on that occurrence. The
+                      bot adds this button right after one of those actions.
 
 Everything is keyed off ``store["messages"][message_id] -> task_id`` so that
 reactions keep working across restarts, and the persisted ``remind_at`` means
 nags survive restarts too.
+
+Undo
+----
+Each of the three mutating actions stashes a deep copy of the task *as it was
+just before the action* into ``store["undo"][anchor_message_id]`` (plus the
+completion-log id for ✅) and self-reacts ↩️ on the message showing the result.
+Undo simply restores that snapshot — after first checking the occurrence hasn't
+moved on (``can_undo``), so we never clobber a newer occurrence — and voids the
+logged completion when reverting a ✅. Like the rest of the store it survives
+restarts, so the ↩️ button keeps working after a reboot.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
 import pathlib
@@ -39,6 +52,7 @@ from .models import (
     EMOJI_DONE,
     EMOJI_FFWD,
     EMOJI_INFO,
+    EMOJI_UNDO,
     UTC,
     compute_first_due,
     discord_ts,
@@ -279,6 +293,18 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if payload.guild_id is None:
         return
 
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        return
+    key = emoji_key(payload.emoji)
+
+    # Undo (↩️) is keyed off the separate "undo" table rather than the live
+    # message map, because a completed/skipped message has been de-registered
+    # from "messages" — yet we still want its ↩️ button to work.
+    if key == emoji_key(EMOJI_UNDO):
+        await _handle_undo(payload, channel)
+        return
+
     snap = await store.snapshot()
     tid = snap["messages"].get(str(payload.message_id))
     if not tid:
@@ -291,10 +317,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         return
 
     tz = ZoneInfo(cfg["timezone"])
-    key = emoji_key(payload.emoji)
-    channel = bot.get_channel(payload.channel_id)
-    if channel is None:
-        return
     reacted = channel.get_partial_message(payload.message_id)
     member = payload.member
     mention = member.mention if member else f"<@{payload.user_id}>"
@@ -338,10 +360,12 @@ async def _handle_info(task, channel, reacted, payload) -> None:
 
 async def _handle_ffwd(tid, task, channel, reacted, payload, mention) -> None:
     result = None
+    before = None
     async with store.txn() as data:
         live = data["tasks"].get(tid)
         p = live.get("pending") if live else None
         if p:
+            before = json.loads(json.dumps(live))  # snapshot for undo
             p["ffwd_count"] += 1
             hours = 2 ** (p["ffwd_count"] - 1)
             remind = now_utc() + dt.timedelta(hours=hours)
@@ -359,6 +383,7 @@ async def _handle_ffwd(tid, task, channel, reacted, payload, mention) -> None:
             await reacted.edit(content=status, allowed_mentions=NO_PINGS)
         except discord.HTTPException:
             pass
+        await _arm_undo("snooze", tid, before, payload.message_id, channel)
     await _remove_user_reaction(reacted, payload)
 
 
@@ -366,16 +391,21 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
     completed = now_utc()
     record = None
     message_ids: list[int] = []
+    before = None
+    completion_id = None
     async with store.txn() as data:
         live = data["tasks"].get(tid)
         p = live.get("pending") if live else None
         if not p:
             return
+        before = json.loads(json.dumps(live))  # snapshot for undo
+        completion_id = new_id()
         due = from_iso(p["due_at"])
         message_ids = list(p["message_ids"])
         for mid in message_ids:
             data["messages"].pop(str(mid), None)
         record = {
+            "id": completion_id,  # lets an undo void exactly this log entry
             "ts": to_iso(completed),
             "month": completed.astimezone(tz).strftime("%Y-%m"),  # local-tz bucket
             "guild_id": task["guild_id"],
@@ -402,16 +432,20 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
             f"✅ Completed by {mention} • {discord_ts(completed, 't')}"
         )
         await finalize_messages(channel, message_ids, status)
+        if message_ids:
+            await _arm_undo("done", tid, before, message_ids[-1], channel, completion_id=completion_id)
 
 
 async def _handle_skip_or_delete(tid, task, tz, channel, mention) -> None:
     message_ids: list[int] = []
     mode = None
+    before = None
     async with store.txn() as data:
         live = data["tasks"].get(tid)
         p = live.get("pending") if live else None
         if not p:
             return
+        before = json.loads(json.dumps(live))  # snapshot for undo
         message_ids = list(p["message_ids"])
         for mid in message_ids:
             data["messages"].pop(str(mid), None)
@@ -433,6 +467,154 @@ async def _handle_skip_or_delete(tid, task, tz, channel, mention) -> None:
     else:
         return
     await finalize_messages(channel, message_ids, status)
+    if message_ids:
+        await _arm_undo(mode, tid, before, message_ids[-1], channel)
+
+
+# ---------------------------------------------------------------------------
+# Undo (↩️)
+# ---------------------------------------------------------------------------
+def can_undo(action: str, before: dict, live: Optional[dict]) -> bool:
+    """Is it still safe to restore ``before`` over the current ``live`` task?
+
+    The guard exists so a stale ↩️ (e.g. tapped on yesterday's completed chore
+    after today's occurrence has already fired) can't clobber newer state.
+
+      * snooze            — the very same occurrence must still be pending
+                            (matched by ``due_at``); refuse if it was resolved
+                            or a different occurrence is now in flight.
+      * done/skip (recurring) — refuse if a new occurrence is already pending,
+                            or the task was deleted in the meantime.
+      * done/delete (one-off) — the task was removed; only restore if nothing
+                            has since taken its id.
+    """
+    if action == "snooze":
+        lp = live.get("pending") if live else None
+        bp = before.get("pending")
+        return bool(lp and bp and lp.get("due_at") == bp.get("due_at"))
+    if before.get("recurring"):
+        return live is not None and live.get("pending") is None
+    return live is None
+
+
+async def _arm_undo(
+    action: str,
+    tid: str,
+    before: Optional[dict],
+    anchor_id: int,
+    channel: discord.abc.Messageable,
+    *,
+    completion_id: Optional[str] = None,
+) -> None:
+    """Record how to reverse the action just taken and add the ↩️ button to the
+    message that shows its result. Only the most recent action per task is kept
+    undoable, so older ↩️ buttons for this task are retired."""
+    if before is None:
+        return
+    stale: list[int] = []
+    async with store.txn() as data:
+        for mid, rec in list(data["undo"].items()):
+            if rec.get("task_id") == tid and str(mid) != str(anchor_id):
+                data["undo"].pop(mid, None)
+                stale.append(int(mid))
+        data["undo"][str(anchor_id)] = {
+            "action": action,
+            "task_id": tid,
+            "before": before,
+            "completion_id": completion_id,
+            "channel_id": getattr(channel, "id", None),
+        }
+    try:
+        await channel.get_partial_message(anchor_id).add_reaction(EMOJI_UNDO)
+    except discord.HTTPException:
+        pass
+    if bot.user:  # tidy now-dead ↩️ buttons left on this task's older messages
+        for mid in stale:
+            try:
+                await channel.get_partial_message(mid).remove_reaction(EMOJI_UNDO, bot.user)
+            except discord.HTTPException:
+                pass
+
+
+async def _restore_anchor(
+    channel: discord.abc.Messageable, msg_id: int, task: dict
+) -> None:
+    """Bring the resolved message back to a live, actionable post: restore the
+    brief, drop the ↩️ button, and re-add the ✅/⏩/(ℹ️)/❌ reactions."""
+    pm = channel.get_partial_message(msg_id)
+    try:
+        await pm.edit(content=post_content(task, reminder=False, cfg={}), allowed_mentions=NO_PINGS)
+    except discord.HTTPException:
+        pass
+    try:
+        await pm.clear_reactions()  # needs Manage Messages; best effort
+    except discord.HTTPException:
+        pass
+    if bot.user:  # ensure our ↩️ is gone even without Manage Messages
+        try:
+            await pm.remove_reaction(EMOJI_UNDO, bot.user)
+        except discord.HTTPException:
+            pass
+    try:
+        await add_task_reactions(pm, task)
+    except discord.HTTPException:
+        pass
+
+
+async def _disarm_undo_button(channel: discord.abc.Messageable, msg_id: int) -> None:
+    """A refused undo: remove the dead ↩️ and say (quietly) why nothing happened."""
+    pm = channel.get_partial_message(msg_id)
+    if bot.user:
+        try:
+            await pm.remove_reaction(EMOJI_UNDO, bot.user)
+        except discord.HTTPException:
+            pass
+    try:
+        await channel.send(
+            "↩️ Too late to undo — this chore has already moved on.",
+            reference=pm,
+            allowed_mentions=NO_PINGS,
+        )
+    except discord.HTTPException:
+        pass
+
+
+async def _handle_undo(
+    payload: discord.RawReactionActionEvent, channel: discord.abc.Messageable
+) -> None:
+    snap = await store.snapshot()
+    if str(payload.message_id) not in snap["undo"]:
+        return  # fast path: a ↩️ on something we don't track — ignore
+
+    # Everything authoritative is read from inside the txn so a concurrent
+    # re-arm (e.g. a second snooze on this message) can't make us act on stale
+    # snapshot data.
+    outcome = None  # "ok" | "refused"
+    action = before = completion_id = None
+    async with store.txn() as data:
+        rec = data["undo"].get(str(payload.message_id))
+        if not rec:
+            return  # a concurrent ↩️ beat us to it
+        action = rec["action"]
+        before = rec["before"]
+        completion_id = rec.get("completion_id")
+        tid = rec["task_id"]
+        if can_undo(action, before, data["tasks"].get(tid)):
+            data["tasks"][tid] = json.loads(json.dumps(before))
+            pending = before.get("pending") or {}
+            for mid in pending.get("message_ids", []):
+                data["messages"][str(mid)] = tid
+            outcome = "ok"
+        else:
+            outcome = "refused"
+        data["undo"].pop(str(payload.message_id), None)
+
+    if outcome == "ok":
+        if action == "done" and completion_id:
+            await store.void_completion(completion_id)
+        await _restore_anchor(channel, payload.message_id, before)
+    elif outcome == "refused":
+        await _disarm_undo_button(channel, payload.message_id)
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +764,9 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
             if pending:
                 for mid in pending.get("message_ids", []):
                     data["messages"].pop(str(mid), None)
+            for mid, rec in list(data["undo"].items()):
+                if rec.get("task_id") == task:
+                    data["undo"].pop(mid, None)
             removed = data["tasks"].pop(task, None)
     if removed:
         await interaction.response.send_message(

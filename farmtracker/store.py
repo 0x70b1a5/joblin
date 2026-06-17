@@ -28,7 +28,7 @@ import pathlib
 import tempfile
 from typing import Any
 
-EMPTY: dict[str, Any] = {"configs": {}, "tasks": {}, "messages": {}}
+EMPTY: dict[str, Any] = {"configs": {}, "tasks": {}, "messages": {}, "undo": {}}
 
 
 class Store:
@@ -86,6 +86,49 @@ class Store:
                 f.write(line + "\n")
                 f.flush()
                 os.fsync(f.fileno())
+
+    async def void_completion(self, completion_id: str) -> bool:
+        """Remove a single logged completion by its ``id`` (used when an undo
+        reverts a ✅ so the leaderboard stays honest).
+
+        The log is normally append-only, but an undo is a genuine retraction, so
+        we rewrite it: read every record, drop the matching one, and replace the
+        file atomically (temp + ``fsync`` + ``os.replace``) just like ``_flush``.
+        Returns True if a record was actually removed.
+        """
+        async with self._lock:
+            if not self.log_path.exists():
+                return False
+            kept: list[str] = []
+            removed = False
+            for line in self.log_path.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    rec = json.loads(s)
+                except json.JSONDecodeError:
+                    continue  # drop a torn/garbage line while we're rewriting
+                if not removed and rec.get("id") == completion_id:
+                    removed = True
+                    continue
+                kept.append(json.dumps(rec, ensure_ascii=False))
+            if not removed:
+                return False
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(self.log_path.parent), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    if kept:
+                        f.write("\n".join(kept) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.log_path)  # atomic on POSIX
+            except BaseException:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp)
+                raise
+            return True
 
     def read_completions(self) -> list[dict[str, Any]]:
         """Read every logged completion (tolerating a torn final line)."""

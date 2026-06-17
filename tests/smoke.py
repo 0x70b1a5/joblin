@@ -10,14 +10,19 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import pathlib
+import sys
 import tempfile
 from zoneinfo import ZoneInfo
 
+# Make `farmtracker` importable when run straight from the repo (the package
+# isn't pip-installed; running a script puts tests/ — not the root — on path).
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 # Importing the bot module runs every @bot.tree.command decorator and builds
 # the FarmBot instance — a real smoke test of the command definitions.
-import farmtracker.bot  # noqa: F401
-from farmtracker import models as m
-from farmtracker.store import Store
+import farmtracker.bot  # noqa: E402, F401
+from farmtracker import models as m  # noqa: E402
+from farmtracker.store import Store  # noqa: E402
 
 UTC = dt.timezone.utc
 
@@ -92,6 +97,42 @@ def test_oneoff_parse() -> None:
             raise AssertionError(f"{bad!r} should have failed")
 
 
+def test_can_undo() -> None:
+    from farmtracker.bot import can_undo
+
+    rec = {"recurring": True, "pending": {"due_at": "2026-06-14T06:00:00+00:00", "message_ids": [1]}}
+    # recurring complete/skip: only while no new occurrence has fired, task alive.
+    assert can_undo("done", rec, {"recurring": True, "pending": None}) is True
+    assert can_undo("skip", rec, {"recurring": True, "pending": {"due_at": "later"}}) is False
+    assert can_undo("done", rec, None) is False  # task was deleted -> don't resurrect
+
+    # one-off complete/delete: the task is gone; restore only if the id is free.
+    one = {"recurring": False, "pending": {"due_at": "2026-06-14T06:00:00+00:00", "message_ids": [2]}}
+    assert can_undo("done", one, None) is True
+    assert can_undo("delete", one, {"recurring": False, "pending": None}) is False
+
+    # snooze: the very same occurrence must still be pending (matched by due_at).
+    assert can_undo("snooze", rec, {"recurring": True, "pending": {"due_at": "2026-06-14T06:00:00+00:00"}}) is True
+    assert can_undo("snooze", rec, {"recurring": True, "pending": {"due_at": "2026-06-15T06:00:00+00:00"}}) is False
+    assert can_undo("snooze", rec, {"recurring": True, "pending": None}) is False
+    assert can_undo("snooze", rec, None) is False
+
+
+async def test_void_completion() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        path = pathlib.Path(d) / "store.json"
+        store = Store(path, pathlib.Path(d) / "log.jsonl")
+        store.load()
+        assert "undo" in store.data, "store should grow an 'undo' section"
+
+        await store.log_completion({"id": "aaa", "user_id": 1})
+        await store.log_completion({"id": "bbb", "user_id": 2})
+        assert await store.void_completion("aaa") is True
+        recs = store.read_completions()
+        assert len(recs) == 1 and recs[0]["id"] == "bbb", "only the voided record is gone"
+        assert await store.void_completion("missing") is False, "voiding an absent id is a no-op"
+
+
 async def test_store() -> None:
     with tempfile.TemporaryDirectory() as d:
         path = pathlib.Path(d) / "store.json"
@@ -131,6 +172,8 @@ def main() -> None:
     test_roll_forward_skips_backlog()
     test_roll_forward_dst()
     test_oneoff_parse()
+    test_can_undo()
+    asyncio.run(test_void_completion())
     asyncio.run(test_store())
     print("✅ all smoke tests passed")
 
