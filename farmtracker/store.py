@@ -28,7 +28,13 @@ import pathlib
 import tempfile
 from typing import Any
 
-EMPTY: dict[str, Any] = {"configs": {}, "tasks": {}, "messages": {}, "undo": {}}
+EMPTY: dict[str, Any] = {
+    "configs": {},
+    "tasks": {},
+    "messages": {},
+    "undo": {},
+    "snooze_panels": {},  # panel message id -> {task_id, anchor_id, unit, brief}
+}
 
 
 class Store:

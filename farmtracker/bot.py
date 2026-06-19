@@ -48,22 +48,29 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from .models import (
+    DIGIT_BY_KEY,
+    DIGIT_EMOJI,
     EMOJI_DELETE,
     EMOJI_DONE,
     EMOJI_FFWD,
     EMOJI_INFO,
+    EMOJI_SNOOZE_DAYS,
+    EMOJI_SNOOZE_HOURS,
     EMOJI_UNDO,
+    SNOOZE_CHOICES,
     UTC,
-    compute_first_due,
+    describe_repeat,
     discord_ts,
     emoji_key,
+    first_due,
     from_iso,
     new_id,
-    normalise_hhmm,
+    next_due,
     now_utc,
-    parse_hhmm,
-    parse_oneoff,
-    roll_forward,
+    parse_repeat,
+    recurrence_of,
+    resolve_when,
+    time_of_day_from,
     to_iso,
 )
 from .store import Store
@@ -133,11 +140,10 @@ def config_ready(cfg: Optional[dict]) -> bool:
 
 
 def schedule_label(task: dict) -> str:
-    if not task["recurring"]:
+    rule = recurrence_of(task)
+    if rule["freq"] == "once":
         return "one-off"
-    every = task["interval_days"]
-    base = "every day" if every == 1 else f"every {every} days"
-    return f"{base} at {task['time_of_day']}"
+    return f"{describe_repeat(rule)} at {task.get('time_of_day')}"
 
 
 def post_content(task: dict, *, reminder: bool, cfg: dict) -> str:
@@ -306,6 +312,9 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         return
 
     snap = await store.snapshot()
+    if str(payload.message_id) in snap["snooze_panels"]:
+        await _handle_snooze_panel(payload, channel)
+        return
     tid = snap["messages"].get(str(payload.message_id))
     if not tid:
         return
@@ -325,7 +334,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if key == emoji_key(EMOJI_INFO):
         await _handle_info(task, channel, reacted, payload)
     elif key == emoji_key(EMOJI_FFWD):
-        await _handle_ffwd(tid, task, channel, reacted, payload, mention)
+        await _handle_ffwd(tid, task, channel, reacted, payload)
     elif key == emoji_key(EMOJI_DONE):
         await _handle_done(tid, task, cfg, tz, channel, payload, mention, display)
     elif key == emoji_key(EMOJI_DELETE):
@@ -358,33 +367,138 @@ async def _handle_info(task, channel, reacted, payload) -> None:
     await _remove_user_reaction(reacted, payload)
 
 
-async def _handle_ffwd(tid, task, channel, reacted, payload, mention) -> None:
-    result = None
-    before = None
+# --- Snooze "numpad" panel -------------------------------------------------
+# Tapping ⏩ posts a separate panel message that self-reacts with a number pad
+# plus an hours/days unit toggle, so the task post itself stays clean. Picking a
+# number snoozes the occurrence, edits the task post with the result + ↩️ undo,
+# and deletes the panel. The panel is keyed in store["snooze_panels"] so it
+# survives restarts.
+SNOOZE_REACTIONS = (
+    [DIGIT_EMOJI[n] for n in SNOOZE_CHOICES]
+    + [EMOJI_SNOOZE_HOURS, EMOJI_SNOOZE_DAYS, EMOJI_DELETE]
+)
+
+
+def snooze_panel_text(brief: str, unit: str) -> str:
+    other = "tap 📅 for days" if unit == "hours" else "tap ⏱️ for hours"
+    return (
+        f"💤 **Snooze {brief}** — pick a number of **{unit}** below "
+        f"({other}, or ❌ to cancel)."
+    )
+
+
+def _take_task_panels(data: dict, tid: str) -> list[tuple[int, Optional[int]]]:
+    """Pop (within a txn) every open snooze panel belonging to a task, returning
+    (message_id, channel_id) pairs so the caller can delete the messages."""
+    out: list[tuple[int, Optional[int]]] = []
+    for pid, rec in list(data["snooze_panels"].items()):
+        if rec.get("task_id") == tid:
+            out.append((int(pid), rec.get("channel_id")))
+            data["snooze_panels"].pop(pid, None)
+    return out
+
+
+async def _delete_panels(panels: list[tuple[int, Optional[int]]]) -> None:
+    for mid, cid in panels:
+        ch = bot.get_channel(int(cid)) if cid else None
+        if ch is not None:
+            await safe_delete(ch.get_partial_message(mid))
+
+
+async def _handle_ffwd(tid, task, channel, reacted, payload) -> None:
+    snap = await store.snapshot()
+    live = snap["tasks"].get(tid)
+    if not live or not live.get("pending"):
+        await _remove_user_reaction(reacted, payload)
+        return  # occurrence already resolved — nothing to snooze
+    panel = await channel.send(
+        snooze_panel_text(task["brief"], "hours"), allowed_mentions=NO_PINGS
+    )
     async with store.txn() as data:
+        data["snooze_panels"][str(panel.id)] = {
+            "task_id": tid,
+            "anchor_id": payload.message_id,
+            "unit": "hours",
+            "brief": task["brief"],
+            "channel_id": getattr(channel, "id", None),
+        }
+    for emoji in SNOOZE_REACTIONS:
+        try:
+            await panel.add_reaction(emoji)
+        except discord.HTTPException:
+            pass
+    await _remove_user_reaction(reacted, payload)
+
+
+async def _handle_snooze_panel(
+    payload: discord.RawReactionActionEvent, channel: discord.abc.Messageable
+) -> None:
+    key = emoji_key(payload.emoji)
+    snap = await store.snapshot()
+    rec = snap["snooze_panels"].get(str(payload.message_id))
+    if not rec:
+        return
+    panel = channel.get_partial_message(payload.message_id)
+    tid, brief = rec["task_id"], rec.get("brief", "")
+
+    if key == emoji_key(EMOJI_DELETE):  # cancel the panel
+        async with store.txn() as data:
+            data["snooze_panels"].pop(str(payload.message_id), None)
+        await safe_delete(panel)
+        return
+
+    if key in (emoji_key(EMOJI_SNOOZE_HOURS), emoji_key(EMOJI_SNOOZE_DAYS)):
+        unit = "hours" if key == emoji_key(EMOJI_SNOOZE_HOURS) else "days"
+        async with store.txn() as data:
+            r = data["snooze_panels"].get(str(payload.message_id))
+            if r:
+                r["unit"] = unit
+        try:
+            await panel.edit(content=snooze_panel_text(brief, unit), allowed_mentions=NO_PINGS)
+        except discord.HTTPException:
+            pass
+        await _remove_user_reaction(panel, payload)
+        return
+
+    n = DIGIT_BY_KEY.get(key)
+    if n is None:
+        return  # an unrelated reaction on the panel
+
+    unit = rec.get("unit", "hours")
+    hours = n if unit == "hours" else n * 24
+    member = payload.member
+    mention = member.mention if member else f"<@{payload.user_id}>"
+    anchor_id = rec.get("anchor_id")
+
+    before = None
+    remind = None
+    async with store.txn() as data:
+        data["snooze_panels"].pop(str(payload.message_id), None)
         live = data["tasks"].get(tid)
         p = live.get("pending") if live else None
         if p:
             before = json.loads(json.dumps(live))  # snapshot for undo
-            p["ffwd_count"] += 1
-            hours = 2 ** (p["ffwd_count"] - 1)
+            p["ffwd_count"] = p.get("ffwd_count", 0) + 1
             remind = now_utc() + dt.timedelta(hours=hours)
             p["remind_at"] = to_iso(remind)
-            result = (hours, remind)
-    if result:
-        hours, remind = result
-        plural = "hour" if hours == 1 else "hours"
-        status = (
-            f"**{task['brief']}**\n"
-            f"⏩ Snoozed {hours} {plural} by {mention} — "
-            f"next reminder {discord_ts(remind, 'R')}"
-        )
+    await safe_delete(panel)
+    if before is None or remind is None:
+        return  # resolved between opening the panel and picking a number
+
+    amount = f"{hours} hour{'' if hours == 1 else 's'}" if unit == "hours" \
+        else f"{n} day{'' if n == 1 else 's'}"
+    status = (
+        f"**{brief}**\n"
+        f"⏩ Snoozed {amount} by {mention} — next reminder {discord_ts(remind, 'R')}"
+    )
+    if anchor_id:
         try:
-            await reacted.edit(content=status, allowed_mentions=NO_PINGS)
+            await channel.get_partial_message(anchor_id).edit(
+                content=status, allowed_mentions=NO_PINGS
+            )
         except discord.HTTPException:
             pass
-        await _arm_undo("snooze", tid, before, payload.message_id, channel)
-    await _remove_user_reaction(reacted, payload)
+        await _arm_undo("snooze", tid, before, anchor_id, channel)
 
 
 async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -> None:
@@ -404,6 +518,7 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
         message_ids = list(p["message_ids"])
         for mid in message_ids:
             data["messages"].pop(str(mid), None)
+        panels = _take_task_panels(data, tid)
         record = {
             "id": completion_id,  # lets an undo void exactly this log entry
             "ts": to_iso(completed),
@@ -419,12 +534,11 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
         }
         if live["recurring"]:
             live["pending"] = None
-            live["next_due"] = to_iso(
-                roll_forward(due, tz, live["time_of_day"], live["interval_days"], completed)
-            )
+            live["next_due"] = to_iso(next_due(recurrence_of(live), tz, due, completed))
         else:
             data["tasks"].pop(tid, None)
 
+    await _delete_panels(panels)
     if record:
         await store.log_completion(record)
         status = (
@@ -449,17 +563,17 @@ async def _handle_skip_or_delete(tid, task, tz, channel, mention) -> None:
         message_ids = list(p["message_ids"])
         for mid in message_ids:
             data["messages"].pop(str(mid), None)
+        panels = _take_task_panels(data, tid)
         if live["recurring"]:
             due = from_iso(p["due_at"])
             live["pending"] = None
-            live["next_due"] = to_iso(
-                roll_forward(due, tz, live["time_of_day"], live["interval_days"], now_utc())
-            )
+            live["next_due"] = to_iso(next_due(recurrence_of(live), tz, due, now_utc()))
             mode = "skip"
         else:
             data["tasks"].pop(tid, None)
             mode = "delete"
 
+    await _delete_panels(panels)
     if mode == "skip":
         status = f"**{task['brief']}**\n⏭️ Skipped this time by {mention} — back next cycle."
     elif mode == "delete":
@@ -618,6 +732,51 @@ async def _handle_undo(
 
 
 # ---------------------------------------------------------------------------
+# Scheduling from user input (shared by /newtask and /edittask)
+# ---------------------------------------------------------------------------
+def schedule_from_rule(
+    rule: dict,
+    at: Optional[str],
+    tz: ZoneInfo,
+    now: dt.datetime,
+    *,
+    at_given: bool,
+    default_tod: Optional[str] = None,
+) -> dict:
+    """Turn a parsed ``repeat`` rule + an ``at`` string into concrete task
+    schedule fields. Raises ``ValueError`` for an explicit past one-off time.
+
+    ``at_given`` distinguishes "user typed an `at`" from "defaulted to now": a
+    one-off that lands in the past is an error *only* when the user asked for a
+    specific past time; an omitted/`now` `at` simply fires on the next tick.
+    ``default_tod`` is the recurring time to keep when ``at`` isn't supplied
+    (used by edits that change only the repeat rule).
+    """
+    if rule["freq"] == "monthly" and not rule["monthdays"]:
+        rule["monthdays"] = [now.astimezone(tz).day]  # bare "monthly" → today's date
+
+    if rule["freq"] == "once":
+        due = resolve_when(at, tz, now)
+        if due <= now:
+            explicit = at_given and (at or "").strip().lower() not in ("", "now")
+            if explicit:
+                raise ValueError("that time is already in the past")
+            due = now  # fire on the next scheduler tick
+        return {
+            "recurring": False, "freq": "once", "interval_days": 0,
+            "weekdays": [], "monthdays": [], "time_of_day": None, "next_due": due,
+        }
+
+    tod = time_of_day_from(at, tz, now) if at_given else (default_tod or time_of_day_from(None, tz, now))
+    rule["time_of_day"] = tod
+    return {
+        "recurring": True, "freq": rule["freq"], "interval_days": rule["interval_days"],
+        "weekdays": rule["weekdays"], "monthdays": rule["monthdays"],
+        "time_of_day": tod, "next_due": first_due(rule, tz, now),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
 @bot.tree.command(name="farmconfig", description="Set the channel, timezone, and optional reminder role")
@@ -677,18 +836,133 @@ async def _tz_autocomplete(interaction: discord.Interaction, current: str):
     return [app_commands.Choice(name=z, value=z) for z in matches]
 
 
-@bot.tree.command(name="newtask", description="Create a recurring or one-off task")
+# --- Autocomplete helpers (shared across commands) -------------------------
+async def _guild_tz(interaction: discord.Interaction) -> ZoneInfo:
+    """Best-effort timezone for live autocomplete previews."""
+    snap = await store.snapshot()
+    cfg = guild_config(snap, interaction.guild_id)
+    if cfg and cfg.get("timezone"):
+        try:
+            return ZoneInfo(cfg["timezone"])
+        except Exception:
+            pass
+    return UTC
+
+
+def _human_until(now: dt.datetime, due: dt.datetime) -> str:
+    secs = (due - now).total_seconds()
+    if -60 <= secs <= 60:
+        return "now"
+    past, secs = secs < 0, abs(secs)
+    if secs < 3600:
+        v, u = round(secs / 60), "min"
+    elif secs < 86400:
+        v = round(secs / 3600)
+        u = "hour" if v == 1 else "hours"
+    else:
+        v = round(secs / 86400)
+        u = "day" if v == 1 else "days"
+    return f"{v} {u} ago" if past else f"in {v} {u}"
+
+
+def _when_label(due: dt.datetime, tz: ZoneInfo, now: dt.datetime, *, head: bool = True) -> str:
+    local = due.astimezone(tz)
+    prefix = "📅 " if head else ""
+    return f"{prefix}{local:%a %b %d · %H:%M} ({_human_until(now, due)})"
+
+
+def _dedup(choices: list[app_commands.Choice]) -> list[app_commands.Choice]:
+    seen, out = set(), []
+    for c in choices:
+        if c.value in seen:
+            continue
+        seen.add(c.value)
+        out.append(c)
+    return out[:25]
+
+
+async def at_autocomplete(interaction: discord.Interaction, current: str):
+    tz, now = await _guild_tz(interaction), now_utc()
+    cur = current.strip()
+    choices: list[app_commands.Choice] = []
+    if cur:
+        try:
+            choices.append(app_commands.Choice(
+                name=_when_label(resolve_when(cur, tz, now), tz, now)[:100], value=cur[:100]))
+        except ValueError:
+            choices.append(app_commands.Choice(
+                name="⚠️ e.g. now · in 2h · 18:00 · tomorrow 8am · Jun 20 14:00", value=cur[:100]))
+    for text in ("now", "in 1 hour", "in 30 minutes", "tonight", "tomorrow 08:00",
+                 "this saturday 09:00", "next monday 18:00"):
+        if cur and cur.lower() not in text.lower():
+            continue
+        try:
+            due = resolve_when(text, tz, now)
+        except ValueError:
+            continue
+        choices.append(app_commands.Choice(
+            name=f"{text}  →  {_when_label(due, tz, now, head=False)}"[:100], value=text))
+    return _dedup(choices)
+
+
+def _repeat_label(rule: dict, now: dt.datetime) -> str:
+    if rule["freq"] == "monthly" and not rule["monthdays"]:
+        rule = {**rule, "monthdays": [now.day]}  # preview only; real day set at run time
+    return "one-off" if rule["freq"] == "once" else describe_repeat(rule)
+
+
+async def repeat_autocomplete(interaction: discord.Interaction, current: str):
+    now = now_utc()
+    cur = current.strip()
+    choices: list[app_commands.Choice] = []
+    if cur:
+        try:
+            choices.append(app_commands.Choice(
+                name=f"🔁 {_repeat_label(parse_repeat(cur), now)}"[:100], value=cur[:100]))
+        except ValueError:
+            choices.append(app_commands.Choice(
+                name="⚠️ e.g. daily · every 2 days · weekdays · mon,thu · monthly on the 1st",
+                value=cur[:100]))
+    for text in ("once", "daily", "every 2 days", "every 3 days", "weekdays", "weekends",
+                 "mon,wed,fri", "every tuesday", "weekly", "monthly", "monthly on the 1st",
+                 "monthly on the 1st,15th"):
+        if cur and cur.lower() not in text.lower():
+            continue
+        try:
+            choices.append(app_commands.Choice(
+                name=f"{text}  →  {_repeat_label(parse_repeat(text), now)}"[:100], value=text))
+        except ValueError:
+            continue
+    return _dedup(choices)
+
+
+async def task_autocomplete(interaction: discord.Interaction, current: str):
+    snap = await store.snapshot()
+    cur = current.lower()
+    out = []
+    for tid, t in snap["tasks"].items():
+        if str(t["guild_id"]) != str(interaction.guild_id):
+            continue
+        label = f"{t['brief']} ({schedule_label(t)})"
+        if cur in label.lower() or cur in tid.lower():
+            out.append(app_commands.Choice(name=label[:100], value=tid))
+        if len(out) >= 25:
+            break
+    return out
+
+
+@bot.tree.command(name="newtask", description="Create a one-off or recurring task")
 @app_commands.describe(
     brief="Short text posted in the channel (required)",
-    at="Recurring time 'HH:MM', or a one-off deadline 'YYYY-MM-DD HH:MM'",
-    every_days="Repeat every N days — recurring only (1 = daily, the default)",
+    at="When/what time — now, in 2h, 18:00, tomorrow 8am, 2026-06-20 14:00 (default: now)",
+    repeat="How often — once, daily, every 2 days, weekdays, mon/thu, monthly on the 1st (default: once)",
     description="Optional longer details, revealed by the ℹ️ reaction",
 )
 async def newtask(
     interaction: discord.Interaction,
     brief: app_commands.Range[str, 1, 200],
-    at: str,
-    every_days: app_commands.Range[int, 1, 366] = 1,
+    at: Optional[str] = None,
+    repeat: Optional[str] = None,
     description: Optional[str] = None,
 ) -> None:
     snap = await store.snapshot()
@@ -699,29 +973,12 @@ async def newtask(
         )
         return
 
-    tz = ZoneInfo(cfg["timezone"])
-    recurring: bool
-    time_of_day: Optional[str] = None
+    tz, now = ZoneInfo(cfg["timezone"]), now_utc()
     try:
-        if ":" in at and "-" not in at:
-            time_of_day = normalise_hhmm(at)
-            parse_hhmm(time_of_day)  # validates range
-            recurring = True
-            next_due = compute_first_due(now_utc(), tz, time_of_day)
-        else:
-            due = parse_oneoff(at, tz)
-            if due <= now_utc():
-                await interaction.response.send_message(
-                    "❌ That one-off time is already in the past.", ephemeral=True
-                )
-                return
-            recurring = False
-            next_due = due
+        sched = schedule_from_rule(parse_repeat(repeat), at, tz, now, at_given=at is not None)
     except ValueError as e:
         await interaction.response.send_message(
-            f"❌ Couldn't read `at`: {e}\n"
-            "Use `HH:MM` for a recurring time, or `YYYY-MM-DD HH:MM` for a one-off.",
-            ephemeral=True,
+            f"❌ {e}\nSee `/farmhelp` for the `at` and `repeat` formats.", ephemeral=True
         )
         return
 
@@ -731,88 +988,285 @@ async def newtask(
         "guild_id": interaction.guild_id,
         "brief": str(brief),
         "description": description[:1500] if description else None,
-        "recurring": recurring,
-        "interval_days": int(every_days) if recurring else 0,
-        "time_of_day": time_of_day,
-        "next_due": to_iso(next_due),
+        "recurring": sched["recurring"],
+        "freq": sched["freq"],
+        "interval_days": sched["interval_days"],
+        "weekdays": sched["weekdays"],
+        "monthdays": sched["monthdays"],
+        "time_of_day": sched["time_of_day"],
+        "next_due": to_iso(sched["next_due"]),
         "created_by": interaction.user.id,
-        "created_at": to_iso(now_utc()),
+        "created_at": to_iso(now),
         "pending": None,
     }
     async with store.txn() as data:
         data["tasks"][tid] = task
 
-    when = f"{discord_ts(next_due, 'F')} ({discord_ts(next_due, 'R')})"
-    if recurring:
-        head = "every day" if every_days == 1 else f"every {every_days} days"
-        body = f"✅ Created **{brief}** — {head} at `{time_of_day}`.\nFirst post: {when}"
+    fire = sched["next_due"]
+    when = f"{discord_ts(fire, 'F')} ({discord_ts(fire, 'R')})"
+    if sched["recurring"]:
+        body = f"✅ Created **{brief}** — {schedule_label(task)}.\nFirst post: {when}"
     else:
         body = f"✅ Created one-off **{brief}**.\nDue: {when}"
     if description:
-        body += "\nℹ️ Long description attached."
-    await interaction.response.send_message(body, ephemeral=True, allowed_mentions=NO_PINGS)
+        body += "\nℹ️ Details attached."
+    body += f"\n· `{tid}` — change it any time with `/edittask`"
+    # Public on purpose: the family should see when a chore is added.
+    await interaction.response.send_message(body, allowed_mentions=NO_PINGS)
+
+
+def _find_task(snap: dict, guild_id: int, text: str) -> Optional[dict]:
+    """Resolve a task by id (the autocomplete value) or, failing that, by an
+    exact then substring match on its brief — so a pasted id *or* a typed name
+    both work."""
+    t = snap["tasks"].get(text)
+    if t and str(t["guild_id"]) == str(guild_id):
+        return t
+    needle = (text or "").strip().lower()
+    mine = [t for t in snap["tasks"].values() if str(t["guild_id"]) == str(guild_id)]
+    for t in mine:
+        if t["id"].lower() == needle or t["brief"].strip().lower() == needle:
+            return t
+    for t in mine:
+        if needle and needle in t["brief"].lower():
+            return t
+    return None
 
 
 @bot.tree.command(name="deletetask", description="Permanently delete a task (recurring or one-off)")
-@app_commands.describe(task="Start typing to pick a task")
+@app_commands.describe(task="Start typing to pick a task (or paste its id)")
 async def deletetask(interaction: discord.Interaction, task: str) -> None:
+    snap = await store.snapshot()
+    found = _find_task(snap, interaction.guild_id, task)
     removed = None
-    async with store.txn() as data:
-        t = data["tasks"].get(task)
-        if t and str(t["guild_id"]) == str(interaction.guild_id):
-            pending = t.get("pending")
-            if pending:
-                for mid in pending.get("message_ids", []):
-                    data["messages"].pop(str(mid), None)
-            for mid, rec in list(data["undo"].items()):
-                if rec.get("task_id") == task:
-                    data["undo"].pop(mid, None)
-            removed = data["tasks"].pop(task, None)
+    panels: list = []
+    if found:
+        async with store.txn() as data:
+            tid = found["id"]
+            t = data["tasks"].get(tid)
+            if t and str(t["guild_id"]) == str(interaction.guild_id):
+                pending = t.get("pending")
+                if pending:
+                    for mid in pending.get("message_ids", []):
+                        data["messages"].pop(str(mid), None)
+                for mid, rec in list(data["undo"].items()):
+                    if rec.get("task_id") == tid:
+                        data["undo"].pop(mid, None)
+                panels = _take_task_panels(data, tid)
+                removed = data["tasks"].pop(tid, None)
+    await _delete_panels(panels)
     if removed:
         await interaction.response.send_message(
             f"🗑️ Deleted **{removed['brief']}**.", ephemeral=True
         )
     else:
-        await interaction.response.send_message("❌ Task not found.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Task not found. Use `/listtasks` to see current tasks.", ephemeral=True
+        )
 
 
-@deletetask.autocomplete("task")
-async def _deletetask_autocomplete(interaction: discord.Interaction, current: str):
+@bot.tree.command(name="edittask", description="Edit a task's text, time, or repeat (ids come from /listtasks)")
+@app_commands.describe(
+    task="The task to edit — pick from the list, or paste its id",
+    brief="New short text (optional)",
+    at="New time/date — now, in 2h, 18:00, tomorrow 8am, 2026-06-20 14:00 (optional)",
+    repeat="New repeat — once, daily, every 2 days, weekdays, mon/thu, monthly on the 1st (optional)",
+    description="New longer details (optional)",
+    clear_description="Remove the existing long description",
+)
+async def edittask(
+    interaction: discord.Interaction,
+    task: str,
+    brief: Optional[app_commands.Range[str, 1, 200]] = None,
+    at: Optional[str] = None,
+    repeat: Optional[str] = None,
+    description: Optional[str] = None,
+    clear_description: bool = False,
+) -> None:
     snap = await store.snapshot()
-    cur = current.lower()
-    out = []
-    for tid, t in snap["tasks"].items():
-        if str(t["guild_id"]) != str(interaction.guild_id):
-            continue
-        label = f"{t['brief']} ({schedule_label(t)})"
-        if cur in label.lower():
-            out.append(app_commands.Choice(name=label[:100], value=tid))
-        if len(out) >= 25:
-            break
-    return out
+    live = _find_task(snap, interaction.guild_id, task)
+    if not live:
+        await interaction.response.send_message(
+            "❌ Task not found. Use `/listtasks` to see ids.", ephemeral=True
+        )
+        return
+    tid = live["id"]
+
+    if brief is None and at is None and repeat is None and description is None and not clear_description:
+        await interaction.response.send_message(
+            "❌ Nothing to change — set at least one of brief, at, repeat, or description.",
+            ephemeral=True,
+        )
+        return
+
+    cfg = guild_config(snap, interaction.guild_id)
+    recompute = at is not None or repeat is not None
+    if recompute and not config_ready(cfg):
+        await interaction.response.send_message(
+            "❌ Set a timezone with `/farmconfig` before changing the schedule.", ephemeral=True
+        )
+        return
+
+    now = now_utc()
+    sched = None
+    if recompute:
+        tz = ZoneInfo(cfg["timezone"])
+        new_rule = parse_repeat(repeat) if repeat is not None else recurrence_of(live)
+        try:
+            sched = schedule_from_rule(
+                new_rule, at, tz, now, at_given=at is not None, default_tod=live.get("time_of_day")
+            )
+        except ValueError as e:
+            await interaction.response.send_message(
+                f"❌ {e}\nSee `/farmhelp` for the `at` and `repeat` formats.", ephemeral=True
+            )
+            return
+
+    updated = None
+    pending_note = False
+    async with store.txn() as data:
+        t = data["tasks"].get(tid)
+        if t:
+            if brief is not None:
+                t["brief"] = str(brief)
+            if clear_description:
+                t["description"] = None
+            elif description is not None:
+                t["description"] = description[:1500]
+            if sched is not None:
+                t["recurring"] = sched["recurring"]
+                t["freq"] = sched["freq"]
+                t["interval_days"] = sched["interval_days"]
+                t["weekdays"] = sched["weekdays"]
+                t["monthdays"] = sched["monthdays"]
+                t["time_of_day"] = sched["time_of_day"]
+                if t.get("pending"):
+                    pending_note = True  # don't disturb a live occurrence
+                else:
+                    t["next_due"] = to_iso(sched["next_due"])
+            updated = json.loads(json.dumps(t))
+
+    if not updated:
+        await interaction.response.send_message("❌ Task not found.", ephemeral=True)
+        return
+
+    body = f"✏️ Updated **{updated['brief']}** — {schedule_label(updated)}."
+    if pending_note:
+        body += "\n(A reminder is live now; the new schedule applies from the next cycle.)"
+    elif sched is not None and updated.get("next_due"):
+        nd = from_iso(updated["next_due"])
+        body += f"\nNext post: {discord_ts(nd, 'F')} ({discord_ts(nd, 'R')})"
+    # Public on purpose: shared chores changing is something the family should see.
+    await interaction.response.send_message(body, allowed_mentions=NO_PINGS)
 
 
-@bot.tree.command(name="listtasks", description="Show every task and when it next posts")
+# Register the shared autocompletes onto each command that needs them.
+for _cmd in (newtask, edittask):
+    _cmd.autocomplete("at")(at_autocomplete)
+    _cmd.autocomplete("repeat")(repeat_autocomplete)
+for _cmd in (deletetask, edittask):
+    _cmd.autocomplete("task")(task_autocomplete)
+
+
+@bot.tree.command(name="listtasks", description="List every task with its id, schedule, and next post")
 async def listtasks(interaction: discord.Interaction) -> None:
     snap = await store.snapshot()
+    mine = [t for t in snap["tasks"].values() if str(t["guild_id"]) == str(interaction.guild_id)]
+
+    def sort_key(t: dict):
+        if t.get("pending"):
+            return (0, from_iso(t["pending"]["due_at"]))
+        if t.get("next_due"):
+            return (1, from_iso(t["next_due"]))
+        return (2, now_utc())
+
+    mine.sort(key=sort_key)
+
     rows = []
-    for t in snap["tasks"].values():
-        if str(t["guild_id"]) != str(interaction.guild_id):
-            continue
+    for t in mine:
         if t.get("pending"):
             state = f"⏳ pending since {discord_ts(from_iso(t['pending']['due_at']), 'R')}"
         elif t.get("next_due"):
             state = f"next {discord_ts(from_iso(t['next_due']), 'R')}"
         else:
             state = "—"
-        rows.append(f"• **{t['brief']}** — {schedule_label(t)} — {state}")
+        info = " ℹ️" if t.get("description") else ""
+        rows.append(f"• `{t['id']}` **{t['brief']}**{info} — {schedule_label(t)} · {state}")
+
     if not rows:
-        msg = "No tasks yet. Create one with `/newtask`."
-    else:
-        msg = "**Farm tasks**\n" + "\n".join(rows[:50])
-        if len(rows) > 50:
-            msg += f"\n… and {len(rows) - 50} more."
+        await interaction.response.send_message(
+            "No tasks yet. Create one with `/newtask`.", ephemeral=True
+        )
+        return
+
+    head = "**Farm tasks** — edit with `/edittask` using the `id`, remove with `/deletetask`\n"
+    shown, total = [], len(head)
+    for r in rows:
+        if total + len(r) + 1 > 1900:  # stay under Discord's 2000-char limit
+            break
+        shown.append(r)
+        total += len(r) + 1
+    msg = head + "\n".join(shown)
+    if len(shown) < len(rows):
+        msg += f"\n… and {len(rows) - len(shown)} more."
     await interaction.response.send_message(msg, ephemeral=True, allowed_mentions=NO_PINGS)
+
+
+@bot.tree.command(name="farmhelp", description="How to use farmtracker — commands, scheduling, and reactions")
+async def farmhelp(interaction: discord.Interaction) -> None:
+    embed = discord.Embed(
+        title="🚜 farmtracker help",
+        description=(
+            "Create one-off or recurring chores. When one is due I post it in the "
+            "farm channel and self-react with buttons the family taps."
+        ),
+        color=0x6B8E23,
+    )
+    embed.add_field(
+        name="Commands",
+        value=(
+            "• `/newtask` — add a chore (see scheduling below)\n"
+            "• `/listtasks` — list chores with their ids\n"
+            "• `/edittask` — change a chore (paste its id from the list)\n"
+            "• `/deletetask` — remove a chore for good\n"
+            "• `/leaderboard` — monthly completion ranking 🏆\n"
+            "• `/farmconfig` — channel, timezone, reminder role *(Manage Server)*\n"
+            "• `/farmhelp` — this message"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="`at` — when / what time (defaults to now)",
+        value=(
+            "`now` · `in 2h` · `+3d` · `tonight` · `18:00` · `6pm` · `tomorrow 8am` · "
+            "`fri 19:00` · `next monday` · `Jun 20 14:00` · `2026-06-20 14:00`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="`repeat` — how often (defaults to once)",
+        value=(
+            "`once` · `daily` · `every 2 days` · `weekly` · `weekdays` · `weekends` · "
+            "`mon,thu` · `every tuesday` · `monthly` · `monthly on the 1st` · `1st,15th`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Reactions on a posted chore",
+        value=(
+            "✅ **Done** — logs who did it (counts on the leaderboard)\n"
+            "⏩ **Snooze** — opens a number-pad panel; pick hours or days\n"
+            "ℹ️ **Info** — shows the longer description, if any\n"
+            "❌ **Skip** — skips just this time (recurring) or cancels (one-off)\n"
+            "↩️ **Undo** — appears after ✅/⏩/❌ to reverse it"
+        ),
+        inline=False,
+    )
+    embed.set_footer(
+        text="e.g.  /newtask brief:Trash out at:19:00 repeat:mon,thu   ·   "
+        "/newtask brief:Vet visit at:tomorrow 14:00"
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="leaderboard", description="Monthly chore-completion leaderboard")
