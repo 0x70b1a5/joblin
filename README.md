@@ -46,6 +46,7 @@ family chores.
 | `/listtasks` | anyone | List all tasks with their **`id`**, schedule, and when each next posts. |
 | `/leaderboard` | anyone | Monthly completion counts per person (`month` defaults to current). |
 | `/farmhelp` | anyone | Quick reference for the commands, the `at`/`repeat` syntax, and the reactions. |
+| `/redeploy` | bot owner | `git pull`, `uv sync`, then restart the bot in place (same tmux pane, so the log continues). Reports the pull result and aborts without restarting if the pull or sync fails. See [Running & updating on a VPS](#running--updating-on-a-vps). |
 
 ### Examples
 - Every morning: `/newtask brief:"Put the animals out" at:08:00 repeat:daily`
@@ -65,6 +66,63 @@ uv sync                       # create the venv & install deps
 cp .env.example .env          # then paste your bot token into .env
 uv run python -m farmtracker  # run the bot
 ```
+
+## Running & updating on a VPS
+
+On the server, launch the bot through the supervisor script **inside its tmux
+window** instead of running it directly:
+
+```bash
+tmux new -s farmtracker       # (first time) make the window
+./run.sh                      # pull + sync + run, and auto-restart on exit
+# Ctrl-B D to detach; the bot keeps running.
+```
+
+`run.sh` is a small loop that `git pull`s, `uv sync`s, runs the bot in the
+foreground, and — whenever the bot exits — pulls again and restarts it. Because
+all of this happens in the *same* pane, the tmux scrollback (your log) stays
+**continuous across restarts**.
+
+To deploy a new version, just trigger a restart from **any** shell on the box
+(no need to attach to tmux):
+
+```bash
+./redeploy.sh                 # stops the bot; run.sh then pulls & restarts it
+```
+
+The new logs flow straight on in the bot's tmux window, unbroken. `redeploy.sh`
+only signals the bot to stop — the supervisor does the pull + restart, so the
+order is always *stop → pull → sync → start*. A crash triggers the same
+auto-restart after a few seconds; **Ctrl-C** in the tmux window stops the bot
+*and* the loop for a full shutdown.
+
+### Redeploy from Discord
+
+You can also trigger a redeploy without touching the server, with the
+owner-only **`/redeploy`** slash command. It runs `git pull` + `uv sync`, posts
+the result back to you (ephemerally), and then re-execs the bot **in place** —
+same PID, same tmux pane, so the log continues uninterrupted just like
+`redeploy.sh`. If the pull or sync fails it reports the error and does *not*
+restart. Pass `sync_deps:false` to skip `uv sync` for a code-only change.
+
+Only the **application owner** can run it (Discord checks this via the bot's
+app info); add extra user ids with the optional `OWNER_IDS` env var. The command
+restarts itself whether or not you're using `run.sh`, but running under `run.sh`
+is still recommended so that a crash on the *new* code auto-restarts rather than
+leaving the bot down.
+
+The store uses atomic writes and everything (due times, pending occurrences,
+snooze panels, undo) is driven from the persisted store, so a signal-stop
+mid-tick is safe and the bot resumes cleanly on restart.
+
+> One-time setup on the VPS: these scripts ship in the repo, so `git pull` once
+> (or clone fresh), then start the bot with `./run.sh` so future `./redeploy.sh`
+> calls have a supervisor to hand the restart to.
+>
+> Tip: bump tmux's scrollback with `tmux set -g history-limit 50000` if you want
+> a longer in-window log. For a permanent file log, start it as
+> `./run.sh 2>&1 | tee -a data/bot.log` (note: with a `tee` pipeline, use
+> `./redeploy.sh` rather than Ctrl-C to cycle the bot).
 
 ### Discord application
 1. **Developer Portal → Applications → New Application → Bot.** Copy the **token**
