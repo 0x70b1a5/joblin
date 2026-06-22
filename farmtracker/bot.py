@@ -155,13 +155,19 @@ def schedule_label(task: dict) -> str:
     return f"{describe_repeat(rule)} at {task.get('time_of_day')}"
 
 
+def bounty_tag(task: dict) -> str:
+    """A small inline marker shown on a bounty's posts (worth 2 pts, not the poster)."""
+    return " 💰 *bounty · 2 pts*" if task.get("bounty") else ""
+
+
 def post_content(task: dict, *, reminder: bool, cfg: dict) -> str:
     brief = task["brief"]
+    tag = bounty_tag(task)
     if not reminder:
-        return f"**{brief}**"
+        return f"**{brief}**{tag}"
     role_id = cfg.get("reminder_role_id")
     prefix = f"<@&{role_id}> " if role_id else ""
-    return f"{prefix}⏰ Still pending: **{brief}**"
+    return f"{prefix}⏰ Still pending: **{brief}**{tag}"
 
 
 async def add_task_reactions(message: discord.Message, task: dict) -> None:
@@ -517,6 +523,22 @@ async def _handle_snooze_panel(
 
 
 async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -> None:
+    # A bounty is a chore the creator has put up for *someone else*: it's worth
+    # double, and they can't claim it themselves.
+    if task.get("bounty") and payload.user_id == task.get("created_by"):
+        reacted = channel.get_partial_message(payload.message_id)
+        await _remove_user_reaction(reacted, payload)
+        try:
+            await channel.send(
+                f"💰 {mention}, this is **your** bounty — someone else has to claim it "
+                "(it's worth 2 points!).",
+                reference=reacted,
+                allowed_mentions=NO_PINGS,
+            )
+        except discord.HTTPException:
+            pass
+        return
+
     completed = now_utc()
     record = None
     message_ids: list[int] = []
@@ -544,6 +566,7 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
             "user_id": payload.user_id,
             "user_name": display,
             "kind": "recurring" if task["recurring"] else "once",
+            "points": 2 if task.get("bounty") else 1,
             "due_at": p["due_at"],
             "late_seconds": max(0, int((completed - due).total_seconds())),
         }
@@ -556,9 +579,10 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
     await _delete_panels(panels)
     if record:
         await store.log_completion(record)
+        bonus = " 💰 **+2 pts**" if task.get("bounty") else ""
         status = (
             f"~~**{task['brief']}**~~\n"
-            f"✅ Completed by {mention} • {discord_ts(completed, 't')}"
+            f"✅ Completed by {mention}{bonus} • {discord_ts(completed, 't')}"
         )
         await finalize_messages(channel, message_ids, status)
         if message_ids:
@@ -1102,6 +1126,7 @@ async def task_autocomplete(interaction: discord.Interaction, current: str):
     at="When/what time — now, in 2h, 18:00, tomorrow 8am, 2026-06-20 14:00 (default: now)",
     repeat="How often — once, daily, every 2 days, weekdays, mon/thu, monthly on the 1st (default: once)",
     description="Optional longer details, revealed by the ℹ️ reaction",
+    bounty="Worth 2 points, and only someone other than you can complete it (default: off)",
 )
 async def newtask(
     interaction: discord.Interaction,
@@ -1109,6 +1134,7 @@ async def newtask(
     at: Optional[str] = None,
     repeat: Optional[str] = None,
     description: Optional[str] = None,
+    bounty: bool = False,
 ) -> None:
     snap = await store.snapshot()
     cfg = guild_config(snap, interaction.guild_id)
@@ -1133,6 +1159,7 @@ async def newtask(
         "guild_id": interaction.guild_id,
         "brief": str(brief),
         "description": description[:1500] if description else None,
+        "bounty": bool(bounty),
         "recurring": sched["recurring"],
         "freq": sched["freq"],
         "interval_days": sched["interval_days"],
@@ -1155,6 +1182,8 @@ async def newtask(
         body = f"✅ Created one-off **{brief}**.\nDue: {when}"
     if description:
         body += "\nℹ️ Details attached."
+    if bounty:
+        body += "\n💰 **Bounty** — worth 2 points; anyone *but* you can complete it."
     body += f"\n· `{tid}` — change it any time with `/edittask`"
     # Public on purpose: the family should see when a chore is added.
     await interaction.response.send_message(body, allowed_mentions=NO_PINGS)
@@ -1221,6 +1250,7 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
     repeat="New repeat — once, daily, every 2 days, weekdays, mon/thu, monthly on the 1st (optional)",
     description="New longer details (optional)",
     clear_description="Remove the existing long description",
+    bounty="Make this a 2-point bounty the creator can't complete (or turn it off)",
 )
 async def edittask(
     interaction: discord.Interaction,
@@ -1230,6 +1260,7 @@ async def edittask(
     repeat: Optional[str] = None,
     description: Optional[str] = None,
     clear_description: bool = False,
+    bounty: Optional[bool] = None,
 ) -> None:
     snap = await store.snapshot()
     live = _find_task(snap, interaction.guild_id, task)
@@ -1240,9 +1271,10 @@ async def edittask(
         return
     tid = live["id"]
 
-    if brief is None and at is None and repeat is None and description is None and not clear_description:
+    if (brief is None and at is None and repeat is None and description is None
+            and not clear_description and bounty is None):
         await interaction.response.send_message(
-            "❌ Nothing to change — set at least one of brief, at, repeat, or description.",
+            "❌ Nothing to change — set at least one of brief, at, repeat, description, or bounty.",
             ephemeral=True,
         )
         return
@@ -1281,6 +1313,8 @@ async def edittask(
                 t["description"] = None
             elif description is not None:
                 t["description"] = description[:1500]
+            if bounty is not None:
+                t["bounty"] = bool(bounty)
             if sched is not None:
                 t["recurring"] = sched["recurring"]
                 t["freq"] = sched["freq"]
@@ -1304,6 +1338,11 @@ async def edittask(
     elif sched is not None and updated.get("next_due"):
         nd = from_iso(updated["next_due"])
         body += f"\nNext post: {discord_ts(nd, 'F')} ({discord_ts(nd, 'R')})"
+    if bounty is not None:
+        body += (
+            "\n💰 Now a **bounty** — worth 2 points; you can't complete it yourself."
+            if bounty else "\n💰 Bounty removed — back to a normal 1-point chore."
+        )
     # Public on purpose: shared chores changing is something the family should see.
     await interaction.response.send_message(body, allowed_mentions=NO_PINGS)
 
@@ -1339,7 +1378,8 @@ async def listtasks(interaction: discord.Interaction) -> None:
         else:
             state = "—"
         info = " ℹ️" if t.get("description") else ""
-        rows.append(f"• `{t['id']}` **{t['brief']}**{info} — {schedule_label(t)} · {state}")
+        flag = " 💰" if t.get("bounty") else ""
+        rows.append(f"• `{t['id']}` **{t['brief']}**{info}{flag} — {schedule_label(t)} · {state}")
 
     if not rows:
         await interaction.response.send_message(
@@ -1373,11 +1413,11 @@ async def farmhelp(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="Commands",
         value=(
-            "• `/newtask` — add a chore (see scheduling below)\n"
+            "• `/newtask` — add a chore (see scheduling below; `bounty:true` for a 2-pointer)\n"
             "• `/listtasks` — list chores with their ids\n"
             "• `/edittask` — change a chore (paste its id from the list)\n"
             "• `/deletetask` — remove a chore for good\n"
-            "• `/leaderboard` — monthly completion ranking 🏆\n"
+            "• `/leaderboard` — monthly points ranking & ⭐ stars 🏆\n"
             "• `/farmconfig` — channel, timezone, reminder role *(Manage Server)*\n"
             "• `/farmhelp` — this message"
         ),
@@ -1411,6 +1451,16 @@ async def farmhelp(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
+    embed.add_field(
+        name="💰 Bounties & ⭐ stars",
+        value=(
+            "Mark a chore you can't do yourself with `bounty:true`: it's worth "
+            "**2 points** and only **someone else** can tap ✅ on it. Every completed "
+            "chore is a point (bounties two); whoever leads the month's `/leaderboard` "
+            "earns a permanent **⭐ star** shown there for keeps."
+        ),
+        inline=False,
+    )
     embed.set_footer(
         text="e.g.  /newtask brief:Trash out at:19:00 repeat:mon,thu   ·   "
         "/newtask brief:Vet visit at:tomorrow 14:00"
@@ -1418,45 +1468,110 @@ async def farmhelp(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="leaderboard", description="Monthly chore-completion leaderboard")
+# ---------------------------------------------------------------------------
+# Leaderboard scoring — points (bounties count double) and monthly ⭐ stars
+# ---------------------------------------------------------------------------
+def _completion_points(rec: dict) -> int:
+    """Points a logged completion is worth. Bounties record ``points: 2``; older
+    records predate the field and count as the normal 1 point."""
+    p = rec.get("points")
+    return int(p) if isinstance(p, (int, float)) and p > 0 else 1
+
+
+def _rec_month(rec: dict) -> str:
+    """The local-tz 'YYYY-MM' bucket a completion belongs to (tolerating very old
+    records that only carry a 'ts')."""
+    return rec.get("month") or str(rec.get("ts", ""))[:7]
+
+
+def monthly_scores(records: list[dict], guild_id: int) -> dict[str, dict[int, dict]]:
+    """Aggregate one guild's completions into
+    ``{month: {user_id: {"points", "chores", "name"}}}``."""
+    months: dict[str, dict[int, dict]] = {}
+    for rec in records:
+        if rec.get("guild_id") != guild_id:
+            continue
+        bucket = months.setdefault(_rec_month(rec), {})
+        ent = bucket.setdefault(
+            rec["user_id"], {"points": 0, "chores": 0, "name": str(rec["user_id"])}
+        )
+        ent["points"] += _completion_points(rec)
+        ent["chores"] += 1
+        ent["name"] = rec.get("user_name", ent["name"])
+    return months
+
+
+def star_counts(records: list[dict], guild_id: int, current_month: str) -> dict[int, int]:
+    """Stars per user: one for each *past* month they led on points (a tie shares
+    the star). The current (and any future) month isn't decided yet, so it's
+    excluded — the title is still up for grabs until the month closes."""
+    stars: dict[int, int] = {}
+    for month, bucket in monthly_scores(records, guild_id).items():
+        if not month or month >= current_month or not bucket:
+            continue
+        top = max(ent["points"] for ent in bucket.values())
+        if top <= 0:
+            continue
+        for uid, ent in bucket.items():
+            if ent["points"] == top:
+                stars[uid] = stars.get(uid, 0) + 1
+    return stars
+
+
+@bot.tree.command(name="leaderboard", description="Monthly chore points & ⭐ stars")
 @app_commands.describe(month="Month as YYYY-MM (defaults to the current month)")
 async def leaderboard(interaction: discord.Interaction, month: Optional[str] = None) -> None:
     snap = await store.snapshot()
     cfg = guild_config(snap, interaction.guild_id)
     tz = ZoneInfo(cfg["timezone"]) if cfg and cfg.get("timezone") else UTC
+    current_month = now_utc().astimezone(tz).strftime("%Y-%m")
     if month is None:
-        month = now_utc().astimezone(tz).strftime("%Y-%m")
+        month = current_month
 
-    counts: dict[int, int] = {}
-    names: dict[int, str] = {}
-    for rec in store.read_completions():
-        if rec.get("guild_id") != interaction.guild_id:
-            continue
-        rec_month = rec.get("month") or str(rec.get("ts", ""))[:7]
-        if rec_month != month:
-            continue
-        uid = rec["user_id"]
-        counts[uid] = counts.get(uid, 0) + 1
-        names[uid] = rec.get("user_name", str(uid))
+    records = store.read_completions()
+    months = monthly_scores(records, interaction.guild_id)
+    stars = star_counts(records, interaction.guild_id, current_month)
 
-    if not counts:
+    # All-time display names so a star holder shows even when idle this month.
+    names = {uid: ent["name"] for bucket in months.values() for uid, ent in bucket.items()}
+    star_line = ""
+    if stars:
+        holders = sorted(stars.items(), key=lambda kv: (-kv[1], names.get(kv[0], "").lower()))
+        star_line = "⭐ **Stars** — " + " · ".join(f"<@{uid}> ×{n}" for uid, n in holders)
+
+    bucket = months.get(month, {})
+    if not bucket:
+        msg = f"No chores logged for **{month}** yet. Get to work! 🚜"
+        if star_line:
+            msg += "\n\n" + star_line
         await interaction.response.send_message(
-            f"No chores logged for **{month}** yet. Get to work! 🚜", ephemeral=True
+            msg, ephemeral=True, allowed_mentions=NO_PINGS
         )
         return
 
-    ranking = sorted(counts.items(), key=lambda kv: (-kv[1], names[kv[0]].lower()))
+    ranking = sorted(bucket.items(), key=lambda kv: (-kv[1]["points"], kv[1]["name"].lower()))
     medals = ["🥇", "🥈", "🥉"]
     lines = []
-    for i, (uid, count) in enumerate(ranking):
+    for i, (uid, ent) in enumerate(ranking):
         badge = medals[i] if i < 3 else f"`{i + 1}.`"
-        lines.append(f"{badge} <@{uid}> — **{count}**")
-    total = sum(counts.values())
-    msg = (
-        f"🏆 **Chore leaderboard — {month}**\n"
-        + "\n".join(lines)
-        + f"\n\n_{total} chore{'s' if total != 1 else ''} completed this month._"
+        star = f" ⭐×{stars[uid]}" if stars.get(uid) else ""
+        pts = ent["points"]
+        lines.append(f"{badge} <@{uid}> — **{pts} pt{'' if pts == 1 else 's'}**{star}")
+
+    total_pts = sum(ent["points"] for ent in bucket.values())
+    total_chores = sum(ent["chores"] for ent in bucket.values())
+    when = "this month" if month == current_month else f"in {month}"
+    footer = (
+        f"_{total_chores} chore{'' if total_chores == 1 else 's'} · "
+        f"{total_pts} pt{'' if total_pts == 1 else 's'} {when}._"
     )
+    if month == current_month:
+        footer += "\n⭐ Whoever tops the board when the month ends earns a star."
+
+    msg = f"🏆 **Chore leaderboard — {month}**\n" + "\n".join(lines)
+    if star_line:
+        msg += "\n\n" + star_line
+    msg += "\n\n" + footer
     await interaction.response.send_message(msg, allowed_mentions=NO_PINGS)
 
 

@@ -632,6 +632,88 @@ async def test_requeue_oneoff() -> None:
         assert snap["tasks"][tid]["recurring"] is False
 
 
+def test_points_and_stars() -> None:
+    """Pure scoring helpers: points (bounties double, legacy → 1) and the monthly
+    ⭐ stars derived from past months only (ties share the star)."""
+    from farmtracker.bot import _completion_points, monthly_scores, star_counts
+
+    assert _completion_points({}) == 1  # legacy record with no 'points' field
+    assert _completion_points({"points": 2}) == 2
+    assert _completion_points({"points": 0}) == 1  # bad value falls back to 1
+
+    recs = [
+        # April: Pat 3 (a bounty=2 plus a normal), Sam 1 -> Pat wins April.
+        {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat", "points": 2},
+        {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat"},
+        {"guild_id": 1, "month": "2026-04", "user_id": 2, "user_name": "Sam"},
+        # May: Pat 2, Sam 2 -> a tie, so both earn a star.
+        {"guild_id": 1, "month": "2026-05", "user_id": 1, "user_name": "Pat", "points": 2},
+        {"guild_id": 1, "month": "2026-05", "user_id": 2, "user_name": "Sam", "points": 2},
+        # June (the current month below): Sam leads but it's not decided yet.
+        {"guild_id": 1, "month": "2026-06", "user_id": 2, "user_name": "Sam", "points": 5},
+        # A different guild must never bleed in.
+        {"guild_id": 9, "month": "2026-04", "user_id": 1, "user_name": "X", "points": 99},
+    ]
+
+    months = monthly_scores(recs, 1)
+    assert set(months) == {"2026-04", "2026-05", "2026-06"}, "other guild excluded"
+    assert months["2026-04"][1] == {"points": 3, "chores": 2, "name": "Pat"}
+    assert months["2026-04"][2]["points"] == 1
+
+    # June is the current month -> excluded; Pat wins April, ties May -> 2 stars.
+    assert star_counts(recs, 1, current_month="2026-06") == {1: 2, 2: 1}
+    # Once July is current, June counts too and Sam leads it solo.
+    assert star_counts(recs, 1, current_month="2026-07") == {1: 2, 2: 2}
+
+
+async def test_bounty() -> None:
+    """A bounty is worth 2 points and its creator can't claim it; anyone else can."""
+    import farmtracker.bot as bot
+
+    with tempfile.TemporaryDirectory() as d:
+        st = Store(pathlib.Path(d) / "store.json", pathlib.Path(d) / "log.jsonl")
+        st.load()
+        bot.store = st  # handlers read the module global at call time
+        ch = FakeChannel()
+        bot.bot.get_channel = lambda cid: ch  # type: ignore[assignment]
+
+        now = m.now_utc()
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        tid, creator = "muck", 1
+        task = {
+            "id": tid, "guild_id": 1, "brief": "Muck out the barn", "description": None,
+            "bounty": True, "recurring": False, "freq": "once", "interval_days": 0,
+            "weekdays": [], "monthdays": [], "time_of_day": None,
+            "next_due": m.to_iso(now - dt.timedelta(seconds=1)),  # already due -> fires
+            "created_by": creator, "created_at": m.to_iso(now), "pending": None,
+        }
+        async with st.txn() as data:
+            data["configs"]["1"] = cfg
+            data["tasks"][tid] = task
+
+        await bot.fire_task(tid, ch, cfg)
+        posted = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][-1]
+        assert "💰" in (ch.msgs[posted].content or ""), "bounty post is tagged"
+
+        # The creator's ✅ must be declined — nothing completed, nothing logged.
+        await bot.on_raw_reaction_add(
+            FakePayload(posted, "✅", user_id=creator, member=FakeMember(creator, "Boss"))
+        )
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["pending"] is not None, "creator can't claim own bounty"
+        assert st.read_completions() == [], "a blocked self-claim logs nothing"
+        assert any("your** bounty" in (msg.content or "") for msg in ch.msgs.values())
+
+        # Someone else claims it -> completed and worth 2 points.
+        await bot.on_raw_reaction_add(
+            FakePayload(posted, "✅", user_id=2, member=FakeMember(2, "Pat"))
+        )
+        snap = await st.snapshot()
+        assert tid not in snap["tasks"], "a completed one-off bounty is removed"
+        comps = st.read_completions()
+        assert len(comps) == 1 and comps[0]["user_id"] == 2 and comps[0]["points"] == 2
+
+
 def main() -> None:
     test_emoji_key()
     test_time_parsing()
@@ -645,7 +727,9 @@ def main() -> None:
     test_roll_forward_dst()
     test_oneoff_parse()
     test_can_undo()
+    test_points_and_stars()
     asyncio.run(test_void_completion())
+    asyncio.run(test_bounty())
     asyncio.run(test_store())
     asyncio.run(test_lifecycle_and_snooze())
     asyncio.run(test_legacy_migration())

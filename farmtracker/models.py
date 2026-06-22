@@ -12,6 +12,7 @@ Task dict schema
     "guild_id":     int,            # discord server id
     "brief":        str,            # short text posted in the channel
     "description":  str | None,     # long text revealed by the info reaction
+    "bounty":       bool,           # worth 2 points; the creator can't complete it
     "recurring":    bool,           # True => repeats, False => one-off
     "freq":         str,            # "once"|"days"|"weekly"|"monthly" (see below)
     "interval_days":int,            # >=1 for freq "days" (1 == daily), else 0

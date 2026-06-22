@@ -3,8 +3,9 @@
 A small Discord bot for **small-scale farm chore logistics**. Create recurring
 or one-off chores; when each is due the bot posts it to your farm channel and
 self-reacts with buttons the family taps to complete, snooze, expand, or skip.
-Completions are logged so you can run a monthly **leaderboard** and gamify the
-family chores.
+Completions are logged so you can run a monthly **leaderboard** — with **points**,
+double-value **bounties**, and a **⭐ star** for each month's winner — to gamify
+the family chores.
 
 ---
 
@@ -14,6 +15,9 @@ family chores.
   (`1` = daily, `7` = weekly), specific **days of the week** (`mon,thu`,
   `weekdays`, `weekends`), or **days of the month** (`1st,15th`, `last day`).
   Each task has a mandatory **brief** and an optional longer **description**.
+- A task can be flagged a **bounty** (`/newtask … bounty:true`): it's worth
+  **2 points** instead of 1, and **only someone other than its creator** can
+  complete it — handy for a chore you're putting up for the rest of the family.
 - You say *when* with two friendly, optional fields:
   - **`at`** — a time or date in plain language: `now` (the default), `in 2h`,
     `tonight`, `18:00`, `6pm`, `tomorrow 8am`, `fri 19:00`, `next monday`,
@@ -41,11 +45,11 @@ family chores.
 | Command | Who | What |
 |---|---|---|
 | `/farmconfig` | Manage Server | Set the post **channel**, **timezone** (IANA, e.g. `Europe/Berlin`), and an optional **reminder role**. Run with no options to view current config. |
-| `/newtask` | anyone | `brief`, optional `at` (default **now**), optional `repeat` (default **once**), optional `description`. Both `at` and `repeat` autocomplete with a live preview. Posts a **public** confirmation so the family sees the new chore. |
-| `/edittask` | anyone | Change a task's `brief`, `at`, `repeat`, or `description` (or `clear_description`). Pick the task from autocomplete or paste its `id` from `/listtasks`. |
+| `/newtask` | anyone | `brief`, optional `at` (default **now**), optional `repeat` (default **once**), optional `description`, optional `bounty` (a 2-point chore the creator can't complete). Both `at` and `repeat` autocomplete with a live preview. Posts a **public** confirmation so the family sees the new chore. |
+| `/edittask` | anyone | Change a task's `brief`, `at`, `repeat`, `description` (or `clear_description`), or `bounty`. Pick the task from autocomplete or paste its `id` from `/listtasks`. |
 | `/deletetask` | anyone | Permanently delete a task (autocompletes existing tasks). |
 | `/listtasks` | anyone | List all tasks with their **`id`**, schedule, and when each next posts. |
-| `/leaderboard` | anyone | Monthly completion counts per person (`month` defaults to current). |
+| `/leaderboard` | anyone | Monthly **points** per person — one per chore, **two** per bounty — with each past month's winner shown by their **⭐ stars** (`month` defaults to current). |
 | `/farmhelp` | anyone | Quick reference for the commands, the `at`/`repeat` syntax, and the reactions. |
 | `/redeploy` | bot owner | `git pull`, `uv sync`, then restart the bot in place (same tmux pane, so the log continues). Reports the pull result and aborts without restarting if the pull or sync fails. See [Running & updating on a VPS](#running--updating-on-a-vps). |
 
@@ -57,6 +61,20 @@ family chores.
 - Right now (one-off): `/newtask brief:"Move the sheep"` *(at defaults to now, repeat to once)*
 - One-off later: `/newtask brief:"Vet visit" at:"tomorrow 14:00" description:"Bring vaccination records"`
 - Fix a typo / reschedule: `/edittask task:<id> brief:"Refill the water trough" repeat:"every 3 days"`
+- Put up a bounty: `/newtask brief:"Muck out the barn" bounty:true`
+
+### Bounties & stars
+- **Bounties** are chores you can't (or won't) do yourself. Create one with
+  `/newtask brief:"Muck out the barn" bounty:true` (or toggle it on an existing
+  task with `/edittask task:<id> bounty:true`). A bounty is **worth 2 points**
+  and its **creator can't tap ✅** — if they try, the bot gently declines and
+  leaves it for someone else. Bounty posts are tagged 💰 so everyone sees the prize.
+- **Points & stars** drive the `/leaderboard`. Every completed chore is a point;
+  bounties are two. At each month's end whoever has the most points wins and earns
+  a permanent **⭐ star**, shown next to their name on every future leaderboard
+  (a tie shares the star). The current month is still up for grabs, so its star
+  isn't awarded until the month closes. Stars are derived from the completion log,
+  so an **undo** that voids a completion also updates the standings honestly.
 
 ## Setup
 
