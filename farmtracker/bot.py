@@ -56,6 +56,7 @@ from .models import (
     DIGIT_EMOJI,
     EMOJI_DELETE,
     EMOJI_DONE,
+    EMOJI_END,
     EMOJI_FFWD,
     EMOJI_INFO,
     EMOJI_REQUEUE,
@@ -66,6 +67,7 @@ from .models import (
     UTC,
     describe_repeat,
     discord_ts,
+    doemup_apply,
     emoji_key,
     first_due,
     from_iso,
@@ -73,7 +75,11 @@ from .models import (
     next_due,
     now_utc,
     parse_repeat,
+    pitchin_add,
+    pitchin_remove,
     recurrence_of,
+    render_doemup,
+    render_pitchin,
     resolve_when,
     time_of_day_from,
     to_iso,
@@ -122,6 +128,9 @@ class FarmBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         scheduler.start()
+        # Revive every do-em-up's ➕/➖/End buttons after a restart in one shot —
+        # the do-em-up id rides in each button's custom_id (see DoEmUpButton).
+        self.add_dynamic_items(DoEmUpButton)
         dev_guild = os.getenv("DEV_GUILD_ID")
         if dev_guild:
             # Sync to one guild for instant availability while developing.
@@ -245,6 +254,8 @@ async def scheduler() -> None:
         except Exception:  # never let one bad task kill the loop
             log.exception("scheduler error on task %s", tid)
 
+    await sweep_games(now, snap)
+
 
 @scheduler.before_loop
 async def _before_scheduler() -> None:
@@ -336,6 +347,11 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if str(payload.message_id) in snap["snooze_panels"]:
         await _handle_snooze_panel(payload, channel)
         return
+    game = snap["game_messages"].get(str(payload.message_id))
+    if game:
+        if game["kind"] == "pitchin":
+            await _handle_pitchin_reaction(payload, channel, game["id"])
+        return  # do-em-ups resolve via buttons; ignore stray reactions on them
     tid = snap["messages"].get(str(payload.message_id))
     if not tid:
         return
@@ -360,6 +376,26 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         await _handle_done(tid, task, cfg, tz, channel, payload, mention, display)
     elif key == emoji_key(EMOJI_DELETE):
         await _handle_skip_or_delete(tid, task, tz, channel, mention)
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> None:
+    """Only meaningful for pitch-ins: pulling your ✅ before it closes drops you
+    from the scorers (Discord sends no member object on removals, so we match by
+    user id)."""
+    if bot.user and payload.user_id == bot.user.id:
+        return
+    if payload.guild_id is None:
+        return
+    if emoji_key(payload.emoji) != emoji_key(EMOJI_DONE):
+        return  # only a ✅ removal matters
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        return
+    snap = await store.snapshot()
+    game = snap["game_messages"].get(str(payload.message_id))
+    if game and game["kind"] == "pitchin":
+        await _handle_pitchin_unreact(payload, channel, game["id"])
 
 
 async def _remove_user_reaction(
@@ -901,6 +937,341 @@ async def _handle_requeue(
 
 
 # ---------------------------------------------------------------------------
+# Pitch-ins and do-em-ups  (ad-hoc point events; see models.py for the schemas)
+# ---------------------------------------------------------------------------
+# Both are posted immediately by their slash command into the configured farm
+# channel, resolve by people reacting (pitch-in ✅) or clicking buttons (do-em-up
+# ➕/➖), and close at an expiry/deadline, a point cap, or the creator's manual
+# end. Closing awards points to the same completion log as chores (with a
+# ``points`` field), so one /leaderboard totals chores and games alike. The
+# ``ended`` flag is flipped inside the same txn that pops the row, so an
+# expiry-tick and a manual end racing each other can only award once.
+def _game_tz(snap: dict, guild_id: int) -> ZoneInfo:
+    cfg = guild_config(snap, guild_id)
+    if cfg and cfg.get("timezone"):
+        try:
+            return ZoneInfo(cfg["timezone"])
+        except Exception:
+            pass
+    return UTC
+
+
+def _game_record(
+    event: dict, kind: str, user_id: int, user_name: str, points: int,
+    tz: ZoneInfo, now: dt.datetime,
+) -> dict:
+    """A completion-log row for one person's points from a pitch-in / do-em-up.
+    Same shape as a chore completion (so /leaderboard reads them uniformly) with
+    an added ``points`` count (chores omit it and are read as 1)."""
+    return {
+        "id": new_id(),
+        "ts": to_iso(now),
+        "month": now.astimezone(tz).strftime("%Y-%m"),  # local-tz bucket
+        "guild_id": event["guild_id"],
+        "task_id": event["id"],
+        "brief": event["brief"],
+        "user_id": user_id,
+        "user_name": user_name,
+        "kind": kind,  # "pitchin" | "doemup"
+        "points": points,
+        "due_at": to_iso(now),
+        "late_seconds": 0,
+    }
+
+
+def game_records(event: dict, kind: str, tz: ZoneInfo, now: dt.datetime) -> list[dict]:
+    """Every point-award row owed when an event closes: one per pitch-in scorer,
+    or one per do-em-up tallier (worth their unit count × ``points_each``)."""
+    pe = event.get("points_each", 1)
+    recs: list[dict] = []
+    if kind == "pitchin":
+        for s in event.get("scorers", []):
+            recs.append(_game_record(event, kind, s["user_id"], s["user_name"], pe, tz, now))
+    else:  # doemup
+        for key, e in event.get("tallies", {}).items():
+            if e.get("count", 0) > 0:
+                recs.append(_game_record(event, kind, int(key), e["name"], e["count"] * pe, tz, now))
+    return recs
+
+
+async def finalize_pitchin(pid: str, channel: discord.abc.Messageable) -> bool:
+    """Close a pitch-in: award every scorer, rewrite the post as a result line,
+    and clear its reactions. Returns False if it was already gone/closed."""
+    snap = await store.snapshot()
+    p0 = snap["pitchins"].get(pid)
+    if not p0:
+        return False
+    tz, now = _game_tz(snap, p0["guild_id"]), now_utc()
+    event = None
+    async with store.txn() as data:
+        p = data["pitchins"].get(pid)
+        if not p or p.get("ended"):
+            return False
+        p["ended"] = True
+        event = json.loads(json.dumps(p))
+        data["pitchins"].pop(pid, None)
+        data["game_messages"].pop(str(p.get("message_id")), None)
+    for rec in game_records(event, "pitchin", tz, now):
+        await store.log_completion(rec)
+    pm = channel.get_partial_message(event["message_id"])
+    try:
+        await pm.edit(content=render_pitchin(event, final=True), allowed_mentions=NO_PINGS)
+    except discord.HTTPException:
+        pass
+    try:
+        await pm.clear_reactions()
+    except discord.HTTPException:
+        pass
+    return True
+
+
+async def finalize_doemup(did: str, channel: discord.abc.Messageable) -> bool:
+    """Close a do-em-up: award each tallier their unit count × points_each,
+    rewrite the post as a result line, and drop its buttons."""
+    snap = await store.snapshot()
+    d0 = snap["doemups"].get(did)
+    if not d0:
+        return False
+    tz, now = _game_tz(snap, d0["guild_id"]), now_utc()
+    event = None
+    async with store.txn() as data:
+        d = data["doemups"].get(did)
+        if not d or d.get("ended"):
+            return False
+        d["ended"] = True
+        event = json.loads(json.dumps(d))
+        data["doemups"].pop(did, None)
+        data["game_messages"].pop(str(d.get("message_id")), None)
+    for rec in game_records(event, "doemup", tz, now):
+        await store.log_completion(rec)
+    try:
+        await channel.get_partial_message(event["message_id"]).edit(
+            content=render_doemup(event, final=True), view=None, allowed_mentions=NO_PINGS
+        )
+    except discord.HTTPException:
+        pass
+    return True
+
+
+async def post_pitchin(
+    channel: discord.abc.Messageable, *, guild_id: int, creator_id: int, brief: str,
+    description: Optional[str], expires_at: str, points_each: int,
+    max_scorers: Optional[int], now: dt.datetime,
+) -> tuple[str, discord.Message]:
+    pid = new_id()
+    p = {
+        "id": pid, "guild_id": guild_id, "channel_id": getattr(channel, "id", None),
+        "message_id": None, "brief": brief, "description": description,
+        "created_by": creator_id, "created_at": to_iso(now),
+        "points_each": points_each, "max_scorers": max_scorers,
+        "expires_at": expires_at, "scorers": [], "ended": False,
+    }
+    msg = await channel.send(render_pitchin(p), allowed_mentions=NO_PINGS)
+    try:
+        await msg.add_reaction(EMOJI_DONE)
+        await msg.add_reaction(EMOJI_END)
+    except discord.HTTPException:
+        pass
+    async with store.txn() as data:
+        p["message_id"] = msg.id
+        data["pitchins"][pid] = p
+        data["game_messages"][str(msg.id)] = {"kind": "pitchin", "id": pid}
+    return pid, msg
+
+
+async def post_doemup(
+    channel: discord.abc.Messageable, *, guild_id: int, creator_id: int, brief: str,
+    description: Optional[str], points_each: int, deadline: Optional[str],
+    point_limit: Optional[int], now: dt.datetime,
+) -> tuple[str, discord.Message]:
+    did = new_id()
+    d = {
+        "id": did, "guild_id": guild_id, "channel_id": getattr(channel, "id", None),
+        "message_id": None, "brief": brief, "description": description,
+        "created_by": creator_id, "created_at": to_iso(now),
+        "points_each": points_each, "deadline": deadline, "point_limit": point_limit,
+        "tallies": {}, "ended": False,
+    }
+    msg = await channel.send(
+        render_doemup(d), view=make_doemup_view(did), allowed_mentions=NO_PINGS
+    )
+    async with store.txn() as data:
+        d["message_id"] = msg.id
+        data["doemups"][did] = d
+        data["game_messages"][str(msg.id)] = {"kind": "doemup", "id": did}
+    return did, msg
+
+
+async def _handle_pitchin_reaction(
+    payload: discord.RawReactionActionEvent, channel: discord.abc.Messageable, pid: str
+) -> None:
+    """A ✅ (pitch in) or 🏁 (creator: end now) on a pitch-in post."""
+    key = emoji_key(payload.emoji)
+    reacted = channel.get_partial_message(payload.message_id)
+
+    if key == emoji_key(EMOJI_END):
+        snap = await store.snapshot()
+        p = snap["pitchins"].get(pid)
+        if not p or p.get("ended"):
+            return
+        if payload.user_id == p["created_by"]:
+            await finalize_pitchin(pid, channel)
+        else:
+            await _remove_user_reaction(reacted, payload)  # only the creator ends it
+        return
+
+    if key != emoji_key(EMOJI_DONE):
+        return  # any other reaction on the post — ignore
+
+    member = payload.member
+    name = member.display_name if member else str(payload.user_id)
+    body = None
+    do_finalize = False
+    async with store.txn() as data:
+        p = data["pitchins"].get(pid)
+        if not p or p.get("ended"):
+            return
+        res = pitchin_add(p, payload.user_id, name)
+        if res["changed"]:
+            if res["full"]:
+                do_finalize = True  # cap reached — close it now
+            else:
+                body = render_pitchin(p)
+    if do_finalize:
+        await finalize_pitchin(pid, channel)
+    elif body is not None:
+        try:
+            await reacted.edit(content=body, allowed_mentions=NO_PINGS)
+        except discord.HTTPException:
+            pass
+
+
+async def _handle_pitchin_unreact(
+    payload: discord.RawReactionActionEvent, channel: discord.abc.Messageable, pid: str
+) -> None:
+    """A ✅ pulled off a still-open pitch-in drops that person before it closes."""
+    body = None
+    async with store.txn() as data:
+        p = data["pitchins"].get(pid)
+        if not p or p.get("ended"):
+            return
+        if pitchin_remove(p, payload.user_id):
+            body = render_pitchin(p)
+    if body is not None:
+        try:
+            await channel.get_partial_message(payload.message_id).edit(
+                content=body, allowed_mentions=NO_PINGS
+            )
+        except discord.HTTPException:
+            pass
+
+
+async def _doemup_press(did: str, action: str, user_id: int, user_name: str) -> dict:
+    """Apply a do-em-up button press inside a txn and report what to do next:
+    ``status`` ∈ {gone, error, changed, final} (+ the new ``body`` when changed).
+    ``final`` means the caller should run :func:`finalize_doemup`."""
+    out = {"status": "gone", "body": None}
+    async with store.txn() as data:
+        d = data["doemups"].get(did)
+        if not d or d.get("ended"):
+            return out
+        res = doemup_apply(d, action, user_id, user_name)
+        if res["error"] == "not_creator":
+            out["status"] = "error"
+        elif res["final"]:
+            out["status"] = "final"  # ➕ hit the cap, or the creator tapped End
+        else:
+            out["status"] = "changed"
+            out["body"] = render_doemup(d)
+    return out
+
+
+async def handle_doemup_button(
+    did: str, action: str, interaction: discord.Interaction
+) -> None:
+    res = await _doemup_press(did, action, interaction.user.id, interaction.user.display_name)
+    status = res["status"]
+    if status == "gone":
+        await interaction.response.send_message(
+            "That do-em-up has already closed.", ephemeral=True
+        )
+    elif status == "error":
+        await interaction.response.send_message(
+            "Only the person who started this do-em-up can end it.", ephemeral=True
+        )
+    elif status == "final":
+        await interaction.response.defer()  # finalize edits the post itself
+        await finalize_doemup(did, interaction.channel)
+    else:  # changed — update the live tally in place
+        await interaction.response.edit_message(content=res["body"], view=make_doemup_view(did))
+
+
+class DoEmUpButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"doemup:(?P<action>plus|minus|end):(?P<did>[0-9a-f]+)",
+):
+    """A persistent ➕ / ➖ / 🏁End button. The do-em-up id rides in the
+    custom_id, so a single ``add_dynamic_items`` registration on startup revives
+    every do-em-up's buttons after a restart with no per-message bookkeeping."""
+
+    LABELS = {"plus": "➕", "minus": "➖", "end": f"{EMOJI_END} End"}
+    STYLES = {
+        "plus": discord.ButtonStyle.success,
+        "minus": discord.ButtonStyle.secondary,
+        "end": discord.ButtonStyle.danger,
+    }
+
+    def __init__(self, did: str, action: str) -> None:
+        self.did = did
+        self.action = action
+        super().__init__(
+            discord.ui.Button(
+                label=self.LABELS[action],
+                style=self.STYLES[action],
+                custom_id=f"doemup:{action}:{did}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):  # noqa: ANN001
+        return cls(match["did"], match["action"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await handle_doemup_button(self.did, self.action, interaction)
+
+
+def make_doemup_view(did: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(DoEmUpButton(did, "plus"))
+    view.add_item(DoEmUpButton(did, "minus"))
+    view.add_item(DoEmUpButton(did, "end"))
+    return view
+
+
+async def sweep_games(now: dt.datetime, snap: dict) -> None:
+    """Close any pitch-in past its expiry / do-em-up past its deadline. Driven by
+    the scheduler tick, so closures that fell due while the bot was down fire on
+    the next tick — exactly like chore reminders."""
+    for pid, p in list(snap.get("pitchins", {}).items()):
+        try:
+            if not p.get("ended") and now >= from_iso(p["expires_at"]):
+                ch = bot.get_channel(int(p["channel_id"])) if p.get("channel_id") else None
+                if ch is not None:
+                    await finalize_pitchin(pid, ch)
+        except Exception:
+            log.exception("scheduler error on pitchin %s", pid)
+    for did, d in list(snap.get("doemups", {}).items()):
+        try:
+            dl = d.get("deadline")
+            if not d.get("ended") and dl and now >= from_iso(dl):
+                ch = bot.get_channel(int(d["channel_id"])) if d.get("channel_id") else None
+                if ch is not None:
+                    await finalize_doemup(did, ch)
+        except Exception:
+            log.exception("scheduler error on doemup %s", did)
+
+
+# ---------------------------------------------------------------------------
 # Scheduling from user input (shared by /newtask and /edittask)
 # ---------------------------------------------------------------------------
 def schedule_from_rule(
@@ -1355,6 +1726,134 @@ for _cmd in (deletetask, edittask):
     _cmd.autocomplete("task")(task_autocomplete)
 
 
+@bot.tree.command(
+    name="pitchin",
+    description="Start a pitch-in: everyone who ✅s before it closes earns a point",
+)
+@app_commands.describe(
+    brief="What to pitch in on, e.g. 'laundry bonanza' (required)",
+    expires="When it closes — in 2h, tonight, 18:00, tomorrow 8am (default: in 24h)",
+    points="Points each pitcher-inner earns (default: 1)",
+    max_scorers="Optional cap: only the first N to pitch in score",
+    description="Optional extra details shown on the post",
+)
+async def pitchin(
+    interaction: discord.Interaction,
+    brief: app_commands.Range[str, 1, 200],
+    expires: Optional[str] = None,
+    points: app_commands.Range[int, 1, 100] = 1,
+    max_scorers: Optional[app_commands.Range[int, 1, 100]] = None,
+    description: Optional[str] = None,
+) -> None:
+    snap = await store.snapshot()
+    cfg = guild_config(snap, interaction.guild_id)
+    if not config_ready(cfg):
+        await interaction.response.send_message(
+            "❌ Run `/farmconfig` to set a channel and timezone first.", ephemeral=True
+        )
+        return
+    tz, now = ZoneInfo(cfg["timezone"]), now_utc()
+    try:
+        exp = resolve_when(expires, tz, now) if expires else now + dt.timedelta(hours=24)
+    except ValueError as e:
+        await interaction.response.send_message(
+            f"❌ {e}\nSee `/farmhelp` for the time formats.", ephemeral=True
+        )
+        return
+    if exp <= now:
+        await interaction.response.send_message(
+            "❌ That close time is already in the past.", ephemeral=True
+        )
+        return
+    channel = bot.get_channel(int(cfg["channel_id"]))
+    if channel is None:
+        await interaction.response.send_message(
+            "❌ I can't see the configured channel — check `/farmconfig`.", ephemeral=True
+        )
+        return
+
+    await post_pitchin(
+        channel, guild_id=interaction.guild_id, creator_id=interaction.user.id,
+        brief=str(brief), description=(description[:1000] if description else None),
+        expires_at=to_iso(exp), points_each=int(points),
+        max_scorers=(int(max_scorers) if max_scorers else None), now=now,
+    )
+    cap = f" · first {max_scorers} score" if max_scorers else ""
+    await interaction.response.send_message(
+        f"🤝 Posted **{brief}** in <#{cfg['channel_id']}> — "
+        f"closes {discord_ts(exp, 'R')}{cap}.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="doemup",
+    description="Start a do-em-up: tap ➕ for each one you do; points tally live",
+)
+@app_commands.describe(
+    brief="What's being done one-at-a-time, e.g. 'thistle bush removed' (required)",
+    points="Points per ➕ (default: 1)",
+    deadline="Optional auto-close time — tonight, in 3h, tomorrow 18:00",
+    point_limit="Optional cap: auto-close once this many points are tallied",
+    description="Optional extra details shown on the post",
+)
+async def doemup(
+    interaction: discord.Interaction,
+    brief: app_commands.Range[str, 1, 200],
+    points: app_commands.Range[int, 1, 100] = 1,
+    deadline: Optional[str] = None,
+    point_limit: Optional[app_commands.Range[int, 1, 100000]] = None,
+    description: Optional[str] = None,
+) -> None:
+    snap = await store.snapshot()
+    cfg = guild_config(snap, interaction.guild_id)
+    if not config_ready(cfg):
+        await interaction.response.send_message(
+            "❌ Run `/farmconfig` to set a channel and timezone first.", ephemeral=True
+        )
+        return
+    tz, now = ZoneInfo(cfg["timezone"]), now_utc()
+    deadline_iso = None
+    if deadline:
+        try:
+            dl = resolve_when(deadline, tz, now)
+        except ValueError as e:
+            await interaction.response.send_message(
+                f"❌ {e}\nSee `/farmhelp` for the time formats.", ephemeral=True
+            )
+            return
+        if dl <= now:
+            await interaction.response.send_message(
+                "❌ That deadline is already in the past.", ephemeral=True
+            )
+            return
+        deadline_iso = to_iso(dl)
+    channel = bot.get_channel(int(cfg["channel_id"]))
+    if channel is None:
+        await interaction.response.send_message(
+            "❌ I can't see the configured channel — check `/farmconfig`.", ephemeral=True
+        )
+        return
+
+    await post_doemup(
+        channel, guild_id=interaction.guild_id, creator_id=interaction.user.id,
+        brief=str(brief), description=(description[:1000] if description else None),
+        points_each=int(points), deadline=deadline_iso,
+        point_limit=(int(point_limit) if point_limit else None), now=now,
+    )
+    closes = f" — closes {discord_ts(from_iso(deadline_iso), 'R')}" if deadline_iso else ""
+    await interaction.response.send_message(
+        f"💪 Posted **{brief}** in <#{cfg['channel_id']}> — tap ➕ as you go{closes}.",
+        ephemeral=True,
+    )
+
+
+# The friendly "when" autocomplete (live preview of the resolved instant) is the
+# same one /newtask uses for `at`.
+pitchin.autocomplete("expires")(at_autocomplete)
+doemup.autocomplete("deadline")(at_autocomplete)
+
+
 @bot.tree.command(name="listtasks", description="List every task with its id, schedule, and next post")
 async def listtasks(interaction: discord.Interaction) -> None:
     snap = await store.snapshot()
@@ -1414,6 +1913,8 @@ async def farmhelp(interaction: discord.Interaction) -> None:
         name="Commands",
         value=(
             "• `/newtask` — add a chore (see scheduling below; `bounty:true` for a 2-pointer)\n"
+            "• `/pitchin` — group task: everyone who ✅s before it closes scores\n"
+            "• `/doemup` — per-unit task: tap ➕ for each one you do\n"
             "• `/listtasks` — list chores with their ids\n"
             "• `/edittask` — change a chore (paste its id from the list)\n"
             "• `/deletetask` — remove a chore for good\n"
@@ -1461,9 +1962,22 @@ async def farmhelp(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
+    embed.add_field(
+        name="Pitch-ins & do-em-ups (bonus points 🏆)",
+        value=(
+            "• `/pitchin brief:\"laundry bonanza\"` — everyone who taps ✅ before it "
+            "closes earns a point. Optional `expires` (default 24h), `points` each, "
+            "and `max_scorers` (only the first N score). 🏁 ends it early.\n"
+            "• `/doemup brief:\"thistle bush removed\"` — tap ➕ once per one you did "
+            "(➖ to fix); the tally updates live. Optional `points` each, `deadline`, "
+            "and `point_limit` (auto-closes at that total). 🏁 ends it.\n"
+            "Points from both feed the `/leaderboard`."
+        ),
+        inline=False,
+    )
     embed.set_footer(
         text="e.g.  /newtask brief:Trash out at:19:00 repeat:mon,thu   ·   "
-        "/newtask brief:Vet visit at:tomorrow 14:00"
+        "/pitchin brief:Laundry bonanza expires:tonight"
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 

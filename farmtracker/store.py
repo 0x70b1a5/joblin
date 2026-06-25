@@ -35,6 +35,9 @@ EMPTY: dict[str, Any] = {
     "undo": {},
     "requeue": {},  # completed-post message id -> {task_id, before, guild_id, channel_id}
     "snooze_panels": {},  # panel message id -> {task_id, anchor_id, unit, brief}
+    "pitchins": {},  # pitch-in id -> pitch-in dict (see models.py)
+    "doemups": {},  # do-em-up id -> do-em-up dict (see models.py)
+    "game_messages": {},  # message id -> {"kind": "pitchin"|"doemup", "id": <game id>}
 }
 
 

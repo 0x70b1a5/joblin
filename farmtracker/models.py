@@ -70,6 +70,9 @@ EMOJI_INFO = "ℹ️"
 EMOJI_DELETE = "❌"
 EMOJI_UNDO = "↩️"  # appears after a ✅/⏩/❌ action so it can be reverted
 EMOJI_REQUEUE = "🔄"  # appears on a ✅-completed post to re-fire the chore now
+EMOJI_END = "🏁"  # creator-only "end now" on a pitch-in (✅) or do-em-up post
+EMOJI_HANDSHAKE = "🤝"  # header icon on a pitch-in post
+EMOJI_FLEX = "💪"  # header icon on a do-em-up post
 
 # Snooze "numpad": tapping ⏩ opens a *separate* panel message that self-reacts
 # with these, so the task post itself stays uncluttered. Pick a number; toggle
@@ -552,3 +555,187 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
     if rule["freq"] == "monthly":
         return _next_monthly(rule["monthdays"], tz, h, mi, anchor)
     raise ValueError(f"{rule['freq']} is not a recurring rule")
+
+
+# ===========================================================================
+# Pitch-ins and do-em-ups: ad-hoc, post-now point events (no recurrence).
+# ===========================================================================
+# These live in their own store sections (``pitchins`` / ``doemups``) rather
+# than ``tasks``, because they have nothing to do with the scheduling/nag
+# machinery: they are posted immediately by their slash command and resolve by
+# people reacting/clicking, then close at an expiry/deadline, a point cap, or a
+# creator's manual end. Points they award are written to the same completion log
+# as chores (with a ``points`` field) so a single ``/leaderboard`` totals both.
+#
+# pitch-in dict schema
+# --------------------
+# A shared call to action ("laundry bonanza"): everyone who taps ✅ before it
+# closes earns ``points_each`` (default 1). Closes at ``expires_at``, when the
+# creator taps 🏁, or — if ``max_scorers`` is set — once that many have pitched
+# in (first-come).
+# {
+#     "id":          str,            # short unique id
+#     "guild_id":    int,
+#     "channel_id":  int | None,     # where the post lives
+#     "message_id":  int | None,     # the post itself (set right after sending)
+#     "brief":       str,
+#     "description": str | None,
+#     "created_by":  int,            # only this user's 🏁 ends it early
+#     "created_at":  str,            # ISO-8601 UTC
+#     "points_each": int,            # points every pitcher-inner earns (>=1)
+#     "max_scorers": int | None,     # optional cap on how many can score
+#     "expires_at":  str,            # ISO-8601 UTC; auto-closes at/after this
+#     "scorers":     list[dict],     # [{"user_id": int, "user_name": str}, …]
+#     "ended":       bool,           # set true the instant it finalizes (a guard
+#                                    #   so an expiry/manual-end race can't
+#                                    #   double-award before the row is popped)
+# }
+#
+# do-em-up dict schema
+# --------------------
+# A per-unit grind ("1 pt per thistle bush"): each ➕ adds one unit to that
+# person's tally for ``points_each`` points; ➖ corrects a mistake. The post
+# edits itself to show the running tallies. Closes at an optional ``deadline``,
+# the creator's 🏁, or — if ``point_limit`` is set — once that many points have
+# been tallied in total.
+# {
+#     …same id/guild_id/channel_id/message_id/brief/description/created_by/
+#       created_at/points_each/ended fields as above…
+#     "deadline":    str | None,     # ISO-8601 UTC auto-close, or None (open)
+#     "point_limit": int | None,     # optional total-points cap
+#     "tallies":     dict,           # {str(user_id): {"name": str, "count": int}}
+# }
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+# --- Pitch-ins -------------------------------------------------------------
+def pitchin_is_full(p: dict) -> bool:
+    """True once an optional ``max_scorers`` cap has been reached."""
+    cap = p.get("max_scorers")
+    return cap is not None and len(p.get("scorers", [])) >= cap
+
+
+def pitchin_add(p: dict, user_id: int, user_name: str) -> dict:
+    """Record a ✅ from ``user_id``. Returns ``{"changed", "full"}``: ``changed``
+    is True only if a *new* scorer was added (already-present or over-cap taps
+    don't change anything). ``full`` reflects the state *after* the attempt."""
+    scorers = p.setdefault("scorers", [])
+    if any(s["user_id"] == user_id for s in scorers):
+        return {"changed": False, "full": pitchin_is_full(p)}
+    if pitchin_is_full(p):
+        return {"changed": False, "full": True}
+    scorers.append({"user_id": user_id, "user_name": user_name})
+    return {"changed": True, "full": pitchin_is_full(p)}
+
+
+def pitchin_remove(p: dict, user_id: int) -> bool:
+    """Drop a scorer (they un-reacted before it closed). Returns True if removed."""
+    scorers = p.get("scorers", [])
+    kept = [s for s in scorers if s["user_id"] != user_id]
+    p["scorers"] = kept
+    return len(kept) != len(scorers)
+
+
+def render_pitchin(p: dict, *, final: bool = False) -> str:
+    """The pitch-in post body — live (with ✅ call to action) or finalized."""
+    brief = p["brief"]
+    pe = p.get("points_each", 1)
+    each = f"+{pe} each" if pe != 1 else "+1 each"
+    scorers = p.get("scorers", [])
+    names = ", ".join(s["user_name"] for s in scorers) if scorers else "—"
+
+    if final:
+        if scorers:
+            return (
+                f"{EMOJI_HANDSHAKE} ~~**{brief}**~~ — pitched in! "
+                f"{each} to {names}  ({len(scorers)})"
+            )
+        return f"{EMOJI_HANDSHAKE} ~~**{brief}**~~ — closed with no takers."
+
+    cap = p.get("max_scorers")
+    count = f"{len(scorers)}/{cap}" if cap else f"{len(scorers)}"
+    exp = from_iso(p["expires_at"])
+    desc = f"\n{p['description']}" if p.get("description") else ""
+    return (
+        f"{EMOJI_HANDSHAKE} **{brief}**  ·  {each}{desc}\n"
+        f"Tap ✅ to pitch in — closes {discord_ts(exp, 'R')}.  "
+        f"_(creator: {EMOJI_END} to end now)_\n"
+        f"**Pitched in ({count}):** {names}"
+    )
+
+
+# --- Do-em-ups -------------------------------------------------------------
+def doemup_total_points(d: dict) -> int:
+    """Total points tallied so far = (sum of unit counts) × points_each."""
+    units = sum(e.get("count", 0) for e in d.get("tallies", {}).values())
+    return units * d.get("points_each", 1)
+
+
+def doemup_apply(d: dict, action: str, user_id: int, user_name: str) -> dict:
+    """Apply a ➕ / ➖ / 🏁 button press to a do-em-up (mutating ``d``).
+
+    Returns ``{"changed", "final", "error"}``:
+      * ``"plus"``  — add one unit to this user's tally; ``final`` is True if an
+                      optional ``point_limit`` is now reached.
+      * ``"minus"`` — remove one of this user's units (floored at zero).
+      * ``"end"``   — request a manual close; ``error`` is ``"not_creator"``
+                      unless ``user_id`` created the do-em-up, else ``final``.
+    """
+    tallies = d.setdefault("tallies", {})
+    key = str(user_id)
+    if action == "plus":
+        entry = tallies.setdefault(key, {"name": user_name, "count": 0})
+        entry["name"] = user_name  # keep the display name fresh
+        entry["count"] += 1
+        limit = d.get("point_limit")
+        final = limit is not None and doemup_total_points(d) >= limit
+        return {"changed": True, "final": final, "error": None}
+    if action == "minus":
+        entry = tallies.get(key)
+        if not entry or entry["count"] <= 0:
+            return {"changed": False, "final": False, "error": None}
+        entry["count"] -= 1
+        if entry["count"] <= 0:
+            tallies.pop(key, None)
+        return {"changed": True, "final": False, "error": None}
+    if action == "end":
+        if user_id != d.get("created_by"):
+            return {"changed": False, "final": False, "error": "not_creator"}
+        return {"changed": False, "final": True, "error": None}
+    return {"changed": False, "final": False, "error": "unknown"}
+
+
+def render_doemup(d: dict, *, final: bool = False) -> str:
+    """The do-em-up post body — live (with the ➕/➖ tally) or finalized."""
+    brief = d["brief"]
+    pe = d.get("points_each", 1)
+    per = f"+{pe} each" if pe != 1 else "+1 each"
+    parts = [
+        f"{e['name']} ×{e['count']}"
+        for e in d.get("tallies", {}).values()
+        if e.get("count", 0) > 0
+    ]
+    tally_line = " · ".join(parts) if parts else "—"
+    total = doemup_total_points(d)
+
+    if final:
+        if parts:
+            return (
+                f"{EMOJI_FLEX} ~~**{brief}**~~ — done!\n"
+                f"{tally_line}  —  **{_plural(total, 'pt')}** logged"
+            )
+        return f"{EMOJI_FLEX} ~~**{brief}**~~ — closed with nothing tallied."
+
+    limit = d.get("point_limit")
+    head = f"{total}/{limit} pts" if limit else f"**{_plural(total, 'pt')}**"
+    dl = d.get("deadline")
+    closes = f" — closes {discord_ts(from_iso(dl), 'R')}" if dl else ""
+    desc = f"\n{d['description']}" if d.get("description") else ""
+    return (
+        f"{EMOJI_FLEX} **{brief}**  ·  {per}{closes}{desc}\n"
+        f"Tap ➕ each time you finish one (➖ to fix).\n"
+        f"**Tally:** {tally_line}  —  {head}"
+    )

@@ -46,10 +46,12 @@ the family chores.
 |---|---|---|
 | `/farmconfig` | Manage Server | Set the post **channel**, **timezone** (IANA, e.g. `Europe/Berlin`), and an optional **reminder role**. Run with no options to view current config. |
 | `/newtask` | anyone | `brief`, optional `at` (default **now**), optional `repeat` (default **once**), optional `description`, optional `bounty` (a 2-point chore the creator can't complete). Both `at` and `repeat` autocomplete with a live preview. Posts a **public** confirmation so the family sees the new chore. |
+| `/pitchin` | anyone | Post a **pitch-in**: `brief`, optional `expires` (default **24h**), `points` each (default 1), `max_scorers`, `description`. Everyone who taps ✅ before it closes earns a point. See [Pitch-ins & do-em-ups](#pitch-ins--do-em-ups). |
+| `/doemup` | anyone | Post a **do-em-up**: `brief`, optional `points` per ➕ (default 1), `deadline`, `point_limit`, `description`. Tap ➕ once per thing you did; the tally updates live. See [Pitch-ins & do-em-ups](#pitch-ins--do-em-ups). |
 | `/edittask` | anyone | Change a task's `brief`, `at`, `repeat`, `description` (or `clear_description`), or `bounty`. Pick the task from autocomplete or paste its `id` from `/listtasks`. |
 | `/deletetask` | anyone | Permanently delete a task (autocompletes existing tasks). |
 | `/listtasks` | anyone | List all tasks with their **`id`**, schedule, and when each next posts. |
-| `/leaderboard` | anyone | Monthly **points** per person — one per chore, **two** per bounty — with each past month's winner shown by their **⭐ stars** (`month` defaults to current). |
+| `/leaderboard` | anyone | Monthly **points** per person — one per chore, **two** per bounty, plus pitch-in / do-em-up points — with each past month's winner shown by their **⭐ stars** (`month` defaults to current). |
 | `/farmhelp` | anyone | Quick reference for the commands, the `at`/`repeat` syntax, and the reactions. |
 | `/redeploy` | bot owner | `git pull`, `uv sync`, then restart the bot in place (same tmux pane, so the log continues). Reports the pull result and aborts without restarting if the pull or sync fails. See [Running & updating on a VPS](#running--updating-on-a-vps). |
 
@@ -75,6 +77,38 @@ the family chores.
   (a tie shares the star). The current month is still up for grabs, so its star
   isn't awarded until the month closes. Stars are derived from the completion log,
   so an **undo** that voids a completion also updates the standings honestly.
+
+## Pitch-ins & do-em-ups
+
+Two lightweight, **post-now** task types for ad-hoc bursts of work — unlike chores
+they don't schedule or recur; you fire one off and the family piles on. Both award
+points to the same monthly **`/leaderboard`** as chores (a chore completion is
+worth 1 point).
+
+- **`/pitchin`** — a shared call to action (a "laundry bonanza"). The bot posts it
+  and self-reacts ✅; **everyone who taps ✅ before it closes earns a point** — so a
+  bonanza with three pitcher-inners is +1 to all three. It closes at its `expires`
+  time (**default 24h**) or when the creator taps 🏁. Options: `points` (worth more
+  than one each) and `max_scorers` (only the first *N* score, and it closes the
+  moment it fills). Pull your ✅ back off before it closes and you drop out.
+  - `/pitchin brief:"Laundry bonanza" expires:tonight`
+  - `/pitchin brief:"Stack the firewood" points:2 max_scorers:4`
+
+- **`/doemup`** — one point **per thing done** ("1 pt per thistle bush removed").
+  The post carries **➕ / ➖** buttons: tap ➕ once for each one you do (➖ to fix a
+  miscount) and the message **edits itself** to show a live per-person tally and
+  running total. It stays open until an optional `deadline`, an optional
+  `point_limit` (auto-closes once that many points are tallied), or the creator
+  taps **🏁 End**. Option: `points` (per ➕).
+  - `/doemup brief:"Thistle bush removed"`
+  - `/doemup brief:"Bale stacked" deadline:"tomorrow 18:00" point_limit:200`
+
+When a pitch-in or do-em-up closes, its post is rewritten in place as a one-line
+result (e.g. *"🤝 Laundry bonanza — pitched in! +1 each to Ann, Bo & Cy"*) and its
+points are written to the leaderboard. Both **survive restarts** like everything
+else: the live state lives in the store, the do-em-up buttons are re-registered on
+startup, and each close is driven by the same 30-second tick as chore reminders —
+so a close that fell due while the bot was down simply fires on the next tick.
 
 ## Setup
 
@@ -159,13 +193,19 @@ mid-tick is safe and the bot resumes cleanly on restart.
 
 ## How it’s built
 
-- **`discord.py`** for the gateway, slash commands, and raw reaction events.
-- A **30-second scheduler tick** (`discord.ext.tasks`) fires due tasks and sends
-  hourly nags. It compares `now` against each task's persisted `next_due` /
-  `remind_at`, so it's naturally restart-safe and never replays a backlog.
-- **Storage** is a single JSON document (`data/store.json`) for config + tasks,
-  plus an append-only JSONL **completion log** (`data/completions.jsonl`) for
-  stats. The bot is a single asyncio process, so concurrency safety is just an
+- **`discord.py`** for the gateway, slash commands, raw reaction events, and
+  persistent message buttons (the do-em-up ➕/➖/🏁, revived after a restart with
+  one `add_dynamic_items` call — the do-em-up id rides in each button's custom_id).
+- A **30-second scheduler tick** (`discord.ext.tasks`) fires due tasks, sends
+  hourly nags, and closes expired pitch-ins / past-deadline do-em-ups. It compares
+  `now` against each task's persisted `next_due` / `remind_at` (and each game's
+  `expires_at` / `deadline`), so it's naturally restart-safe and never replays a
+  backlog.
+- **Storage** is a single JSON document (`data/store.json`) for config, tasks, and
+  live pitch-ins / do-em-ups, plus an append-only JSONL **completion log**
+  (`data/completions.jsonl`) for stats — chore completions and pitch-in / do-em-up
+  points both land there (the latter carry a `points` count), so one query totals
+  the leaderboard. The bot is a single asyncio process, so concurrency safety is just an
   `asyncio.Lock` around each read-modify-write plus **atomic writes** (temp file
   + `fsync` + `os.replace`) so a crash can't corrupt the store. See the module
   docstring in `farmtracker/store.py`. Swapping to SQLite later is easy if the
@@ -175,9 +215,9 @@ mid-tick is safe and the bot resumes cleanly on restart.
 ```
 farmtracker/
   models.py   # task schema, natural-language `at` parsing, `repeat` rules,
-              #   and DST-aware recurrence (every-N-days / weekday / monthly)
+              #   DST-aware recurrence, and pitch-in / do-em-up render + tally
   store.py    # JSON store (asyncio.Lock + atomic writes) + completion log
-  bot.py      # commands, scheduler tick, reaction handlers, entry point
+  bot.py      # commands, scheduler tick, reaction + button handlers, entry point
 ```
 
 ## Notes & caveats

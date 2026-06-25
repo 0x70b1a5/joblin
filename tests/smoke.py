@@ -283,6 +283,7 @@ class FakeMessage:
         self.id = mid
         self.channel = channel
         self.content = None
+        self.view = None
 
     async def add_reaction(self, emoji) -> None:
         self.channel.added.append((self.id, str(emoji)))
@@ -291,10 +292,12 @@ class FakeMessage:
         pass
 
     async def clear_reactions(self) -> None:
-        pass
+        self.channel.cleared.append(self.id)
 
-    async def edit(self, content=None, allowed_mentions=None) -> None:
+    async def edit(self, content=None, **kw) -> None:  # absorbs view=/allowed_mentions=
         self.content = content
+        if "view" in kw:
+            self.view = kw["view"]
 
     async def delete(self) -> None:
         self.channel.deleted.append(self.id)
@@ -306,6 +309,7 @@ class FakeChannel:
         self.msgs: dict[int, FakeMessage] = {}
         self.added: list = []
         self.deleted: list = []
+        self.cleared: list = []
         self._next = 1000
 
     async def send(self, content=None, allowed_mentions=None, **kw) -> FakeMessage:
@@ -335,6 +339,271 @@ class FakePayload:
         self.member = member
         self.guild_id = guild_id
         self.channel_id = channel_id
+
+
+class FakeUser:
+    def __init__(self, uid: int, name: str) -> None:
+        self.id = uid
+        self.display_name = name
+        self.mention = f"<@{uid}>"
+
+
+class FakeResponse:
+    """Captures whatever a command / button handler does with the interaction."""
+
+    def __init__(self) -> None:
+        self.content = None
+        self.embed = None
+        self.ephemeral = None
+        self.view = None
+        self._done = False
+
+    async def send_message(self, content=None, *, ephemeral=False, embed=None,
+                           allowed_mentions=None) -> None:
+        self.content, self.embed, self.ephemeral, self._done = content, embed, ephemeral, True
+
+    async def edit_message(self, content=None, *, view=None, allowed_mentions=None) -> None:
+        self.content, self.view, self._done = content, view, True
+
+    async def defer(self, *a, **k) -> None:
+        self._done = True
+
+    def is_done(self) -> bool:
+        return self._done
+
+
+class FakeInteraction:
+    def __init__(self, *, guild_id=1, user=None, channel=None) -> None:
+        self.guild_id = guild_id
+        self.user = user or FakeUser(1, "Boss")
+        self.channel = channel
+        self.response = FakeResponse()
+
+
+async def _game_setup(d):
+    """A fresh store wired into the bot module, a fake farm channel, and config."""
+    import farmtracker.bot as bot
+
+    st = Store(pathlib.Path(d) / "store.json", pathlib.Path(d) / "log.jsonl")
+    st.load()
+    bot.store = st  # handlers read the module global at call time
+    ch = FakeChannel()
+    bot.bot.get_channel = lambda cid: ch  # type: ignore[assignment]
+    async with st.txn() as data:
+        data["configs"]["1"] = {
+            "channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None,
+        }
+    return bot, st, ch
+
+
+async def test_pitchin_lifecycle() -> None:
+    """Post a pitch-in, two people ✅, one un-✅s, a non-creator 🏁 is ignored,
+    then the creator 🏁 closes it and awards a point to whoever's still in."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        now = m.now_utc()
+        pid, msg = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Laundry bonanza", description=None,
+            expires_at=m.to_iso(now + dt.timedelta(hours=6)), points_each=1,
+            max_scorers=None, now=now,
+        )
+        mid = msg.id
+
+        await bot.on_raw_reaction_add(FakePayload(mid, "✅", user_id=42, member=FakeMember(42, "Pat")))
+        await bot.on_raw_reaction_add(FakePayload(mid, "✅", user_id=7, member=FakeMember(7, "Sam")))
+        snap = await st.snapshot()
+        assert [s["user_id"] for s in snap["pitchins"][pid]["scorers"]] == [42, 7]
+        assert "Pitched in (2):" in ch.msgs[mid].content
+
+        # Sam pulls his ✅ back off -> dropped before it closes.
+        await bot.on_raw_reaction_remove(FakePayload(mid, "✅", user_id=7))
+        snap = await st.snapshot()
+        assert [s["user_id"] for s in snap["pitchins"][pid]["scorers"]] == [42]
+        assert "Pitched in (1):" in ch.msgs[mid].content
+
+        # A non-creator 🏁 must NOT close it.
+        await bot.on_raw_reaction_add(FakePayload(mid, m.EMOJI_END, user_id=42, member=FakeMember(42, "Pat")))
+        assert pid in (await st.snapshot())["pitchins"], "only the creator ends a pitch-in"
+
+        # The creator 🏁 closes it: Pat earns 1 point, the post is finalized.
+        await bot.on_raw_reaction_add(FakePayload(mid, m.EMOJI_END, user_id=1, member=FakeMember(1, "Boss")))
+        snap = await st.snapshot()
+        assert pid not in snap["pitchins"] and str(mid) not in snap["game_messages"]
+        recs = st.read_completions()
+        assert len(recs) == 1 and recs[0]["user_id"] == 42 and recs[0]["points"] == 1
+        assert recs[0]["kind"] == "pitchin"
+        assert "pitched in!" in ch.msgs[mid].content and mid in ch.cleared
+
+
+async def test_pitchin_cap_and_points() -> None:
+    """max_scorers closes the pitch-in the instant it fills; points_each>1 pays
+    each scorer that many points."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        now = m.now_utc()
+        pid, msg = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Move the sheep", description=None,
+            expires_at=m.to_iso(now + dt.timedelta(hours=6)), points_each=2,
+            max_scorers=2, now=now,
+        )
+        mid = msg.id
+        await bot.on_raw_reaction_add(FakePayload(mid, "✅", user_id=42, member=FakeMember(42, "Pat")))
+        assert pid in (await st.snapshot())["pitchins"], "still open after 1 of 2"
+        await bot.on_raw_reaction_add(FakePayload(mid, "✅", user_id=7, member=FakeMember(7, "Sam")))
+        assert pid not in (await st.snapshot())["pitchins"], "fills at 2 -> auto-closes"
+        recs = sorted(st.read_completions(), key=lambda r: r["user_id"])
+        assert [(r["user_id"], r["points"]) for r in recs] == [(7, 2), (42, 2)]
+        # A late ✅ after it closed is a harmless no-op (no longer indexed).
+        await bot.on_raw_reaction_add(FakePayload(mid, "✅", user_id=9, member=FakeMember(9, "Lee")))
+        assert len(st.read_completions()) == 2
+
+
+async def test_pitchin_expiry() -> None:
+    """An expired pitch-in closes on the next scheduler sweep (restart-safe)."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        now = m.now_utc()
+        pid, msg = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Quick hands", description=None,
+            expires_at=m.to_iso(now - dt.timedelta(seconds=1)), points_each=1,
+            max_scorers=None, now=now,
+        )
+        await bot.on_raw_reaction_add(FakePayload(msg.id, "✅", user_id=42, member=FakeMember(42, "Pat")))
+        await bot.sweep_games(m.now_utc(), await st.snapshot())
+        assert pid not in (await st.snapshot())["pitchins"]
+        recs = st.read_completions()
+        assert len(recs) == 1 and recs[0]["points"] == 1
+
+
+async def test_doemup_lifecycle() -> None:
+    """Drive the do-em-up buttons: ➕ tallies live, ➖ corrects, a non-creator End
+    is refused, the creator End closes it and awards count×points, and the points
+    land on the unified /leaderboard."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        now = m.now_utc()
+        did, msg = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="Clear the thistle", description=None,
+            points_each=1, deadline=None, point_limit=None, now=now,
+        )
+        mid = msg.id
+
+        async def press(action, uid, name):
+            inter = FakeInteraction(user=FakeUser(uid, name), channel=ch)
+            await bot.handle_doemup_button(did, action, inter)
+            return inter
+
+        last = None
+        for _ in range(5):
+            last = await press("plus", 42, "Pat")
+        assert "Pat ×5" in last.response.content  # live tally rode the interaction
+        for _ in range(3):
+            await press("plus", 7, "Bo")
+        await press("minus", 7, "Bo")  # Bo fixes one -> 2
+        snap = await st.snapshot()
+        d_ = snap["doemups"][did]
+        assert d_["tallies"]["42"]["count"] == 5 and d_["tallies"]["7"]["count"] == 2
+
+        # Non-creator End is refused; the do-em-up stays open.
+        inter = await press("end", 42, "Pat")
+        assert "Only the person" in inter.response.content
+        assert did in (await st.snapshot())["doemups"]
+
+        # Creator End closes it and awards 5 + 2.
+        await press("end", 1, "Boss")
+        snap = await st.snapshot()
+        assert did not in snap["doemups"] and str(mid) not in snap["game_messages"]
+        by = {r["user_id"]: r["points"] for r in st.read_completions()}
+        assert by == {42: 5, 7: 2}
+        assert all(r["kind"] == "doemup" for r in st.read_completions())
+        assert "done!" in ch.msgs[mid].content
+
+        # /leaderboard (the upstream points + ⭐ stars board) totals those points:
+        # Pat leads with 5, Bo has 2, footer counts 2 records · 7 pts.
+        month = now.astimezone(ZoneInfo("Europe/Berlin")).strftime("%Y-%m")
+        inter = FakeInteraction(user=FakeUser(1, "Boss"))
+        await bot.leaderboard.callback(inter, month=month)
+        assert "<@42> — **5 pts**" in inter.response.content
+        assert "7 pts this month" in inter.response.content
+
+
+async def test_doemup_limit_and_deadline() -> None:
+    """point_limit auto-closes at the cap; a past deadline closes on the sweep."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        now = m.now_utc()
+        # Cap of 3 -> the 3rd ➕ closes it.
+        did, msg = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="Pull 3 weeds", description=None,
+            points_each=1, deadline=None, point_limit=3, now=now,
+        )
+        for _ in range(3):
+            await bot.handle_doemup_button(
+                did, "plus", FakeInteraction(user=FakeUser(42, "Pat"), channel=ch)
+            )
+        assert did not in (await st.snapshot())["doemups"], "hits the cap -> closes"
+        assert {r["user_id"]: r["points"] for r in st.read_completions()} == {42: 3}
+
+        # Deadline already past -> closes on the next sweep, paying points_each.
+        did2, msg2 = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="Beat the clock", description=None,
+            points_each=2, deadline=m.to_iso(now - dt.timedelta(seconds=1)),
+            point_limit=None, now=now,
+        )
+        await bot.handle_doemup_button(
+            did2, "plus", FakeInteraction(user=FakeUser(7, "Bo"), channel=ch)
+        )
+        await bot.sweep_games(m.now_utc(), await st.snapshot())
+        assert did2 not in (await st.snapshot())["doemups"]
+        bo = [r for r in st.read_completions() if r["user_id"] == 7]
+        assert len(bo) == 1 and bo[0]["points"] == 2  # 1 unit × 2 each
+
+
+async def test_game_commands() -> None:
+    """The /pitchin and /doemup command callbacks: config gate, time parsing,
+    past-time rejection, and posting into the configured channel."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+
+        # No config for guild 2 -> refuses and posts nothing.
+        inter = FakeInteraction(guild_id=2, user=FakeUser(1, "Boss"))
+        await bot.pitchin.callback(inter, brief="Nope")
+        assert "farmconfig" in inter.response.content
+        assert not (await st.snapshot())["pitchins"]
+
+        # Happy path: default 24h expiry; posts and self-reacts ✅ + 🏁.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.pitchin.callback(inter, brief="Laundry bonanza")
+        snap = await st.snapshot()
+        assert len(snap["pitchins"]) == 1
+        p = next(iter(snap["pitchins"].values()))
+        assert p["points_each"] == 1 and p["max_scorers"] is None
+        assert "🤝 Posted" in inter.response.content and inter.response.ephemeral
+        mid = p["message_id"]
+        assert (mid, m.EMOJI_DONE) in ch.added and (mid, m.EMOJI_END) in ch.added
+
+        # A past expiry is rejected; nothing new is posted.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.pitchin.callback(inter, brief="Too late", expires="2000-01-01 00:00")
+        assert "past" in inter.response.content
+        assert len((await st.snapshot())["pitchins"]) == 1
+
+        # /doemup happy path with a deadline + cap -> posts with live buttons.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.doemup.callback(
+            inter, brief="Thistle bush removed", deadline="in 3h", point_limit=50
+        )
+        snap = await st.snapshot()
+        assert len(snap["doemups"]) == 1
+        dd = next(iter(snap["doemups"].values()))
+        assert dd["point_limit"] == 50 and dd["deadline"] is not None
+        assert "💪 Posted" in inter.response.content
+
+        # A past deadline is rejected.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.doemup.callback(inter, brief="Nope", deadline="2000-01-01 00:00")
+        assert "past" in inter.response.content
+        assert len((await st.snapshot())["doemups"]) == 1
 
 
 async def test_lifecycle_and_snooze() -> None:
@@ -735,6 +1004,12 @@ def main() -> None:
     asyncio.run(test_legacy_migration())
     asyncio.run(test_requeue())
     asyncio.run(test_requeue_oneoff())
+    asyncio.run(test_pitchin_lifecycle())
+    asyncio.run(test_pitchin_cap_and_points())
+    asyncio.run(test_pitchin_expiry())
+    asyncio.run(test_doemup_lifecycle())
+    asyncio.run(test_doemup_limit_and_deadline())
+    asyncio.run(test_game_commands())
     print("✅ all smoke tests passed")
 
 
