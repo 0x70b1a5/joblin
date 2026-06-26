@@ -995,28 +995,82 @@ def game_records(event: dict, kind: str, tz: ZoneInfo, now: dt.datetime) -> list
     return recs
 
 
+def _game_recurrence_fields(
+    recurrence: Optional[dict], duration_secs: Optional[int]
+) -> dict:
+    """The recurrence columns shared by pitch-ins and do-em-ups. ``recurrence`` is
+    a rule dict (carrying ``time_of_day``) for a repeating game, or None for a
+    one-off. ``next_due`` starts None — it's only set later, while dormant between
+    rounds."""
+    if not recurrence:
+        return {"recurring": False, "freq": "once", "interval_days": 0,
+                "weekdays": [], "monthdays": [], "time_of_day": None,
+                "next_due": None, "duration_secs": None}
+    return {"recurring": True, "freq": recurrence["freq"],
+            "interval_days": recurrence.get("interval_days", 0),
+            "weekdays": recurrence.get("weekdays", []),
+            "monthdays": recurrence.get("monthdays", []),
+            "time_of_day": recurrence["time_of_day"],
+            "next_due": None, "duration_secs": duration_secs}
+
+
+async def _send_pitchin(channel: discord.abc.Messageable, p: dict) -> discord.Message:
+    """Post a pitch-in's live body and self-react ✅ (pitch in) + 🏁 (end)."""
+    msg = await channel.send(render_pitchin(p), allowed_mentions=NO_PINGS)
+    try:
+        await msg.add_reaction(EMOJI_DONE)
+        await msg.add_reaction(EMOJI_END)
+    except discord.HTTPException:
+        pass
+    return msg
+
+
+async def _send_doemup(channel: discord.abc.Messageable, d: dict) -> discord.Message:
+    """Post a do-em-up's live body with its ➕/➖/End buttons."""
+    return await channel.send(
+        render_doemup(d), view=make_doemup_view(d["id"]), allowed_mentions=NO_PINGS
+    )
+
+
+def _game_next_round(game: dict, tz: ZoneInfo, now: dt.datetime) -> dt.datetime:
+    """When the next round of a recurring game should post: its next scheduled
+    slot strictly after ``now``, anchored on the original creation time so the
+    rounds stay phase-locked to the wall-clock they were started at."""
+    return next_due(recurrence_of(game), tz, from_iso(game["created_at"]), now)
+
+
 async def finalize_pitchin(pid: str, channel: discord.abc.Messageable) -> bool:
-    """Close a pitch-in: award every scorer, rewrite the post as a result line,
-    and clear its reactions. Returns False if it was already gone/closed."""
+    """Close a pitch-in round: award every scorer, rewrite the post as a result
+    line, and clear its reactions. A recurring pitch-in then rolls on — it goes
+    dormant until its next slot (the whole series is torn down with
+    ``/deletetask``). Returns False if it was already gone/closed."""
     snap = await store.snapshot()
     p0 = snap["pitchins"].get(pid)
     if not p0:
         return False
     tz, now = _game_tz(snap, p0["guild_id"]), now_utc()
-    event = None
+    event = nxt = None
     async with store.txn() as data:
         p = data["pitchins"].get(pid)
         if not p or p.get("ended"):
             return False
         p["ended"] = True
         event = json.loads(json.dumps(p))
-        data["pitchins"].pop(pid, None)
         data["game_messages"].pop(str(p.get("message_id")), None)
+        if p.get("recurring"):
+            nxt = _game_next_round(p, tz, now)
+            p.update({"scorers": [], "ended": False, "message_id": None,
+                      "expires_at": None, "next_due": to_iso(nxt)})
+        else:
+            data["pitchins"].pop(pid, None)
     for rec in game_records(event, "pitchin", tz, now):
         await store.log_completion(rec)
+    body = render_pitchin(event, final=True)
+    if nxt is not None:
+        body += f"\n🔁 Next round {discord_ts(nxt, 'R')}."
     pm = channel.get_partial_message(event["message_id"])
     try:
-        await pm.edit(content=render_pitchin(event, final=True), allowed_mentions=NO_PINGS)
+        await pm.edit(content=body, allowed_mentions=NO_PINGS)
     except discord.HTTPException:
         pass
     try:
@@ -1027,37 +1081,99 @@ async def finalize_pitchin(pid: str, channel: discord.abc.Messageable) -> bool:
 
 
 async def finalize_doemup(did: str, channel: discord.abc.Messageable) -> bool:
-    """Close a do-em-up: award each tallier their unit count × points_each,
-    rewrite the post as a result line, and drop its buttons."""
+    """Close a do-em-up round: award each tallier their unit count × points_each,
+    rewrite the post as a result line, and drop its buttons. A recurring do-em-up
+    then rolls on — it goes dormant until its next slot (the whole series is torn
+    down with ``/deletetask``)."""
     snap = await store.snapshot()
     d0 = snap["doemups"].get(did)
     if not d0:
         return False
     tz, now = _game_tz(snap, d0["guild_id"]), now_utc()
-    event = None
+    event = nxt = None
     async with store.txn() as data:
         d = data["doemups"].get(did)
         if not d or d.get("ended"):
             return False
         d["ended"] = True
         event = json.loads(json.dumps(d))
-        data["doemups"].pop(did, None)
         data["game_messages"].pop(str(d.get("message_id")), None)
+        if d.get("recurring"):
+            nxt = _game_next_round(d, tz, now)
+            d.update({"tallies": {}, "ended": False, "message_id": None,
+                      "deadline": None, "next_due": to_iso(nxt)})
+        else:
+            data["doemups"].pop(did, None)
     for rec in game_records(event, "doemup", tz, now):
         await store.log_completion(rec)
+    body = render_doemup(event, final=True)
+    if nxt is not None:
+        body += f"\n🔁 Next round {discord_ts(nxt, 'R')}."
     try:
         await channel.get_partial_message(event["message_id"]).edit(
-            content=render_doemup(event, final=True), view=None, allowed_mentions=NO_PINGS
+            content=body, view=None, allowed_mentions=NO_PINGS
         )
     except discord.HTTPException:
         pass
     return True
 
 
+async def repost_pitchin(pid: str, channel: discord.abc.Messageable) -> None:
+    """Open a fresh round of a dormant recurring pitch-in (its previous round has
+    closed and ``next_due`` has come due)."""
+    snap = await store.snapshot()
+    p0 = snap["pitchins"].get(pid)
+    if not p0 or p0.get("ended") or p0.get("message_id") or not p0.get("next_due"):
+        return  # not actually dormant
+    tz, now = _game_tz(snap, p0["guild_id"]), now_utc()
+    dur = p0.get("duration_secs")
+    exp = (now + dt.timedelta(seconds=int(dur))) if dur else _game_next_round(p0, tz, now)
+    p_live = {**p0, "scorers": [], "ended": False,
+              "expires_at": to_iso(exp), "next_due": None}
+    msg = await _send_pitchin(channel, p_live)
+    orphan = False
+    async with store.txn() as data:
+        p = data["pitchins"].get(pid)
+        if not p or p.get("ended") or p.get("message_id") or not p.get("next_due"):
+            orphan = True  # something raced us
+        else:
+            p.update({"message_id": msg.id, "scorers": [],
+                      "expires_at": to_iso(exp), "next_due": None})
+            data["game_messages"][str(msg.id)] = {"kind": "pitchin", "id": pid}
+    if orphan:
+        await safe_delete(msg)
+
+
+async def repost_doemup(did: str, channel: discord.abc.Messageable) -> None:
+    """Open a fresh round of a dormant recurring do-em-up."""
+    snap = await store.snapshot()
+    d0 = snap["doemups"].get(did)
+    if not d0 or d0.get("ended") or d0.get("message_id") or not d0.get("next_due"):
+        return
+    tz, now = _game_tz(snap, d0["guild_id"]), now_utc()
+    dur = d0.get("duration_secs")
+    dl = (now + dt.timedelta(seconds=int(dur))) if dur else _game_next_round(d0, tz, now)
+    d_live = {**d0, "tallies": {}, "ended": False,
+              "deadline": to_iso(dl), "next_due": None}
+    msg = await _send_doemup(channel, d_live)
+    orphan = False
+    async with store.txn() as data:
+        d = data["doemups"].get(did)
+        if not d or d.get("ended") or d.get("message_id") or not d.get("next_due"):
+            orphan = True
+        else:
+            d.update({"message_id": msg.id, "tallies": {},
+                      "deadline": to_iso(dl), "next_due": None})
+            data["game_messages"][str(msg.id)] = {"kind": "doemup", "id": did}
+    if orphan:
+        await safe_delete(msg)
+
+
 async def post_pitchin(
     channel: discord.abc.Messageable, *, guild_id: int, creator_id: int, brief: str,
     description: Optional[str], expires_at: str, points_each: int,
     max_scorers: Optional[int], now: dt.datetime,
+    recurrence: Optional[dict] = None, duration_secs: Optional[int] = None,
 ) -> tuple[str, discord.Message]:
     pid = new_id()
     p = {
@@ -1066,13 +1182,9 @@ async def post_pitchin(
         "created_by": creator_id, "created_at": to_iso(now),
         "points_each": points_each, "max_scorers": max_scorers,
         "expires_at": expires_at, "scorers": [], "ended": False,
+        **_game_recurrence_fields(recurrence, duration_secs),
     }
-    msg = await channel.send(render_pitchin(p), allowed_mentions=NO_PINGS)
-    try:
-        await msg.add_reaction(EMOJI_DONE)
-        await msg.add_reaction(EMOJI_END)
-    except discord.HTTPException:
-        pass
+    msg = await _send_pitchin(channel, p)
     async with store.txn() as data:
         p["message_id"] = msg.id
         data["pitchins"][pid] = p
@@ -1084,6 +1196,7 @@ async def post_doemup(
     channel: discord.abc.Messageable, *, guild_id: int, creator_id: int, brief: str,
     description: Optional[str], points_each: int, deadline: Optional[str],
     point_limit: Optional[int], now: dt.datetime,
+    recurrence: Optional[dict] = None, duration_secs: Optional[int] = None,
 ) -> tuple[str, discord.Message]:
     did = new_id()
     d = {
@@ -1092,10 +1205,9 @@ async def post_doemup(
         "created_by": creator_id, "created_at": to_iso(now),
         "points_each": points_each, "deadline": deadline, "point_limit": point_limit,
         "tallies": {}, "ended": False,
+        **_game_recurrence_fields(recurrence, duration_secs),
     }
-    msg = await channel.send(
-        render_doemup(d), view=make_doemup_view(did), allowed_mentions=NO_PINGS
-    )
+    msg = await _send_doemup(channel, d)
     async with store.txn() as data:
         d["message_id"] = msg.id
         data["doemups"][did] = d
@@ -1116,6 +1228,8 @@ async def _handle_pitchin_reaction(
         if not p or p.get("ended"):
             return
         if payload.user_id == p["created_by"]:
+            # 🏁 closes this round early (awarding whoever's in). A recurring
+            # pitch-in rolls on to its next slot; stop the series with /deletetask.
             await finalize_pitchin(pid, channel)
         else:
             await _remove_user_reaction(reacted, payload)  # only the creator ends it
@@ -1202,6 +1316,8 @@ async def handle_doemup_button(
         )
     elif status == "final":
         await interaction.response.defer()  # finalize edits the post itself
+        # End and hitting the point_limit both just close this round; a recurring
+        # do-em-up rolls on to its next slot (stop the series with /deletetask).
         await finalize_doemup(did, interaction.channel)
     else:  # changed — update the live tally in place
         await interaction.response.edit_message(content=res["body"], view=make_doemup_view(did))
@@ -1250,23 +1366,37 @@ def make_doemup_view(did: str) -> discord.ui.View:
 
 
 async def sweep_games(now: dt.datetime, snap: dict) -> None:
-    """Close any pitch-in past its expiry / do-em-up past its deadline. Driven by
-    the scheduler tick, so closures that fell due while the bot was down fire on
-    the next tick — exactly like chore reminders."""
+    """Drive each game's clock from the scheduler tick: close a live round past
+    its expiry/deadline, and re-post a dormant recurring round once its next slot
+    comes due. Running off the tick means anything that fell due while the bot was
+    down fires on the next tick — exactly like chore reminders."""
     for pid, p in list(snap.get("pitchins", {}).items()):
         try:
-            if not p.get("ended") and now >= from_iso(p["expires_at"]):
-                ch = bot.get_channel(int(p["channel_id"])) if p.get("channel_id") else None
-                if ch is not None:
-                    await finalize_pitchin(pid, ch)
+            if p.get("ended"):
+                continue
+            ch = bot.get_channel(int(p["channel_id"])) if p.get("channel_id") else None
+            if ch is None:
+                continue
+            if p.get("next_due"):  # dormant between rounds -> re-post when due
+                if now >= from_iso(p["next_due"]):
+                    await repost_pitchin(pid, ch)
+            elif p.get("expires_at") and now >= from_iso(p["expires_at"]):
+                await finalize_pitchin(pid, ch)
         except Exception:
             log.exception("scheduler error on pitchin %s", pid)
     for did, d in list(snap.get("doemups", {}).items()):
         try:
-            dl = d.get("deadline")
-            if not d.get("ended") and dl and now >= from_iso(dl):
-                ch = bot.get_channel(int(d["channel_id"])) if d.get("channel_id") else None
-                if ch is not None:
+            if d.get("ended"):
+                continue
+            ch = bot.get_channel(int(d["channel_id"])) if d.get("channel_id") else None
+            if ch is None:
+                continue
+            if d.get("next_due"):  # dormant between rounds -> re-post when due
+                if now >= from_iso(d["next_due"]):
+                    await repost_doemup(did, ch)
+            else:
+                dl = d.get("deadline")
+                if dl and now >= from_iso(dl):
                     await finalize_doemup(did, ch)
         except Exception:
             log.exception("scheduler error on doemup %s", did)
@@ -1593,8 +1723,52 @@ def _find_task(snap: dict, guild_id: int, text: str) -> Optional[dict]:
     return None
 
 
-@bot.tree.command(name="deletetask", description="Permanently delete a task (recurring or one-off)")
-@app_commands.describe(task="Start typing to pick a task (or paste its id)")
+def _find_game(snap: dict, guild_id: int, text: str) -> tuple[Optional[str], Optional[dict]]:
+    """Resolve a pitch-in or do-em-up the same way :func:`_find_task` resolves a
+    task — by id, then exact, then substring brief. Returns ``(kind, game)`` with
+    ``kind`` ∈ {"pitchin", "doemup"}, or ``(None, None)``."""
+    for kind, section in (("pitchin", "pitchins"), ("doemup", "doemups")):
+        g = snap[section].get(text)
+        if g and str(g["guild_id"]) == str(guild_id):
+            return kind, g
+    needle = (text or "").strip().lower()
+    games = [("pitchin", g) for g in snap["pitchins"].values()
+             if str(g["guild_id"]) == str(guild_id)]
+    games += [("doemup", g) for g in snap["doemups"].values()
+              if str(g["guild_id"]) == str(guild_id)]
+    for matcher in (
+        lambda g: g["id"].lower() == needle or g["brief"].strip().lower() == needle,
+        lambda g: bool(needle) and needle in g["brief"].lower(),
+    ):
+        for kind, g in games:
+            if matcher(g):
+                return kind, g
+    return None, None
+
+
+async def _cancel_game_message(
+    channel: discord.abc.Messageable, brief: str, mid: int, *, is_doemup: bool
+) -> None:
+    """Make a deleted game's live post inert: strike it through as cancelled and
+    strip its reactions/buttons. No points are awarded (delete ≠ close)."""
+    pm = channel.get_partial_message(mid)
+    try:
+        await pm.edit(content=f"🗑️ ~~**{brief}**~~ — cancelled.",
+                      view=None, allowed_mentions=NO_PINGS)
+    except discord.HTTPException:
+        pass
+    if not is_doemup:  # do-em-ups carry buttons (cleared by view=None); pitch-ins, reactions
+        try:
+            await pm.clear_reactions()
+        except discord.HTTPException:
+            pass
+
+
+@bot.tree.command(
+    name="deletetask",
+    description="Permanently delete a task, pitch-in, or do-em-up (recurring or one-off)",
+)
+@app_commands.describe(task="Start typing to pick a task or game (or paste its id)")
 async def deletetask(interaction: discord.Interaction, task: str) -> None:
     snap = await store.snapshot()
     found = _find_task(snap, interaction.guild_id, task)
@@ -1617,14 +1791,33 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
                         data["requeue"].pop(mid, None)
                 panels = _take_task_panels(data, tid)
                 removed = data["tasks"].pop(tid, None)
-    await _delete_panels(panels)
+        await _delete_panels(panels)
+    else:
+        # Not a task — it may be a pitch-in or do-em-up (kills the whole series).
+        kind, game = _find_game(snap, interaction.guild_id, task)
+        if game:
+            section = "pitchins" if kind == "pitchin" else "doemups"
+            live_mid = None
+            async with store.txn() as data:
+                g = data[section].get(game["id"])
+                if g and str(g["guild_id"]) == str(interaction.guild_id):
+                    live_mid = g.get("message_id")
+                    data["game_messages"].pop(str(live_mid), None)
+                    removed = data[section].pop(game["id"], None)
+            if removed and live_mid:
+                ch = (bot.get_channel(int(removed["channel_id"]))
+                      if removed.get("channel_id") else None)
+                if ch is not None:
+                    await _cancel_game_message(
+                        ch, removed["brief"], live_mid, is_doemup=(kind == "doemup")
+                    )
     if removed:
         await interaction.response.send_message(
             f"🗑️ Deleted **{removed['brief']}**.", ephemeral=True
         )
     else:
         await interaction.response.send_message(
-            "❌ Task not found. Use `/listtasks` to see current tasks.", ephemeral=True
+            "❌ Not found. Use `/listtasks` to see current tasks.", ephemeral=True
         )
 
 
@@ -1733,12 +1926,46 @@ async def edittask(
     await interaction.response.send_message(body, allowed_mentions=NO_PINGS)
 
 
+async def delete_autocomplete(interaction: discord.Interaction, current: str):
+    """Like :func:`task_autocomplete`, but also lists active pitch-ins / do-em-ups
+    so ``/deletetask`` can tear those series down too."""
+    out = await task_autocomplete(interaction, current)
+    cur = current.lower()
+    snap = await store.snapshot()
+    for icon, section in (("🤝", "pitchins"), ("💪", "doemups")):
+        for gid, g in snap[section].items():
+            if len(out) >= 25:
+                break
+            if str(g["guild_id"]) != str(interaction.guild_id):
+                continue
+            sched = describe_repeat(recurrence_of(g)) if g.get("recurring") else "one-off"
+            label = f"{icon} {g['brief']} ({sched})"
+            if cur in label.lower() or cur in gid.lower():
+                out.append(app_commands.Choice(name=label[:100], value=gid))
+    return out[:25]
+
+
 # Register the shared autocompletes onto each command that needs them.
 for _cmd in (newtask, edittask):
     _cmd.autocomplete("at")(at_autocomplete)
     _cmd.autocomplete("repeat")(repeat_autocomplete)
-for _cmd in (deletetask, edittask):
-    _cmd.autocomplete("task")(task_autocomplete)
+edittask.autocomplete("task")(task_autocomplete)
+deletetask.autocomplete("task")(delete_autocomplete)
+
+
+def _game_recurrence_from(
+    repeat: Optional[str], tz: ZoneInfo, now: dt.datetime
+) -> Optional[dict]:
+    """Parse a game's ``repeat`` into a recurrence rule, or None for a one-off.
+    Mirrors :func:`schedule_from_rule`: a bare ``monthly`` takes today's date, and
+    every round is pinned to the wall-clock time the game is started at."""
+    rule = parse_repeat(repeat)  # raises ValueError on junk
+    if rule["freq"] == "once":
+        return None
+    if rule["freq"] == "monthly" and not rule["monthdays"]:
+        rule["monthdays"] = [now.astimezone(tz).day]
+    rule["time_of_day"] = time_of_day_from(None, tz, now)
+    return rule
 
 
 @bot.tree.command(
@@ -1747,9 +1974,10 @@ for _cmd in (deletetask, edittask):
 )
 @app_commands.describe(
     brief="What to pitch in on, e.g. 'laundry bonanza' (required)",
-    expires="When it closes — in 2h, tonight, 18:00, tomorrow 8am (default: in 24h)",
+    expires="When this round closes — in 2h, tonight, 18:00, tomorrow 8am (default: in 24h)",
     points="Points each pitcher-inner earns (default: 1)",
     max_scorers="Optional cap: only the first N to pitch in score",
+    repeat="Repeat it — daily, weekdays, mon/thu, monthly on the 1st (default: once)",
     description="Optional extra details shown on the post",
 )
 async def pitchin(
@@ -1758,6 +1986,7 @@ async def pitchin(
     expires: Optional[str] = None,
     points: app_commands.Range[int, 1, 100] = 1,
     max_scorers: Optional[app_commands.Range[int, 1, 100]] = None,
+    repeat: Optional[str] = None,
     description: Optional[str] = None,
 ) -> None:
     snap = await store.snapshot()
@@ -1769,7 +1998,22 @@ async def pitchin(
         return
     tz, now = ZoneInfo(cfg["timezone"]), now_utc()
     try:
-        exp = resolve_when(expires, tz, now) if expires else now + dt.timedelta(hours=24)
+        recurrence = _game_recurrence_from(repeat, tz, now)
+    except ValueError as e:
+        await interaction.response.send_message(
+            f"❌ {e}\nSee `/farmhelp` for the `repeat` formats.", ephemeral=True
+        )
+        return
+    duration_secs = None
+    try:
+        if expires:
+            exp = resolve_when(expires, tz, now)
+            if recurrence:  # an explicit window each round repeats
+                duration_secs = max(1, int((exp - now).total_seconds()))
+        elif recurrence:  # no window given -> the round runs until the next slot
+            exp = next_due(recurrence, tz, now, now)
+        else:
+            exp = now + dt.timedelta(hours=24)
     except ValueError as e:
         await interaction.response.send_message(
             f"❌ {e}\nSee `/farmhelp` for the time formats.", ephemeral=True
@@ -1792,11 +2036,16 @@ async def pitchin(
         brief=str(brief), description=(description[:1000] if description else None),
         expires_at=to_iso(exp), points_each=int(points),
         max_scorers=(int(max_scorers) if max_scorers else None), now=now,
+        recurrence=recurrence, duration_secs=duration_secs,
     )
     cap = f" · first {max_scorers} score" if max_scorers else ""
+    if recurrence:
+        rep = f" · 🔁 {describe_repeat(recurrence)} (`/deletetask` to stop it)"
+        when = f"first round closes {discord_ts(exp, 'R')}"
+    else:
+        rep, when = "", f"closes {discord_ts(exp, 'R')}"
     await interaction.response.send_message(
-        f"🤝 Posted **{brief}** in <#{cfg['channel_id']}> — "
-        f"closes {discord_ts(exp, 'R')}{cap}.",
+        f"🤝 Posted **{brief}** in <#{cfg['channel_id']}> — {when}{cap}{rep}.",
         ephemeral=True,
     )
 
@@ -1810,6 +2059,7 @@ async def pitchin(
     points="Points per ➕ (default: 1)",
     deadline="Optional auto-close time — tonight, in 3h, tomorrow 18:00",
     point_limit="Optional cap: auto-close once this many points are tallied",
+    repeat="Repeat it — daily, weekdays, mon/thu, monthly on the 1st (default: once)",
     description="Optional extra details shown on the post",
 )
 async def doemup(
@@ -1818,6 +2068,7 @@ async def doemup(
     points: app_commands.Range[int, 1, 100] = 1,
     deadline: Optional[str] = None,
     point_limit: Optional[app_commands.Range[int, 1, 100000]] = None,
+    repeat: Optional[str] = None,
     description: Optional[str] = None,
 ) -> None:
     snap = await store.snapshot()
@@ -1828,21 +2079,33 @@ async def doemup(
         )
         return
     tz, now = ZoneInfo(cfg["timezone"]), now_utc()
-    deadline_iso = None
-    if deadline:
-        try:
+    try:
+        recurrence = _game_recurrence_from(repeat, tz, now)
+    except ValueError as e:
+        await interaction.response.send_message(
+            f"❌ {e}\nSee `/farmhelp` for the `repeat` formats.", ephemeral=True
+        )
+        return
+    deadline_iso, duration_secs = None, None
+    try:
+        if deadline:
             dl = resolve_when(deadline, tz, now)
-        except ValueError as e:
-            await interaction.response.send_message(
-                f"❌ {e}\nSee `/farmhelp` for the time formats.", ephemeral=True
-            )
-            return
-        if dl <= now:
-            await interaction.response.send_message(
-                "❌ That deadline is already in the past.", ephemeral=True
-            )
-            return
-        deadline_iso = to_iso(dl)
+            if dl <= now:
+                await interaction.response.send_message(
+                    "❌ That deadline is already in the past.", ephemeral=True
+                )
+                return
+            deadline_iso = to_iso(dl)
+            if recurrence:  # an explicit window each round repeats
+                duration_secs = max(1, int((dl - now).total_seconds()))
+        elif recurrence:  # recurring needs a close: run each round to the next slot
+            deadline_iso = to_iso(next_due(recurrence, tz, now, now))
+        # else: a plain one-off do-em-up stays open until 🏁
+    except ValueError as e:
+        await interaction.response.send_message(
+            f"❌ {e}\nSee `/farmhelp` for the time formats.", ephemeral=True
+        )
+        return
     channel = bot.get_channel(int(cfg["channel_id"]))
     if channel is None:
         await interaction.response.send_message(
@@ -1855,18 +2118,27 @@ async def doemup(
         brief=str(brief), description=(description[:1000] if description else None),
         points_each=int(points), deadline=deadline_iso,
         point_limit=(int(point_limit) if point_limit else None), now=now,
+        recurrence=recurrence, duration_secs=duration_secs,
     )
-    closes = f" — closes {discord_ts(from_iso(deadline_iso), 'R')}" if deadline_iso else ""
+    if recurrence:
+        closes = (
+            f" — first round closes {discord_ts(from_iso(deadline_iso), 'R')}"
+            f" · 🔁 {describe_repeat(recurrence)} (`/deletetask` to stop it)"
+        )
+    else:
+        closes = f" — closes {discord_ts(from_iso(deadline_iso), 'R')}" if deadline_iso else ""
     await interaction.response.send_message(
         f"💪 Posted **{brief}** in <#{cfg['channel_id']}> — tap ➕ as you go{closes}.",
         ephemeral=True,
     )
 
 
-# The friendly "when" autocomplete (live preview of the resolved instant) is the
-# same one /newtask uses for `at`.
+# The friendly "when"/"repeat" autocompletes (live previews of the resolved
+# instant / rule) are the same ones /newtask uses for `at` and `repeat`.
 pitchin.autocomplete("expires")(at_autocomplete)
+pitchin.autocomplete("repeat")(repeat_autocomplete)
 doemup.autocomplete("deadline")(at_autocomplete)
+doemup.autocomplete("repeat")(repeat_autocomplete)
 
 
 @bot.tree.command(name="listtasks", description="List every task with its id, schedule, and next post")
@@ -1984,6 +2256,10 @@ async def farmhelp(interaction: discord.Interaction) -> None:
             "• `/pitchin brief:\"laundry bonanza\"` — everyone who taps ✅ before it "
             "closes earns a point. Optional `expires` (default 24h), `points` each, "
             "and `max_scorers` (only the first N score). 🏁 ends it early.\n"
+            "• Add `repeat:` to either (same as a chore — `daily`, `weekdays`, "
+            "`mon,thu`, `monthly on the 1st`) and it re-posts a fresh round each "
+            "slot. 🏁 just closes the current round (it rolls on); stop the whole "
+            "series with `/deletetask`.\n"
             "• `/doemup brief:\"thistle bush removed\"` — tap ➕ once per one you did "
             "(➖ to fix); the tally updates live. Optional `points` each, `deadline`, "
             "and `point_limit` (auto-closes at that total). 🏁 ends it.\n"

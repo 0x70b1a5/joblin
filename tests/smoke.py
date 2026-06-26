@@ -559,6 +559,222 @@ async def test_doemup_limit_and_deadline() -> None:
         assert len(bo) == 1 and bo[0]["points"] == 2  # 1 unit × 2 each
 
 
+async def test_pitchin_recurring() -> None:
+    """A recurring pitch-in awards its round, goes dormant, re-posts a fresh round
+    at its next slot, rolls on past the creator's 🏁, and is torn down by
+    /deletetask."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        rule = {"freq": "days", "interval_days": 1, "weekdays": [], "monthdays": [],
+                "time_of_day": now.astimezone(tz).strftime("%H:%M")}
+        # window already lapsed -> the next sweep closes round one; no fixed
+        # duration, so re-posts run to the next daily slot.
+        pid, msg = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Daily tidy", description=None,
+            expires_at=m.to_iso(now - dt.timedelta(seconds=1)), points_each=1,
+            max_scorers=None, now=now, recurrence=rule, duration_secs=None,
+        )
+        mid = msg.id
+        assert (await st.snapshot())["pitchins"][pid]["recurring"] is True
+
+        await bot.on_raw_reaction_add(FakePayload(mid, "✅", member=FakeMember(42, "Pat")))
+        await bot.sweep_games(m.now_utc(), await st.snapshot())
+        snap = await st.snapshot()
+        p = snap["pitchins"][pid]
+        assert p["message_id"] is None and p["scorers"] == [], "round closed -> dormant"
+        nd = m.from_iso(p["next_due"])
+        assert nd > now and nd.astimezone(tz).strftime("%H:%M") == rule["time_of_day"]
+        assert str(mid) not in snap["game_messages"], "old post de-registered"
+        assert "pitched in!" in ch.msgs[mid].content and "Next round" in ch.msgs[mid].content
+        assert len(st.read_completions()) == 1
+
+        # Force the next slot due -> the sweep re-posts a fresh, live round.
+        async with st.txn() as data:
+            data["pitchins"][pid]["next_due"] = m.to_iso(m.now_utc() - dt.timedelta(seconds=1))
+        await bot.sweep_games(m.now_utc(), await st.snapshot())
+        snap = await st.snapshot()
+        p = snap["pitchins"][pid]
+        new_mid = p["message_id"]
+        assert new_mid is not None and new_mid != mid, "a brand-new round post"
+        assert p["next_due"] is None and m.from_iso(p["expires_at"]) > m.now_utc()
+        assert snap["game_messages"][str(new_mid)] == {"kind": "pitchin", "id": pid}
+        assert (new_mid, m.EMOJI_DONE) in ch.added, "the fresh round self-reacts ✅"
+
+        # Score the new round; the creator's 🏁 closes THIS round (awarding Sam)
+        # and the recurring series rolls on rather than ending.
+        await bot.on_raw_reaction_add(
+            FakePayload(new_mid, "✅", user_id=7, member=FakeMember(7, "Sam"))
+        )
+        await bot.on_raw_reaction_add(
+            FakePayload(new_mid, m.EMOJI_END, user_id=1, member=FakeMember(1, "Boss"))
+        )
+        snap = await st.snapshot()
+        assert pid in snap["pitchins"], "🏁 closes a round, not the series"
+        assert snap["pitchins"][pid]["message_id"] is None, "rolled on -> dormant again"
+        assert "Next round" in ch.msgs[new_mid].content
+        by = sorted(r["user_id"] for r in st.read_completions())
+        assert by == [7, 42], "round one (Pat) and round two (Sam) both scored"
+
+        # /deletetask tears the whole series down (it's dormant -> nothing live).
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.deletetask.callback(inter, pid)
+        assert pid not in (await st.snapshot())["pitchins"], "deletetask kills the series"
+        assert "Deleted" in inter.response.content
+
+
+async def test_doemup_recurring() -> None:
+    """A recurring do-em-up rolls on after its deadline (and re-posts live buttons),
+    a point_limit closes just the round, and the creator's End stops the series."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        rule = {"freq": "days", "interval_days": 1, "weekdays": [], "monthdays": [],
+                "time_of_day": now.astimezone(tz).strftime("%H:%M")}
+        did, msg = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="Daily weeds", description=None,
+            points_each=1, deadline=m.to_iso(now - dt.timedelta(seconds=1)),
+            point_limit=None, now=now, recurrence=rule,
+            duration_secs=6 * 3600,  # each round runs a fixed 6h window
+        )
+        mid = msg.id
+
+        async def press(action, uid, name):
+            await bot.handle_doemup_button(
+                did, action, FakeInteraction(user=FakeUser(uid, name), channel=ch)
+            )
+
+        await press("plus", 42, "Pat")
+        await press("plus", 42, "Pat")
+        await bot.sweep_games(m.now_utc(), await st.snapshot())
+        snap = await st.snapshot()
+        dd = snap["doemups"][did]
+        assert dd["message_id"] is None and dd["tallies"] == {}, "round closed -> dormant"
+        assert dd["next_due"] is not None and ch.msgs[mid].view is None
+        assert "done!" in ch.msgs[mid].content and "Next round" in ch.msgs[mid].content
+        assert {r["user_id"]: r["points"] for r in st.read_completions()} == {42: 2}
+
+        # Force the next slot due -> re-post a fresh round with a fixed 6h window.
+        async with st.txn() as data:
+            data["doemups"][did]["next_due"] = m.to_iso(m.now_utc() - dt.timedelta(seconds=1))
+        await bot.sweep_games(m.now_utc(), await st.snapshot())
+        snap = await st.snapshot()
+        dd = snap["doemups"][did]
+        new_mid = dd["message_id"]
+        assert new_mid is not None and new_mid != mid
+        win = (m.from_iso(dd["deadline"]) - m.now_utc()).total_seconds()
+        assert 5.9 * 3600 < win < 6.1 * 3600, "fixed-duration window honored on re-post"
+        assert dd["next_due"] is None
+        assert snap["game_messages"][str(new_mid)] == {"kind": "doemup", "id": did}
+
+        # End closes THIS round (awarding Bo); the recurring series rolls on.
+        await press("plus", 7, "Bo")
+        await press("end", 1, "Boss")
+        snap = await st.snapshot()
+        assert did in snap["doemups"], "End closes a round, not the series"
+        assert snap["doemups"][did]["message_id"] is None, "rolled on -> dormant"
+        by = {r["user_id"]: r["points"] for r in st.read_completions()}
+        assert by == {42: 2, 7: 1}
+
+        # /deletetask tears the whole series down.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.deletetask.callback(inter, did)
+        assert did not in (await st.snapshot())["doemups"]
+        assert "Deleted" in inter.response.content
+
+
+async def test_doemup_recurring_limit_rolls_on() -> None:
+    """Hitting a recurring do-em-up's point_limit closes only that round; the
+    series rolls on to its next slot rather than ending."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        rule = {"freq": "days", "interval_days": 1, "weekdays": [], "monthdays": [],
+                "time_of_day": now.astimezone(tz).strftime("%H:%M")}
+        did, msg = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="Three weeds", description=None,
+            points_each=1, deadline=m.to_iso(now + dt.timedelta(hours=6)),
+            point_limit=3, now=now, recurrence=rule, duration_secs=6 * 3600,
+        )
+        for _ in range(3):  # the 3rd ➕ hits the cap
+            await bot.handle_doemup_button(
+                did, "plus", FakeInteraction(user=FakeUser(42, "Pat"), channel=ch)
+            )
+        snap = await st.snapshot()
+        assert did in snap["doemups"], "a capped round does NOT end a recurring series"
+        assert snap["doemups"][did]["next_due"] is not None, "it rolls to the next slot"
+        assert {r["user_id"]: r["points"] for r in st.read_completions()} == {42: 3}
+
+
+async def test_delete_live_game() -> None:
+    """/deletetask cancels a live game outright — removed from the store and its
+    post struck through as cancelled, awarding nobody (delete ≠ close)."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        now = m.now_utc()
+
+        # A live pitch-in with a scorer -> deletetask cancels it, no points.
+        pid, msg = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Laundry", description=None,
+            expires_at=m.to_iso(now + dt.timedelta(hours=6)), points_each=1,
+            max_scorers=None, now=now,
+        )
+        await bot.on_raw_reaction_add(FakePayload(msg.id, "✅", user_id=42, member=FakeMember(42, "Pat")))
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.deletetask.callback(inter, pid)
+        snap = await st.snapshot()
+        assert pid not in snap["pitchins"] and str(msg.id) not in snap["game_messages"]
+        assert "cancelled" in ch.msgs[msg.id].content and msg.id in ch.cleared
+        assert st.read_completions() == [], "delete awards nobody"
+
+        # A live do-em-up -> its buttons are dropped (view=None) on cancel.
+        did, dmsg = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="Weeds", description=None,
+            points_each=1, deadline=None, point_limit=None, now=now,
+        )
+        await bot.handle_doemup_button(did, "plus", FakeInteraction(user=FakeUser(7, "Bo"), channel=ch))
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.deletetask.callback(inter, did)
+        snap = await st.snapshot()
+        assert did not in snap["doemups"] and str(dmsg.id) not in snap["game_messages"]
+        assert "cancelled" in ch.msgs[dmsg.id].content and ch.msgs[dmsg.id].view is None
+        assert st.read_completions() == []
+
+        # Deleting something that doesn't exist is a clean miss.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.deletetask.callback(inter, "nope-nope")
+        assert "Not found" in inter.response.content
+
+
+async def test_game_commands_recurring() -> None:
+    """The /pitchin and /doemup `repeat` option records a recurring game that's
+    live now (next_due only fills once it goes dormant)."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.pitchin.callback(inter, brief="Morning chores", repeat="daily")
+        p = next(iter((await st.snapshot())["pitchins"].values()))
+        assert p["recurring"] and p["freq"] == "days" and p["interval_days"] == 1
+        assert p["next_due"] is None and m.from_iso(p["expires_at"]) > m.now_utc()
+        assert "🔁" in inter.response.content and "every day" in inter.response.content
+
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.doemup.callback(inter, brief="Weekday reps", repeat="weekdays")
+        dd = next(iter((await st.snapshot())["doemups"].values()))
+        assert dd["recurring"] and dd["freq"] == "weekly" and dd["weekdays"] == [0, 1, 2, 3, 4]
+        assert dd["next_due"] is None and dd["deadline"] is not None
+        assert "🔁" in inter.response.content
+
+        # Junk repeat is rejected before anything is posted.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.pitchin.callback(inter, brief="Nope", repeat="garblarg")
+        assert "repeat" in inter.response.content.lower()
+
+
 async def test_game_commands() -> None:
     """The /pitchin and /doemup command callbacks: config gate, time parsing,
     past-time rejection, and posting into the configured channel."""
@@ -1068,6 +1284,11 @@ def main() -> None:
     asyncio.run(test_pitchin_expiry())
     asyncio.run(test_doemup_lifecycle())
     asyncio.run(test_doemup_limit_and_deadline())
+    asyncio.run(test_pitchin_recurring())
+    asyncio.run(test_doemup_recurring())
+    asyncio.run(test_doemup_recurring_limit_rolls_on())
+    asyncio.run(test_delete_live_game())
+    asyncio.run(test_game_commands_recurring())
     asyncio.run(test_game_commands())
     print("✅ all smoke tests passed")
 

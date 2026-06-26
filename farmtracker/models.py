@@ -558,14 +558,30 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
 
 
 # ===========================================================================
-# Pitch-ins and do-em-ups: ad-hoc, post-now point events (no recurrence).
+# Pitch-ins and do-em-ups: post-now point events, optionally recurring.
 # ===========================================================================
 # These live in their own store sections (``pitchins`` / ``doemups``) rather
-# than ``tasks``, because they have nothing to do with the scheduling/nag
-# machinery: they are posted immediately by their slash command and resolve by
-# people reacting/clicking, then close at an expiry/deadline, a point cap, or a
-# creator's manual end. Points they award are written to the same completion log
-# as chores (with a ``points`` field) so a single ``/leaderboard`` totals both.
+# than ``tasks``, because they resolve by people reacting/clicking rather than
+# through the nag machinery: they are posted immediately by their slash command,
+# then close at an expiry/deadline, a point cap, or a creator's manual end.
+# Points they award are written to the same completion log as chores (with a
+# ``points`` field) so a single ``/leaderboard`` totals both.
+#
+# Recurrence (optional)
+# ---------------------
+# A game may carry the same recurrence columns a task does — ``recurring``,
+# ``freq``, ``interval_days``, ``weekdays``, ``monthdays``, ``time_of_day`` (see
+# the task schema at the top of this file) — plus:
+#   "next_due":      str | None,   # set ONLY while dormant between rounds: the
+#                                  #   instant the next round should be posted.
+#                                  #   None while a round is live (or one-off).
+#   "duration_secs": int | None,   # how long each round stays open. Set from an
+#                                  #   explicit expires/deadline; None means the
+#                                  #   round runs until the next scheduled slot.
+# When a recurring game's round auto-closes (expiry/deadline/cap) it awards
+# points, rewrites its post as a result line, then goes dormant with ``next_due``
+# set; the scheduler re-posts a fresh round at that instant. A creator's 🏁 ends
+# the whole series instead. ``recurrence_of`` reads a game just like a task.
 #
 # pitch-in dict schema
 # --------------------
@@ -584,11 +600,13 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
 #     "created_at":  str,            # ISO-8601 UTC
 #     "points_each": int,            # points every pitcher-inner earns (>=1)
 #     "max_scorers": int | None,     # optional cap on how many can score
-#     "expires_at":  str,            # ISO-8601 UTC; auto-closes at/after this
+#     "expires_at":  str | None,     # ISO-8601 UTC; auto-closes at/after this
+#                                    #   (None only while dormant between rounds)
 #     "scorers":     list[dict],     # [{"user_id": int, "user_name": str}, …]
 #     "ended":       bool,           # set true the instant it finalizes (a guard
 #                                    #   so an expiry/manual-end race can't
 #                                    #   double-award before the row is popped)
+#     …plus the optional recurrence columns described above…
 # }
 #
 # do-em-up dict schema
@@ -601,9 +619,11 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
 # {
 #     …same id/guild_id/channel_id/message_id/brief/description/created_by/
 #       created_at/points_each/ended fields as above…
-#     "deadline":    str | None,     # ISO-8601 UTC auto-close, or None (open)
+#     "deadline":    str | None,     # ISO-8601 UTC auto-close, or None (open /
+#                                    #   dormant between rounds)
 #     "point_limit": int | None,     # optional total-points cap
 #     "tallies":     dict,           # {str(user_id): {"name": str, "count": int}}
+#     …plus the optional recurrence columns described above…
 # }
 
 
