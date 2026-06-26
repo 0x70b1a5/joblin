@@ -2,12 +2,13 @@
 
 The deal
 --------
-At the close of each month, anyone whose monthly points total reached the guild's
-**bar** (``/farmconfig item_bar``, default :data:`DEFAULT_BAR`) earns a single,
-inert, decorative **trinket**, rolled from the month's active **zone**. The
-trinket has no mechanical effect and costs no points — it is a milestone reward
-sitting *beside* the ⭐ star, not a purchase. The chore economy stays sealed:
-points are never spent, so none are ever created from nothing.
+At the close of each month, a worker earns one inert, decorative **trinket** for
+*every whole multiple* of the guild's **bar** (``/farmconfig item_bar``, default
+:data:`DEFAULT_BAR`) their monthly points reached — clear it once for one, twice
+over (50 points against a 25-point bar) for two — each rolled from the month's
+active **zone**. A trinket has no mechanical effect and costs no points; it is a
+milestone reward sitting *beside* the ⭐ star, not a purchase. The chore economy
+stays sealed: points are never spent, so none are ever created from nothing.
 
 Why it's all derived, never stored
 -----------------------------------
@@ -422,8 +423,8 @@ def zone_blurb(ym: str, bar: int, *, past: bool = False) -> str:
     if past:
         return f"{z['emoji']} _{ym} was {z['name']} — {z['blurb']}._"
     return (
-        f"{z['emoji']} _{ym} is **{z['name']}** — clear **{bar} pts** this month "
-        f"and a trinket from it is yours when the month closes._"
+        f"{z['emoji']} _{ym} is **{z['name']}** — every **{bar} pts** you clear "
+        f"this month earns a trinket from it when the month closes._"
     )
 
 
@@ -519,15 +520,27 @@ def roll_trinket(rng: random.Random, zone: dict) -> dict:
     }
 
 
-def roll_for(guild_id: int, user_id: int, ym: str) -> dict:
+def roll_for(guild_id: int, user_id: int, ym: str, idx: int = 0) -> dict:
     """The deterministic trinket a user earns for clearing the bar in month ``ym``.
 
-    Same inputs → same trinket, forever. Carries its month/zone for display.
+    A worker earns **one trinket per whole multiple of the bar** reached that
+    month — 50 points against a 25-point bar yields two — and ``idx`` (0-based)
+    picks which of them this is. Same inputs → same trinket, forever; it carries
+    its month/zone (and its index within the month) for display.
+
+    Backward-compat: ``idx == 0`` reuses the *exact* pre-multiples seed, so every
+    collection earned under the old one-per-month rule is preserved byte-for-byte;
+    only the extra trinkets (``idx >= 1``) fold the index into the seed, in a
+    longer key that structurally cannot collide with any existing roll.
     """
     zone_key = zone_for_month(ym)
-    rng = random.Random(_seed("trinket", guild_id, user_id, ym, zone_key))
+    parts: tuple = ("trinket", guild_id, user_id, ym, zone_key)
+    if idx:
+        parts += (idx,)
+    rng = random.Random(_seed(*parts))
     t = roll_trinket(rng, ZONES[zone_key])
     t["month"] = ym
+    t["idx"] = idx
     t["zone_key"] = zone_key
     t["zone_emoji"] = ZONES[zone_key]["emoji"]
     t["zone_name"] = ZONES[zone_key]["name"]

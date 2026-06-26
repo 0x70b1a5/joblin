@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import itertools
 import json
 import logging
 import os
@@ -1455,7 +1456,7 @@ def schedule_from_rule(
     channel="Channel where tasks are posted",
     timezone="IANA timezone, e.g. Europe/Berlin (autocompletes)",
     reminder_role="Role to ping on overdue hourly reminders (optional)",
-    item_bar="Monthly points needed to earn a trinket at month's end (default 25)",
+    item_bar="Points per trinket each month — every multiple earns another (default 25)",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def farmconfig(
@@ -1507,7 +1508,7 @@ async def farmconfig(
         f"• Channel: {ch}\n"
         f"• Timezone: {tz}\n"
         f"• Reminder role: {role}\n"
-        f"• Trinket bar: **{bar} pts/month** 🖼️"
+        f"• Trinket bar: **{bar} pts** each — every multiple earns another 🖼️"
     )
     if not config_ready(current):
         msg += "\n\n⚠️ Set **both** a channel and a timezone before creating tasks."
@@ -2271,8 +2272,9 @@ async def farmhelp(interaction: discord.Interaction) -> None:
         name="🖼️ Trinkets & the vitrine",
         value=(
             "Clear the month's **bar** of points (default **25**, set with "
-            "`/farmconfig item_bar:`) and when the month closes you earn a unique, "
-            "inert **trinket** — a rolled *objet d'art* — into your `/vitrine`. Each "
+            "`/farmconfig item_bar:`) and when the month closes an inert **trinket** "
+            "— a rolled *objet d'art* — lands in your `/vitrine`; clear it several "
+            "times over (50 pts on a 25-pt bar) and you collect that many. Each "
             "month a different **zone** is bountiful (the Bean Zone, the Vaults, the "
             "Menagerie…), shown on the `/leaderboard`. Trinkets cost no points and do "
             "nothing but delight; the ⭐ star still goes to the month's top scorer."
@@ -2346,16 +2348,20 @@ def _guild_bar(cfg: Optional[dict]) -> int:
 
 def vitrine_for(records: list[dict], guild_id: int, user_id: int, bar: int,
                 current_month: str) -> list[dict]:
-    """Every trinket a user has earned: one deterministic roll for each *past*
-    month in which their points reached ``bar``. Like stars, it's derived from
-    the log — the current month is still in play, so it's excluded."""
+    """Every trinket a user has earned: one deterministic roll per *whole multiple*
+    of ``bar`` their points reached, for each *past* month (50 pts against a
+    25-point bar → two). Like stars, it's derived from the log — the current
+    month is still in play, so it's excluded. Sorted oldest→newest, idx 0…n−1
+    within a month."""
     out: list[dict] = []
     for month, bucket in sorted(monthly_scores(records, guild_id).items()):
         if not month or month >= current_month:
             continue
         ent = bucket.get(user_id)
-        if ent and ent["points"] >= bar:
-            out.append(trinkets.roll_for(guild_id, user_id, month))
+        if not ent:
+            continue
+        for idx in range(ent["points"] // bar):  # bar ≥ 1, guaranteed by _guild_bar
+            out.append(trinkets.roll_for(guild_id, user_id, month, idx))
     return out
 
 
@@ -2435,30 +2441,53 @@ async def vitrine(interaction: discord.Interaction, user: Optional[discord.Membe
     whose = "Your" if target.id == interaction.user.id else f"{target.display_name}'s"
     header = f"🖼️ **{whose} vitrine** — {len(items)} trinket{'' if len(items) == 1 else 's'}"
 
-    # Newest first, trimmed to stay under Discord's 2000-char message limit.
+    # Group by month, newest first: a header (with a ×N count when that month
+    # yielded several) over its indented items. `items` is already month-sorted,
+    # so consecutive grouping is sound. Rendered flat as (line, is_trinket) pairs
+    # — body is always a prefix of these — then greedily trimmed to stay under
+    # Discord's 2000-char message limit.
+    blocks: list[list[tuple[str, bool]]] = []
+    for month, grp in itertools.groupby(items, key=lambda t: t["month"]):
+        group = list(grp)
+        suffix = f"  ×{len(group)}" if len(group) > 1 else ""
+        block: list[tuple[str, bool]] = [(f"**{month}**{suffix}", False)]
+        block.extend((f"  {trinkets.render_line(t)}", True) for t in group)
+        blocks.append(block)
+    # Newest month on top, but each header still leads its own items (idx 0…n) —
+    # reverse the *group order*, not the flat lines.
+    rendered = [pair for block in reversed(blocks) for pair in block]
+
     body: list[str] = []
-    shown = 0
-    for t in reversed(items):
-        line = f"{trinkets.render_line(t)}  ·  _{t['month']}_"
-        if sum(len(x) for x in body) + len(line) > 1700:
+    shown = used = 0
+    for line, is_trinket in rendered:
+        if body and used + len(line) + 1 > 1700:
             break
         body.append(line)
-        shown += 1
+        used += len(line) + 1
+        shown += is_trinket
+    # Never strand a month header whose items got trimmed away.
+    if body and not rendered[len(body) - 1][1]:
+        body.pop()
     if not items:
         body.append("_The cabinet stands empty… for now._")
     elif shown < len(items):
         n = len(items) - shown
         body.append(f"… and {n} older trinket{'' if n == 1 else 's'}.")
 
-    # Progress toward this month's (still-pending) trinket.
+    # Progress toward this month's (still-pending) trinkets — one per multiple of
+    # the bar, so a high scorer is already stacking several.
     ent = monthly_scores(records, interaction.guild_id).get(current_month, {}).get(target.id)
     pts = ent["points"] if ent else 0
+    secured = pts // bar
+    to_next = bar - pts % bar  # 1…bar: points until the next trinket tips over
     zk = trinkets.zone_for_month(current_month)
     z = f"{trinkets.zone_emoji(zk)} {current_month} is **{trinkets.zone_label(zk)}**"
-    if pts >= bar:
-        foot = f"{z} — at **{pts}/{bar} pts**, a trinket from it is already secured ✨"
+    if secured == 0:
+        foot = f"{z} — **{pts}/{bar} pts**, {to_next} to go for a trinket from it"
     else:
-        foot = f"{z} — **{pts}/{bar} pts**, {bar - pts} to go for a trinket from it"
+        foot = (f"{z} — at **{pts} pts** you've secured "
+                f"**{secured} trinket{'' if secured == 1 else 's'}** ✨, "
+                f"**{to_next}** more for the next")
 
     msg = header + "\n" + "\n".join(body) + "\n\n" + foot
     await interaction.response.send_message(msg, allowed_mentions=NO_PINGS)

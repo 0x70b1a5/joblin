@@ -45,7 +45,7 @@ the family chores.
 
 | Command | Who | What |
 |---|---|---|
-| `/farmconfig` | Manage Server | Set the post **channel**, **timezone** (IANA, e.g. `Europe/Berlin`), an optional **reminder role**, and the **`item_bar`** — monthly points needed to earn a trinket (default **25**). Run with no options to view current config. |
+| `/farmconfig` | Manage Server | Set the post **channel**, **timezone** (IANA, e.g. `Europe/Berlin`), an optional **reminder role**, and the **`item_bar`** — points per trinket each month, where every whole multiple earns another (default **25**). Run with no options to view current config. |
 | `/newtask` | anyone | `brief`, optional `at` (default **now**), optional `repeat` (default **once**), optional `description`, optional `bounty` (a 2-point chore the creator can't complete). Both `at` and `repeat` autocomplete with a live preview. Posts a **public** confirmation so the family sees the new chore. |
 | `/pitchin` | anyone | Post a **pitch-in**: `brief`, optional `expires` (default **24h**), `points` each (default 1), `max_scorers`, `description`. Everyone who taps ✅ before it closes earns a point. See [Pitch-ins & do-em-ups](#pitch-ins--do-em-ups). |
 | `/doemup` | anyone | Post a **do-em-up**: `brief`, optional `points` per ➕ (default 1), `deadline`, `point_limit`, `description`. Tap ➕ once per thing you did; the tally updates live. See [Pitch-ins & do-em-ups](#pitch-ins--do-em-ups). |
@@ -53,7 +53,7 @@ the family chores.
 | `/deletetask` | anyone | Permanently delete a task (autocompletes existing tasks). |
 | `/listtasks` | anyone | List all tasks with their **`id`**, schedule, and when each next posts. |
 | `/leaderboard` | anyone | Monthly **points** per person — one per chore, **two** per bounty, plus pitch-in / do-em-up points — with each past month's winner shown by their **⭐ stars**, and the month's bountiful **zone** (`month` defaults to current). |
-| `/vitrine` | anyone | Gaze upon a collection of **trinkets** — the inert *objets d'art* earned at each month's end for clearing the bar. `user` defaults to yourself. |
+| `/vitrine` | anyone | Gaze upon a collection of **trinkets** — the inert *objets d'art* earned at each month's end, one per whole multiple of the bar cleared, grouped by month. `user` defaults to yourself. |
 | `/farmhelp` | anyone | Quick reference for the commands, the `at`/`repeat` syntax, and the reactions. |
 | `/redeploy` | bot owner | `git pull`, `uv sync`, then restart the bot in place (same tmux pane, so the log continues). Reports the pull result and aborts without restarting if the pull or sync fails. See [Running & updating on a VPS](#running--updating-on-a-vps). |
 
@@ -79,17 +79,19 @@ the family chores.
   (a tie shares the star). The current month is still up for grabs, so its star
   isn't awarded until the month closes. Stars are derived from the completion log,
   so an **undo** that voids a completion also updates the standings honestly.
-- **Trinkets 🖼️** are a *parallel* reward to the star: at each month's close,
-  **everyone** whose monthly points reached the **bar** (`/farmconfig item_bar:`,
-  default **25**) earns one unique, **inert** *objet d'art* into their `/vitrine`.
-  They cost no points and do nothing — so the chore economy stays sealed and no
-  points are ever created from nothing. Each month a different **zone** is bountiful
+- **Trinkets 🖼️** are a *parallel* reward to the star: at each month's close, a
+  worker earns one **inert** *objet d'art* into their `/vitrine` for **every whole
+  multiple** of the **bar** (`/farmconfig item_bar:`, default **25**) their monthly
+  points reached — 50 points on a 25 bar earns two. They cost no points and do
+  nothing — so the chore economy stays sealed and no points are ever created from
+  nothing. Each month a different **zone** is bountiful
   (the Bean Zone, the Vaults, the Menagerie, the Scriptorium…), rolled
-  deterministically from the year-month and announced on the `/leaderboard`; your
-  trinket is rolled from that zone. Like stars, trinkets are **derived from the
-  completion log** — a stable `sha256(guild, user, month, zone)` seed yields the
-  same collection every time, with no stored award state and nothing to reconcile
-  after an undo. The tables are blended from *Vaults of Vaarn* and *Flayed Sun*;
+  deterministically from the year-month and announced on the `/leaderboard`; the
+  trinkets are rolled from that zone. Like stars, trinkets are **derived from the
+  completion log** — a stable `sha256(guild, user, month, zone[, idx])` seed yields
+  the same collection every time (the first trinket omits `idx`, so collections
+  earned before multiples existed are preserved), with no stored award state and
+  nothing to reconcile after an undo. The tables are blended from *Vaults of Vaarn* and *Flayed Sun*;
   see `farmtracker/trinkets.py`.
 
 ## Pitch-ins & do-em-ups

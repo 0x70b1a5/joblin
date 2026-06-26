@@ -1255,6 +1255,26 @@ def test_vitrine_award() -> None:
     # And it's stable across calls (derived, not re-randomised each time).
     assert won[0]["display"] == B.vitrine_for(recs, 1, 5, 3, "2026-03")[0]["display"]
 
+    # Multiples: each whole multiple of the bar earns another trinket from that
+    # month. User 5 cleared 3 pts in 2026-01 → three at a 1-pt bar (idx 0,1,2),
+    # one at a 2-pt bar (floor(3/2)), zero once the bar exceeds the score.
+    many = B.vitrine_for(recs, 1, 5, 1, "2026-03")
+    assert [t["month"] for t in many] == ["2026-01"] * 3, "3 pts / 1-pt bar → 3 trinkets"
+    assert [t["idx"] for t in many] == [0, 1, 2], "indexed 0,1,2 within the month"
+    assert len(B.vitrine_for(recs, 1, 5, 2, "2026-03")) == 1, "floor(3/2) = 1"
+    assert B.vitrine_for(recs, 1, 5, 4, "2026-03") == [], "3 pts under a 4-pt bar earns none"
+
+    # Backward-compat is sacred: trinket #0 must reuse the EXACT pre-multiples
+    # seed (no index in the key) so existing collections never silently reshuffle.
+    # Re-derive it the old way and demand a match; the extras are own stable rolls.
+    import random
+
+    zk = T.zone_for_month("2026-01")
+    legacy0 = T.roll_trinket(random.Random(T._seed("trinket", 1, 5, "2026-01", zk)), T.ZONES[zk])
+    assert many[0]["display"] == legacy0["display"], "idx-0 seed drifted from the old recipe"
+    assert T.roll_for(1, 5, "2026-01") == T.roll_for(1, 5, "2026-01", 0), "default idx is 0"
+    assert many[1] == T.roll_for(1, 5, "2026-01", 1), "extra trinkets are deterministic too"
+
 
 def main() -> None:
     test_emoji_key()
