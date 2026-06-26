@@ -983,6 +983,63 @@ async def test_bounty() -> None:
         assert len(comps) == 1 and comps[0]["user_id"] == 2 and comps[0]["points"] == 2
 
 
+def test_trinkets() -> None:
+    import random
+    from farmtracker import trinkets as T
+
+    # Determinism is the whole foundation: identical inputs -> identical trinket,
+    # even across processes/restarts (sha256 seed, not the salted builtin hash).
+    a = T.roll_for(7, 99, "2026-06")
+    assert a == T.roll_for(7, 99, "2026-06"), "trinket rolls must be deterministic"
+
+    # Every zone yields a clean, fully-rendered name for many users — no empty
+    # names, no unfilled "{...}" placeholders, no "of a a"/" a a" article slips.
+    for zk in T.ZONE_KEYS:
+        for u in range(300):
+            rng = random.Random(T._seed("t", 1, u, "x", zk))
+            t = T.roll_trinket(rng, T.ZONES[zk])
+            d = t["display"]
+            assert d.strip(), f"empty trinket name in zone {zk}"
+            assert "{" not in d and "}" not in d, f"unfilled placeholder: {d!r}"
+            assert " a a" not in f" {d}" and "of a a" not in d, f"bad article: {d!r}"
+
+    # Zone rotation: each cycle of len(ZONES) months is a permutation of all
+    # zones (true rotation), with no back-to-back repeats inside a cycle.
+    n = len(T.ZONE_KEYS)
+    start = (T._month_index("2026-01") // n) * n
+    cycle = []
+    for i in range(start, start + n):
+        y, mo = divmod(i, 12)
+        cycle.append(T.zone_for_month(f"{y:04d}-{mo + 1:02d}"))
+    assert sorted(cycle) == sorted(T.ZONE_KEYS), "a cycle must cover every zone once"
+    assert all(cycle[i] != cycle[i + 1] for i in range(n - 1)), "no back-to-back repeats"
+
+
+def test_vitrine_award() -> None:
+    import farmtracker.bot as B
+    from farmtracker import trinkets as T
+
+    # Bar handling: explicit, defaulted, and junk all resolve sanely.
+    assert B._guild_bar({"item_bar": 40}) == 40
+    assert B._guild_bar({}) == T.DEFAULT_BAR
+    assert B._guild_bar(None) == T.DEFAULT_BAR
+
+    recs = [
+        {"guild_id": 1, "user_id": 5, "user_name": "A", "month": "2026-01"},               # 1
+        {"guild_id": 1, "user_id": 5, "user_name": "A", "month": "2026-01", "points": 2},  # +2 = 3
+        {"guild_id": 1, "user_id": 9, "user_name": "B", "month": "2026-01"},               # 1 (< bar)
+        {"guild_id": 1, "user_id": 5, "user_name": "A", "month": "2026-03"},               # current
+    ]
+    # bar=3, "current" month = 2026-03: only user 5's closed 2026-01 qualifies.
+    won = B.vitrine_for(recs, 1, 5, 3, "2026-03")
+    assert [t["month"] for t in won] == ["2026-01"], "award only past months >= bar"
+    assert B.vitrine_for(recs, 1, 9, 3, "2026-03") == [], "below the bar earns nothing"
+    # The current (still-contested) month is never awarded yet.
+    assert all(t["month"] != "2026-03" for t in B.vitrine_for(recs, 1, 5, 1, "2026-03"))
+    # And it's stable across calls (derived, not re-randomised each time).
+    assert won[0]["display"] == B.vitrine_for(recs, 1, 5, 3, "2026-03")[0]["display"]
+
+
 def main() -> None:
     test_emoji_key()
     test_time_parsing()
@@ -997,6 +1054,8 @@ def main() -> None:
     test_oneoff_parse()
     test_can_undo()
     test_points_and_stars()
+    test_trinkets()
+    test_vitrine_award()
     asyncio.run(test_void_completion())
     asyncio.run(test_bounty())
     asyncio.run(test_store())

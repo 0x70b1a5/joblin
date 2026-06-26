@@ -51,6 +51,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from . import trinkets
 from .models import (
     DIGIT_BY_KEY,
     DIGIT_EMOJI,
@@ -1324,6 +1325,7 @@ def schedule_from_rule(
     channel="Channel where tasks are posted",
     timezone="IANA timezone, e.g. Europe/Berlin (autocompletes)",
     reminder_role="Role to ping on overdue hourly reminders (optional)",
+    item_bar="Monthly points needed to earn a trinket at month's end (default 25)",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def farmconfig(
@@ -1331,6 +1333,7 @@ async def farmconfig(
     channel: Optional[discord.TextChannel] = None,
     timezone: Optional[str] = None,
     reminder_role: Optional[discord.Role] = None,
+    item_bar: Optional[int] = None,
 ) -> None:
     if timezone is not None:
         try:
@@ -1342,27 +1345,39 @@ async def farmconfig(
             )
             return
 
+    if item_bar is not None and item_bar < 1:
+        await interaction.response.send_message(
+            "❌ The trinket bar must be at least 1 point.", ephemeral=True
+        )
+        return
+
     async with store.txn() as data:
         cfg = data["configs"].setdefault(
             str(interaction.guild_id),
-            {"channel_id": None, "timezone": None, "reminder_role_id": None},
+            {"channel_id": None, "timezone": None, "reminder_role_id": None,
+             "item_bar": trinkets.DEFAULT_BAR},
         )
+        cfg.setdefault("item_bar", trinkets.DEFAULT_BAR)
         if channel is not None:
             cfg["channel_id"] = channel.id
         if timezone is not None:
             cfg["timezone"] = timezone
         if reminder_role is not None:
             cfg["reminder_role_id"] = reminder_role.id
+        if item_bar is not None:
+            cfg["item_bar"] = item_bar
         current = dict(cfg)
 
     ch = f"<#{current['channel_id']}>" if current.get("channel_id") else "— *(unset)*"
     tz = f"`{current['timezone']}`" if current.get("timezone") else "— *(unset)*"
     role = f"<@&{current['reminder_role_id']}>" if current.get("reminder_role_id") else "— *(none)*"
+    bar = current.get("item_bar") or trinkets.DEFAULT_BAR
     msg = (
         "**Farm configuration**\n"
         f"• Channel: {ch}\n"
         f"• Timezone: {tz}\n"
-        f"• Reminder role: {role}"
+        f"• Reminder role: {role}\n"
+        f"• Trinket bar: **{bar} pts/month** 🖼️"
     )
     if not config_ready(current):
         msg += "\n\n⚠️ Set **both** a channel and a timezone before creating tasks."
@@ -1919,7 +1934,8 @@ async def farmhelp(interaction: discord.Interaction) -> None:
             "• `/edittask` — change a chore (paste its id from the list)\n"
             "• `/deletetask` — remove a chore for good\n"
             "• `/leaderboard` — monthly points ranking & ⭐ stars 🏆\n"
-            "• `/farmconfig` — channel, timezone, reminder role *(Manage Server)*\n"
+            "• `/vitrine` — your cabinet of month's-end trinkets 🖼️\n"
+            "• `/farmconfig` — channel, timezone, reminder role, trinket bar *(Manage Server)*\n"
             "• `/farmhelp` — this message"
         ),
         inline=False,
@@ -1972,6 +1988,18 @@ async def farmhelp(interaction: discord.Interaction) -> None:
             "(➖ to fix); the tally updates live. Optional `points` each, `deadline`, "
             "and `point_limit` (auto-closes at that total). 🏁 ends it.\n"
             "Points from both feed the `/leaderboard`."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🖼️ Trinkets & the vitrine",
+        value=(
+            "Clear the month's **bar** of points (default **25**, set with "
+            "`/farmconfig item_bar:`) and when the month closes you earn a unique, "
+            "inert **trinket** — a rolled *objet d'art* — into your `/vitrine`. Each "
+            "month a different **zone** is bountiful (the Bean Zone, the Vaults, the "
+            "Menagerie…), shown on the `/leaderboard`. Trinkets cost no points and do "
+            "nothing but delight; the ⭐ star still goes to the month's top scorer."
         ),
         inline=False,
     )
@@ -2032,6 +2060,29 @@ def star_counts(records: list[dict], guild_id: int, current_month: str) -> dict[
     return stars
 
 
+def _guild_bar(cfg: Optional[dict]) -> int:
+    """The guild's trinket bar (monthly points to earn one), defaulted & sane."""
+    try:
+        return max(1, int(cfg.get("item_bar")))  # type: ignore[union-attr]
+    except (TypeError, ValueError, AttributeError):
+        return trinkets.DEFAULT_BAR
+
+
+def vitrine_for(records: list[dict], guild_id: int, user_id: int, bar: int,
+                current_month: str) -> list[dict]:
+    """Every trinket a user has earned: one deterministic roll for each *past*
+    month in which their points reached ``bar``. Like stars, it's derived from
+    the log — the current month is still in play, so it's excluded."""
+    out: list[dict] = []
+    for month, bucket in sorted(monthly_scores(records, guild_id).items()):
+        if not month or month >= current_month:
+            continue
+        ent = bucket.get(user_id)
+        if ent and ent["points"] >= bar:
+            out.append(trinkets.roll_for(guild_id, user_id, month))
+    return out
+
+
 @bot.tree.command(name="leaderboard", description="Monthly chore points & ⭐ stars")
 @app_commands.describe(month="Month as YYYY-MM (defaults to the current month)")
 async def leaderboard(interaction: discord.Interaction, month: Optional[str] = None) -> None:
@@ -2039,6 +2090,7 @@ async def leaderboard(interaction: discord.Interaction, month: Optional[str] = N
     cfg = guild_config(snap, interaction.guild_id)
     tz = ZoneInfo(cfg["timezone"]) if cfg and cfg.get("timezone") else UTC
     current_month = now_utc().astimezone(tz).strftime("%Y-%m")
+    bar = _guild_bar(cfg)
     if month is None:
         month = current_month
 
@@ -2055,7 +2107,8 @@ async def leaderboard(interaction: discord.Interaction, month: Optional[str] = N
 
     bucket = months.get(month, {})
     if not bucket:
-        msg = f"No chores logged for **{month}** yet. Get to work! 🚜"
+        msg = (f"No chores logged for **{month}** yet. Get to work! 🚜\n"
+               + trinkets.zone_blurb(month, bar, past=month < current_month))
         if star_line:
             msg += "\n\n" + star_line
         await interaction.response.send_message(
@@ -2082,10 +2135,56 @@ async def leaderboard(interaction: discord.Interaction, month: Optional[str] = N
     if month == current_month:
         footer += "\n⭐ Whoever tops the board when the month ends earns a star."
 
-    msg = f"🏆 **Chore leaderboard — {month}**\n" + "\n".join(lines)
+    zone_note = trinkets.zone_blurb(month, bar, past=month < current_month)
+    msg = f"🏆 **Chore leaderboard — {month}**\n{zone_note}\n" + "\n".join(lines)
     if star_line:
         msg += "\n\n" + star_line
     msg += "\n\n" + footer
+    await interaction.response.send_message(msg, allowed_mentions=NO_PINGS)
+
+
+@bot.tree.command(name="vitrine", description="Gaze upon a collection of trinkets won at month's end")
+@app_commands.describe(user="Whose vitrine to view (default: yours)")
+async def vitrine(interaction: discord.Interaction, user: Optional[discord.Member] = None) -> None:
+    target = user or interaction.user
+    snap = await store.snapshot()
+    cfg = guild_config(snap, interaction.guild_id)
+    tz = ZoneInfo(cfg["timezone"]) if cfg and cfg.get("timezone") else UTC
+    current_month = now_utc().astimezone(tz).strftime("%Y-%m")
+    bar = _guild_bar(cfg)
+
+    records = store.read_completions()
+    items = vitrine_for(records, interaction.guild_id, target.id, bar, current_month)
+
+    whose = "Your" if target.id == interaction.user.id else f"{target.display_name}'s"
+    header = f"🖼️ **{whose} vitrine** — {len(items)} trinket{'' if len(items) == 1 else 's'}"
+
+    # Newest first, trimmed to stay under Discord's 2000-char message limit.
+    body: list[str] = []
+    shown = 0
+    for t in reversed(items):
+        line = f"{trinkets.render_line(t)}  ·  _{t['month']}_"
+        if sum(len(x) for x in body) + len(line) > 1700:
+            break
+        body.append(line)
+        shown += 1
+    if not items:
+        body.append("_The cabinet stands empty… for now._")
+    elif shown < len(items):
+        n = len(items) - shown
+        body.append(f"… and {n} older trinket{'' if n == 1 else 's'}.")
+
+    # Progress toward this month's (still-pending) trinket.
+    ent = monthly_scores(records, interaction.guild_id).get(current_month, {}).get(target.id)
+    pts = ent["points"] if ent else 0
+    zk = trinkets.zone_for_month(current_month)
+    z = f"{trinkets.zone_emoji(zk)} {current_month} is **{trinkets.zone_label(zk)}**"
+    if pts >= bar:
+        foot = f"{z} — at **{pts}/{bar} pts**, a trinket from it is already secured ✨"
+    else:
+        foot = f"{z} — **{pts}/{bar} pts**, {bar - pts} to go for a trinket from it"
+
+    msg = header + "\n" + "\n".join(body) + "\n\n" + foot
     await interaction.response.send_message(msg, allowed_mentions=NO_PINGS)
 
 
