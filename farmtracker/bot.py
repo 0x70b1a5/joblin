@@ -2275,9 +2275,10 @@ async def farmhelp(interaction: discord.Interaction) -> None:
             "`/farmconfig item_bar:`) and when the month closes an inert **trinket** "
             "— a rolled *objet d'art* — lands in your `/vitrine`; clear it several "
             "times over (50 pts on a 25-pt bar) and you collect that many. Each "
-            "month a different **zone** is bountiful (the Bean Zone, the Vaults, the "
-            "Menagerie…), shown on the `/leaderboard`. Trinkets cost no points and do "
-            "nothing but delight; the ⭐ star still goes to the month's top scorer."
+            "month a different **zone** is *in season* (the Bean Zone, the Vaults, the "
+            "Menagerie…), shown on the `/leaderboard`: ~7 in 10 of your trinkets are "
+            "rolled from it, the rest stray in from other zones. Trinkets cost no "
+            "points and do nothing but delight; the ⭐ star still goes to the top scorer."
         ),
         inline=False,
     )
@@ -2450,7 +2451,10 @@ async def vitrine(interaction: discord.Interaction, user: Optional[discord.Membe
     for month, grp in itertools.groupby(items, key=lambda t: t["month"]):
         group = list(grp)
         suffix = f"  ×{len(group)}" if len(group) > 1 else ""
-        block: list[tuple[str, bool]] = [(f"**{month}**{suffix}", False)]
+        # Lead the header with that month's *featured* zone; each item line then
+        # carries its own zone emoji, so an off-season stray stands out at a glance.
+        season = trinkets.zone_emoji(trinkets.zone_for_month(month))
+        block: list[tuple[str, bool]] = [(f"{season} **{month}**{suffix}", False)]
         block.extend((f"  {trinkets.render_line(t)}", True) for t in group)
         blocks.append(block)
     # Newest month on top, but each header still leads its own items (idx 0…n) —
@@ -2481,9 +2485,9 @@ async def vitrine(interaction: discord.Interaction, user: Optional[discord.Membe
     secured = pts // bar
     to_next = bar - pts % bar  # 1…bar: points until the next trinket tips over
     zk = trinkets.zone_for_month(current_month)
-    z = f"{trinkets.zone_emoji(zk)} {current_month} is **{trinkets.zone_label(zk)}**"
+    z = f"{trinkets.zone_emoji(zk)} {current_month}: **{trinkets.zone_label(zk)}** in season"
     if secured == 0:
-        foot = f"{z} — **{pts}/{bar} pts**, {to_next} to go for a trinket from it"
+        foot = f"{z} — **{pts}/{bar} pts**, {to_next} to go for your first trinket"
     else:
         foot = (f"{z} — at **{pts} pts** you've secured "
                 f"**{secured} trinket{'' if secured == 1 else 's'}** ✨, "

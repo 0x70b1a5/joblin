@@ -1264,16 +1264,49 @@ def test_vitrine_award() -> None:
     assert len(B.vitrine_for(recs, 1, 5, 2, "2026-03")) == 1, "floor(3/2) = 1"
     assert B.vitrine_for(recs, 1, 5, 4, "2026-03") == [], "3 pts under a 4-pt bar earns none"
 
-    # Backward-compat is sacred: trinket #0 must reuse the EXACT pre-multiples
-    # seed (no index in the key) so existing collections never silently reshuffle.
-    # Re-derive it the old way and demand a match; the extras are own stable rolls.
-    import random
-
-    zk = T.zone_for_month("2026-01")
-    legacy0 = T.roll_trinket(random.Random(T._seed("trinket", 1, 5, "2026-01", zk)), T.ZONES[zk])
-    assert many[0]["display"] == legacy0["display"], "idx-0 seed drifted from the old recipe"
-    assert T.roll_for(1, 5, "2026-01") == T.roll_for(1, 5, "2026-01", 0), "default idx is 0"
+    # Each trinket is deterministic and wears the zone its own weighted draw chose
+    # (the 70/30 bonus — see test_zone_pick), extras included, stable across calls.
     assert many[1] == T.roll_for(1, 5, "2026-01", 1), "extra trinkets are deterministic too"
+    for t in many:
+        zk, in_season = T.zone_pick_for(1, 5, "2026-01", t["idx"])
+        assert t["zone_key"] == zk and t["in_season"] == in_season, "trinket wears its picked zone"
+
+
+def test_zone_pick() -> None:
+    """Each trinket draws its zone independently: the month's featured zone with
+    probability FEATURED_WEIGHT (~0.70), else an off-season zone uniformly — a
+    bonus, not a monopoly. Deterministic per (guild, user, month, idx)."""
+    from farmtracker import trinkets as T
+
+    ym = "2026-06"
+    featured = T.zone_for_month(ym)
+    assert T.zone_pick_for(1, 2, ym, 0) == T.zone_pick_for(1, 2, ym, 0), "stable per identity"
+
+    # Over many users the featured share lands near FEATURED_WEIGHT; every pick is
+    # a real zone, and in_season is true iff it's the featured one.
+    n, hits, off = 5000, 0, set()
+    for u in range(n):
+        zk, in_season = T.zone_pick_for(1, u, ym, 0)
+        assert zk in T.ZONE_KEYS
+        assert (zk == featured) == in_season, "in_season iff featured zone"
+        if in_season:
+            hits += 1
+        else:
+            off.add(zk)
+    frac = hits / n
+    assert 0.66 < frac < 0.74, f"featured share {frac:.3f} not ≈ {T.FEATURED_WEIGHT}"
+    assert featured not in off, "an off-season pick is never the featured zone"
+    assert len(off) > 1, "off-season strays spread across multiple other zones"
+
+    # Different indices draw independently, so a month's trinkets can mix zones.
+    zones = {T.zone_pick_for(1, 3, ym, i)[0] for i in range(40)}
+    assert len(zones) > 1, "40 trinkets in one month should not all be one zone"
+
+    # roll_for stamps the picked zone + flag (and matching emoji/name) onto the item.
+    t = T.roll_for(1, 7, ym, 0)
+    zk, in_season = T.zone_pick_for(1, 7, ym, 0)
+    assert t["zone_key"] == zk and t["in_season"] == in_season
+    assert t["zone_emoji"] == T.zone_emoji(zk) and t["zone_name"] == T.zone_label(zk)
 
 
 def main() -> None:
@@ -1291,6 +1324,7 @@ def main() -> None:
     test_can_undo()
     test_points_and_stars()
     test_trinkets()
+    test_zone_pick()
     test_vitrine_award()
     asyncio.run(test_void_completion())
     asyncio.run(test_bounty())

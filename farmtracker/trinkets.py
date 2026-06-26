@@ -5,21 +5,24 @@ The deal
 At the close of each month, a worker earns one inert, decorative **trinket** for
 *every whole multiple* of the guild's **bar** (``/farmconfig item_bar``, default
 :data:`DEFAULT_BAR`) their monthly points reached — clear it once for one, twice
-over (50 points against a 25-point bar) for two — each rolled from the month's
-active **zone**. A trinket has no mechanical effect and costs no points; it is a
-milestone reward sitting *beside* the ⭐ star, not a purchase. The chore economy
-stays sealed: points are never spent, so none are ever created from nothing.
+over (50 points against a 25-point bar) for two. Each trinket draws its own
+**zone**: the month's featured ("in-season") zone is favoured (~70%), but the odd
+one strays in from another — a rotating *bonus*, not a monopoly. A trinket has no
+mechanical effect and costs no points; it is a milestone reward sitting *beside*
+the ⭐ star, not a purchase. The chore economy stays sealed: points are never
+spent, so none are ever created from nothing.
 
 Why it's all derived, never stored
 -----------------------------------
 A star is *derived* from the completion log every time the leaderboard is drawn
 (see ``bot.star_counts``). A trinket is a *random roll*, so naive re-derivation
-would reroll it on every view. We fix that by making the roll **deterministic**:
-the RNG is seeded from ``sha256(guild_id, user_id, year-month, zone)`` — facts
-already pinned in the ledger — so :func:`roll_for` returns the *same* trinket
-every single time, on every machine, across restarts. That buys us the star's
-elegance with none of its hazards: no month-close job, no persisted award state,
-no double-award races. A whole vitrine is a pure function of
+would reroll it on every view. We fix that by making both rolls **deterministic**:
+the trinket's zone is drawn from ``sha256("zone-pick", guild, user, year-month,
+idx)`` and then the item from ``sha256("trinket", guild, user, year-month, zone,
+idx)`` — facts already pinned in the ledger — so :func:`roll_for` returns the
+*same* trinket every single time, on every machine, across restarts. That buys us
+the star's elegance with none of its hazards: no month-close job, no persisted
+award state, no double-award races. A whole vitrine is a pure function of
 ``(completion log, bar, the zone schedule)``.
 
 Two warnings live in the seeding:
@@ -51,6 +54,11 @@ import random
 from typing import Optional
 
 DEFAULT_BAR = 25  # monthly points needed to earn a trinket, unless reconfigured
+
+# A single trinket's chance of being rolled from the month's featured ("in-season")
+# zone. The remaining ~30% stray in from one of the *other* zones, drawn uniformly —
+# so the featured taxon is a weighted *bonus*, never an exclusive monopoly.
+FEATURED_WEIGHT = 0.70
 
 
 # ---------------------------------------------------------------------------
@@ -423,8 +431,8 @@ def zone_blurb(ym: str, bar: int, *, past: bool = False) -> str:
     if past:
         return f"{z['emoji']} _{ym} was {z['name']} — {z['blurb']}._"
     return (
-        f"{z['emoji']} _{ym} is **{z['name']}** — every **{bar} pts** you clear "
-        f"this month earns a trinket from it when the month closes._"
+        f"{z['emoji']} _{ym}: **{z['name']}** is in season — every **{bar} pts** you "
+        f"clear earns a trinket, most from it, the odd one straying in from afar._"
     )
 
 
@@ -520,28 +528,40 @@ def roll_trinket(rng: random.Random, zone: dict) -> dict:
     }
 
 
-def roll_for(guild_id: int, user_id: int, ym: str, idx: int = 0) -> dict:
-    """The deterministic trinket a user earns for clearing the bar in month ``ym``.
+def zone_pick_for(guild_id: int, user_id: int, ym: str, idx: int) -> tuple[str, bool]:
+    """Which zone a single trinket is rolled from, and whether it's *in-season*.
 
-    A worker earns **one trinket per whole multiple of the bar** reached that
-    month — 50 points against a 25-point bar yields two — and ``idx`` (0-based)
-    picks which of them this is. Same inputs → same trinket, forever; it carries
-    its month/zone (and its index within the month) for display.
-
-    Backward-compat: ``idx == 0`` reuses the *exact* pre-multiples seed, so every
-    collection earned under the old one-per-month rule is preserved byte-for-byte;
-    only the extra trinkets (``idx >= 1``) fold the index into the seed, in a
-    longer key that structurally cannot collide with any existing roll.
+    The month's featured zone (:func:`zone_for_month`) is favoured — it wins with
+    probability :data:`FEATURED_WEIGHT` — otherwise an off-season zone is drawn
+    uniformly from the rest. So the featured taxon is a *bonus*, not a monopoly:
+    most of a month's trinkets come from it, but the odd one strays in from afar.
+    Deterministic per (guild, user, month, index), seeded in its own keyspace so
+    the choice never perturbs the item roll itself.
     """
-    zone_key = zone_for_month(ym)
-    parts: tuple = ("trinket", guild_id, user_id, ym, zone_key)
-    if idx:
-        parts += (idx,)
-    rng = random.Random(_seed(*parts))
+    featured = zone_for_month(ym)
+    rng = random.Random(_seed("zone-pick", guild_id, user_id, ym, idx))
+    if rng.random() < FEATURED_WEIGHT:
+        return featured, True
+    others = [z for z in ZONE_KEYS if z != featured]
+    return others[rng.randrange(len(others))], False
+
+
+def roll_for(guild_id: int, user_id: int, ym: str, idx: int = 0) -> dict:
+    """The deterministic trinket a worker earns as their ``idx``-th award in ``ym``.
+
+    A worker earns one trinket per whole multiple of the bar (50 pts against a
+    25-point bar → two); ``idx`` (0-based) picks which one. Each trinket draws its
+    own zone via :func:`zone_pick_for` — the featured zone ~70% of the time, an
+    off-season zone the rest — then rolls an item from it. Same inputs → same
+    trinket, forever; it carries its month, index, picked zone, and season flag.
+    """
+    zone_key, in_season = zone_pick_for(guild_id, user_id, ym, idx)
+    rng = random.Random(_seed("trinket", guild_id, user_id, ym, zone_key, idx))
     t = roll_trinket(rng, ZONES[zone_key])
     t["month"] = ym
     t["idx"] = idx
     t["zone_key"] = zone_key
+    t["in_season"] = in_season
     t["zone_emoji"] = ZONES[zone_key]["emoji"]
     t["zone_name"] = ZONES[zone_key]["name"]
     return t

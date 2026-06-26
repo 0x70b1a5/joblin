@@ -84,14 +84,18 @@ the family chores.
   multiple** of the **bar** (`/farmconfig item_bar:`, default **25**) their monthly
   points reached — 50 points on a 25 bar earns two. They cost no points and do
   nothing — so the chore economy stays sealed and no points are ever created from
-  nothing. Each month a different **zone** is bountiful
-  (the Bean Zone, the Vaults, the Menagerie, the Scriptorium…), rolled
-  deterministically from the year-month and announced on the `/leaderboard`; the
-  trinkets are rolled from that zone. Like stars, trinkets are **derived from the
-  completion log** — a stable `sha256(guild, user, month, zone[, idx])` seed yields
-  the same collection every time (the first trinket omits `idx`, so collections
-  earned before multiples existed are preserved), with no stored award state and
-  nothing to reconcile after an undo. The tables are blended from *Vaults of Vaarn* and *Flayed Sun*;
+  nothing. Each month a different **zone** is *in season*
+  (the Bean Zone, the Vaults, the Menagerie, the Scriptorium…), chosen
+  deterministically from the year-month and announced on the `/leaderboard`. The
+  in-season zone is a **bonus, not a monopoly**: each trinket independently lands
+  on it ~70% of the time (`FEATURED_WEIGHT`) and otherwise strays in from one of
+  the other zones, so a month's collection is mostly — but not only — the featured
+  taxon (`/vitrine` leads each month with the season's emoji, and every item shows
+  its own). Like stars, trinkets are **derived from the completion log** — the zone
+  is drawn from a `sha256("zone-pick", guild, user, month, idx)` seed and the item
+  from a `sha256("trinket", guild, user, month, zone, idx)` seed, so the same
+  collection comes back every time, with no stored award state and nothing to
+  reconcile after an undo. The tables are blended from *Vaults of Vaarn* and *Flayed Sun*;
   see `farmtracker/trinkets.py`.
 
 ## Pitch-ins & do-em-ups
