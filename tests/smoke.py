@@ -1178,6 +1178,152 @@ async def test_requeue() -> None:
         assert any("already queued" in (msg.content or "") for msg in ch.msgs.values())
 
 
+async def test_claps() -> None:
+    """A ✅-completed post grows a 👏 button; an outsider's tap tips the doer a
+    bonus point (one per outsider), a participant's own 👏 is ignored, and undoing
+    the ✅ retracts both the completion and every clap bonus."""
+    import farmtracker.bot as bot
+
+    with tempfile.TemporaryDirectory() as d:
+        st = Store(pathlib.Path(d) / "store.json", pathlib.Path(d) / "log.jsonl")
+        st.load()
+        assert "claps" in st.data, "store should grow a 'claps' section"
+        bot.store = st  # handlers read the module global at call time
+        ch = FakeChannel()
+        bot.bot.get_channel = lambda cid: ch  # type: ignore[assignment]
+
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        tid = "sweep"
+        task = {
+            "id": tid, "guild_id": 1, "brief": "Sweep the barn", "description": None,
+            "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+            "monthdays": [], "time_of_day": tod,
+            "next_due": m.to_iso(now - dt.timedelta(seconds=1)),  # already due -> fires
+            "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+        }
+        async with st.txn() as data:
+            data["configs"]["1"] = cfg
+            data["tasks"][tid] = task
+
+        # Fire + ✅ complete by Pat -> the completed post carries a 👏.
+        await bot.fire_task(tid, ch, cfg)
+        posted = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][-1]
+        await bot.on_raw_reaction_add(FakePayload(posted, "✅", member=FakeMember(42, "Pat")))
+        snap = await st.snapshot()
+        assert str(posted) in snap["claps"], "completing arms a clap on the post"
+        assert (posted, "👏") in ch.added, "👏 button added to the completed post"
+        assert [p["user_id"] for p in snap["claps"][str(posted)]["participants"]] == [42]
+        assert len(st.read_completions()) == 1, "just the completion so far"
+
+        # An outsider (Sam) claps -> Pat earns a +1 bonus; the tally shows on the post.
+        await bot.on_raw_reaction_add(FakePayload(posted, "👏", user_id=7, member=FakeMember(7, "Sam")))
+        recs = st.read_completions()
+        claps = [r for r in recs if r["kind"] == "clap"]
+        assert len(claps) == 1 and claps[0]["user_id"] == 42 and claps[0]["points"] == 1
+        assert "👏 ×1" in (ch.msgs[posted].content or "")
+
+        # Sam clapping again is a no-op (one per outsider).
+        await bot.on_raw_reaction_add(FakePayload(posted, "👏", user_id=7, member=FakeMember(7, "Sam")))
+        assert len([r for r in st.read_completions() if r["kind"] == "clap"]) == 1
+
+        # Pat can't clap their own finished chore.
+        await bot.on_raw_reaction_add(FakePayload(posted, "👏", user_id=42, member=FakeMember(42, "Pat")))
+        assert len([r for r in st.read_completions() if r["kind"] == "clap"]) == 1
+        assert 42 not in (await st.snapshot())["claps"][str(posted)]["clappers"]
+
+        # A second outsider (Lee) stacks another bonus -> Pat now has the chore + 2 claps.
+        await bot.on_raw_reaction_add(FakePayload(posted, "👏", user_id=9, member=FakeMember(9, "Lee")))
+        assert "👏 ×2" in (ch.msgs[posted].content or "")
+        by = {}
+        for r in st.read_completions():
+            by[r["user_id"]] = by.get(r["user_id"], 0) + r.get("points", 1)
+        assert by == {42: 3}, "1 for the chore + 2 clapped bonuses"
+
+        # /leaderboard totals the bonus into Pat's score.
+        month = now.astimezone(tz).strftime("%Y-%m")
+        inter = FakeInteraction(user=FakeUser(1, "Boss"))
+        await bot.leaderboard.callback(inter, month=month)
+        assert "<@42> — **3 pts**" in inter.response.content
+
+        # Undoing the ✅ retracts the completion AND every clap bonus.
+        await bot.on_raw_reaction_add(FakePayload(posted, "↩️", member=FakeMember(42, "Pat")))
+        snap = await st.snapshot()
+        assert str(posted) not in snap["claps"], "undo drops the clap record"
+        assert snap["tasks"][tid]["pending"] is not None, "the occurrence is live again"
+        assert st.read_completions() == [], "completion + both clap bonuses are gone"
+
+
+async def test_game_claps() -> None:
+    """A closed pitch-in / do-em-up round grows a 👏 button; an outsider's tap tips
+    *every* scorer a bonus point (one clap per outsider), and a scorer's own 👏 is
+    ignored."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        now = m.now_utc()
+
+        # --- Pitch-in: Pat + Sam pitch in, the creator 🏁 closes the round. ---
+        pid, msg = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Laundry bonanza", description=None,
+            expires_at=m.to_iso(now + dt.timedelta(hours=6)), points_each=1,
+            max_scorers=None, now=now,
+        )
+        mid = msg.id
+        await bot.on_raw_reaction_add(FakePayload(mid, "✅", user_id=42, member=FakeMember(42, "Pat")))
+        await bot.on_raw_reaction_add(FakePayload(mid, "✅", user_id=7, member=FakeMember(7, "Sam")))
+        await bot.on_raw_reaction_add(FakePayload(mid, m.EMOJI_END, user_id=1, member=FakeMember(1, "Boss")))
+        snap = await st.snapshot()
+        assert pid not in snap["pitchins"], "creator 🏁 closed the round"
+        assert str(mid) in snap["claps"], "the finished round armed a clap"
+        assert {p["user_id"] for p in snap["claps"][str(mid)]["participants"]} == {42, 7}
+        assert (mid, "👏") in ch.added
+        assert len(st.read_completions()) == 2, "Pat + Sam each scored 1"
+
+        # An outsider (Lee) claps -> +1 to BOTH scorers; the tally shows "each".
+        await bot.on_raw_reaction_add(FakePayload(mid, "👏", user_id=9, member=FakeMember(9, "Lee")))
+        claps = [r for r in st.read_completions() if r["kind"] == "clap"]
+        assert sorted(r["user_id"] for r in claps) == [7, 42], "one clap tips every scorer"
+        assert "👏 ×1" in (ch.msgs[mid].content or "") and "each" in (ch.msgs[mid].content or "")
+
+        # Lee again is a no-op; a scorer (Pat) clapping their own round is ignored.
+        await bot.on_raw_reaction_add(FakePayload(mid, "👏", user_id=9, member=FakeMember(9, "Lee")))
+        await bot.on_raw_reaction_add(FakePayload(mid, "👏", user_id=42, member=FakeMember(42, "Pat")))
+        assert len([r for r in st.read_completions() if r["kind"] == "clap"]) == 2
+        by = {}
+        for r in st.read_completions():
+            by[r["user_id"]] = by.get(r["user_id"], 0) + r.get("points", 1)
+        assert by == {42: 2, 7: 2}, "each scored 1 + was clapped 1"
+
+        # --- Do-em-up: Pat tallies 3, Bo tallies 2, the creator ends it. ---
+        did, dmsg = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="Clear the thistle", description=None,
+            points_each=1, deadline=None, point_limit=None, now=now,
+        )
+        dmid = dmsg.id
+
+        async def press(action, uid, name):
+            await bot.handle_doemup_button(
+                did, action, FakeInteraction(user=FakeUser(uid, name), channel=ch)
+            )
+
+        for _ in range(3):
+            await press("plus", 42, "Pat")
+        for _ in range(2):
+            await press("plus", 7, "Bo")
+        await press("end", 1, "Boss")
+        snap = await st.snapshot()
+        assert did not in snap["doemups"] and str(dmid) in snap["claps"], "closed round armed a clap"
+        assert {p["user_id"] for p in snap["claps"][str(dmid)]["participants"]} == {42, 7}
+        assert (dmid, "👏") in ch.added
+
+        # An outsider claps the closed do-em-up -> +1 to each tallier (once).
+        await bot.on_raw_reaction_add(FakePayload(dmid, "👏", user_id=9, member=FakeMember(9, "Lee")))
+        dclaps = [r for r in st.read_completions() if r["kind"] == "clap" and r["task_id"] == did]
+        assert sorted(r["user_id"] for r in dclaps) == [7, 42], "both talliers tipped once"
+
+
 async def test_requeue_oneoff() -> None:
     """A completed one-off is gone from the store; 🔄 rebuilds it from the saved
     snapshot and re-fires it."""
@@ -1434,6 +1580,8 @@ def main() -> None:
     asyncio.run(test_legacy_migration())
     asyncio.run(test_requeue())
     asyncio.run(test_requeue_oneoff())
+    asyncio.run(test_claps())
+    asyncio.run(test_game_claps())
     asyncio.run(test_pitchin_lifecycle())
     asyncio.run(test_pitchin_cap_and_points())
     asyncio.run(test_pitchin_expiry())

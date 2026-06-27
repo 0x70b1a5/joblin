@@ -70,6 +70,7 @@ EMOJI_INFO = "ℹ️"
 EMOJI_DELETE = "❌"
 EMOJI_UNDO = "↩️"  # appears after a ✅/⏩/❌ action so it can be reverted
 EMOJI_REQUEUE = "🔄"  # appears on a ✅-completed post to re-fire the chore now
+EMOJI_CLAP = "👏"  # appears on a ✅-completed post; an outsider's tap tips its doer a bonus point
 EMOJI_END = "🏁"  # creator-only "end now" on a pitch-in (✅) or do-em-up post
 EMOJI_HANDSHAKE = "🤝"  # header icon on a pitch-in post
 EMOJI_FLEX = "💪"  # header icon on a do-em-up post

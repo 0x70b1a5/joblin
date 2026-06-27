@@ -36,6 +36,7 @@ the family chores.
   | ❌ | **Skip** — skips just *this* occurrence of a recurring task (it returns next cycle); deletes a one-off. To remove a recurring task entirely, use `/deletetask`. |
   | ↩️ | **Undo** — appears right after a ✅/⏩/❌ and reverses it: a completion is un-logged (so it leaves the leaderboard too), a snooze is rolled back, and a skip/delete is restored. Survives restarts; only the most recent action on an occurrence is undoable, and only until that chore next comes due. |
   | 🔄 | **Requeue** — appears on a ✅-completed post; re-fires that chore **right now** as a fresh occurrence (handy when, say, the water trough is empty again an hour later) without waiting for its next scheduled slot. Finishing the re-run rolls the recurrence on to its normal next slot. Survives restarts; the most recent completed post per task carries the button. |
+  | 👏 | **Clap** — appears on a finished chore, **pitch-in, or do-em-up** post; anyone who *didn't* take part can tap it to tip **every** doer a **+1 bonus point** (one clap per outsider, so a crowd can stack several). The bonus lands on the leaderboard like any other point; undoing a chore's ✅ retracts its claps. Survives restarts; the most recent finished post per task/game carries the button. |
 - If nobody completes or snoozes within the hour, the bot **re-posts hourly**
   until the chore is done (optionally pinging a role).
 - Everything survives restarts: due times, pending occurrences, snooze timers,
@@ -272,6 +273,16 @@ farmtracker/
   `time_of_day`, so the schedule never drifts). If an occurrence is already live
   it declines (finish that one first). Only the most recent completed post per
   task carries the button.
+- **Claps** keep a 👏 on the finished post (in a persisted `claps` table, keyed by
+  that post's id, recording the participants and which outsiders have already
+  clapped). It rides on a ✅-completed chore as well as a closed **pitch-in** or
+  **do-em-up** round — for a game the participants are its scorers/talliers, so one
+  clap tips *all* of them. A tap from anyone who isn't a participant appends a
+  `clap` row (worth 1 point) to the completion log for each participant — capped at
+  one clap per outsider, and ignored entirely from a participant. Undoing a chore's
+  ✅ voids its bonus rows along with the completion (games have no undo; `/deletetask`
+  retires the button without touching already-awarded points). Only the most recent
+  finished post per task/game carries the button.
 - Editing a task's schedule recomputes its next post immediately — unless a
   reminder is **live right now**, in which case that occurrence is left alone and
   the new schedule takes effect from the next cycle.

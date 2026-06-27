@@ -56,6 +56,7 @@ from . import trinkets
 from .models import (
     DIGIT_BY_KEY,
     DIGIT_EMOJI,
+    EMOJI_CLAP,
     EMOJI_DELETE,
     EMOJI_DONE,
     EMOJI_END,
@@ -345,6 +346,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         await _handle_requeue(payload, channel)
         return
 
+    # Clap (👏) likewise lives on a ✅-completed (de-registered) post and is keyed
+    # off its own table — a non-participant's tap tips the doer a bonus point.
+    if key == emoji_key(EMOJI_CLAP):
+        await _handle_clap(payload, channel)
+        return
+
     snap = await store.snapshot()
     if str(payload.message_id) in snap["snooze_panels"]:
         await _handle_snooze_panel(payload, channel)
@@ -626,6 +633,12 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
         if message_ids:
             await _arm_undo("done", tid, before, message_ids[-1], channel, completion_id=completion_id)
             await _arm_requeue(tid, before, message_ids[-1], channel, task["guild_id"])
+            # The doer is this occurrence's sole participant; anyone *else* can 👏
+            # them a bonus point on the finished post.
+            participants = [{"user_id": payload.user_id, "user_name": display}]
+            await _arm_clap(
+                tid, message_ids[-1], channel, task["guild_id"], task["brief"], status, participants
+            )
 
 
 async def _handle_skip_or_delete(tid, task, tz, channel, mention) -> None:
@@ -742,8 +755,8 @@ async def _restore_anchor(
         await pm.clear_reactions()  # needs Manage Messages; best effort
     except discord.HTTPException:
         pass
-    if bot.user:  # ensure our ↩️/🔄 are gone even without Manage Messages
-        for emoji in (EMOJI_UNDO, EMOJI_REQUEUE):
+    if bot.user:  # ensure our ↩️/🔄/👏 are gone even without Manage Messages
+        for emoji in (EMOJI_UNDO, EMOJI_REQUEUE, EMOJI_CLAP):
             try:
                 await pm.remove_reaction(emoji, bot.user)
             except discord.HTTPException:
@@ -784,6 +797,7 @@ async def _handle_undo(
     # snapshot data.
     outcome = None  # "ok" | "refused"
     action = before = completion_id = None
+    clap_log_ids: list[str] = []
     async with store.txn() as data:
         rec = data["undo"].get(str(payload.message_id))
         if not rec:
@@ -801,13 +815,21 @@ async def _handle_undo(
         else:
             outcome = "refused"
         data["undo"].pop(str(payload.message_id), None)
-        # Undoing a ✅ turns its post back into a live occurrence, so any 🔄
-        # requeue we armed on that same post no longer applies.
+        # Undoing a ✅ turns its post back into a live occurrence, so the 🔄
+        # requeue and 👏 claps we armed on that same post no longer apply. Any
+        # bonus points the claps already paid are retracted below — but only when
+        # the undo actually takes (a refused ↩️ leaves the completion, and its
+        # claps, standing).
         data["requeue"].pop(str(payload.message_id), None)
+        clap = data["claps"].pop(str(payload.message_id), None)
+        if clap:
+            clap_log_ids = list(clap.get("log_ids", []))
 
     if outcome == "ok":
         if action == "done" and completion_id:
             await store.void_completion(completion_id)
+        for lid in clap_log_ids:  # retract every bonus point the claps awarded
+            await store.void_completion(lid)
         await _restore_anchor(channel, payload.message_id, before)
     elif outcome == "refused":
         await _disarm_undo_button(channel, payload.message_id)
@@ -936,6 +958,160 @@ async def _handle_requeue(
                 await pm.remove_reaction(EMOJI_REQUEUE, bot.user)
             except discord.HTTPException:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Claps (👏)
+# ---------------------------------------------------------------------------
+# A finished post grows a 👏 button so the rest of the family can cheer the doers
+# on: a tap from anyone who *didn't* take part tips every participant a +1 bonus
+# point — capped at one clap per outsider. The same button rides a ✅-completed
+# chore (participant = the completer) and a closed pitch-in / do-em-up round
+# (participants = its scorers / talliers), so one clap can tip several people at
+# once. Bonuses are written to the same completion log as chores (kind "clap",
+# points 1), so /leaderboard totals them like any other point, and undoing a
+# chore's ✅ retracts them (games have no undo). Like ↩️/🔄, the table is keyed by
+# the finished post's id, survives restarts, and only the most recent finished
+# post per task/game carries a live 👏.
+def _clap_record(rec: dict, participant: dict, tz: ZoneInfo, now: dt.datetime) -> dict:
+    """A completion-log row for one clap bonus: +1 to a finished task's
+    participant, shaped like a chore completion so /leaderboard reads it the
+    same way."""
+    return {
+        "id": new_id(),  # lets an undo void exactly this bonus
+        "ts": to_iso(now),
+        "month": now.astimezone(tz).strftime("%Y-%m"),  # local-tz bucket
+        "guild_id": rec["guild_id"],
+        "task_id": rec["task_id"],
+        "brief": rec.get("brief", ""),
+        "user_id": participant["user_id"],
+        "user_name": participant["user_name"],
+        "kind": "clap",
+        "points": 1,
+        "due_at": to_iso(now),
+        "late_seconds": 0,
+    }
+
+
+def clap_status(rec: dict) -> str:
+    """The finished-post text with its running clap tally appended (the bare
+    status until the first clap lands). With several participants the bonus is
+    +n *each*, since every clap tips all of them."""
+    n = len(rec.get("clappers", []))
+    if n == 0:
+        return rec["status"]
+    parts = rec["participants"]
+    names = ", ".join(p["user_name"] for p in parts)
+    each = " each" if len(parts) > 1 else ""
+    return f"{rec['status']}\n👏 ×{n} · +{n} pt{each} to {names}"
+
+
+def _game_participants(event: dict, kind: str) -> list[dict]:
+    """The scorers a finalized game round tips when clapped: a pitch-in's ✅
+    scorers, or a do-em-up's talliers with a positive count."""
+    if kind == "pitchin":
+        return [{"user_id": s["user_id"], "user_name": s["user_name"]}
+                for s in event.get("scorers", [])]
+    return [{"user_id": int(uid), "user_name": e.get("name", str(uid))}
+            for uid, e in event.get("tallies", {}).items() if e.get("count", 0) > 0]
+
+
+async def _arm_clap(
+    tid: str,
+    anchor_id: int,
+    channel: discord.abc.Messageable,
+    guild_id: int,
+    brief: str,
+    status: str,
+    participants: list[dict],
+) -> None:
+    """Add the 👏 button to a just-completed post and remember who may be tipped,
+    retiring any 👏 left on this task's older completed posts (their already-paid
+    bonuses stand — only the button is taken away)."""
+    stale: list[int] = []
+    async with store.txn() as data:
+        for mid, rec in list(data["claps"].items()):
+            if rec.get("task_id") == tid and str(mid) != str(anchor_id):
+                data["claps"].pop(mid, None)
+                stale.append(int(mid))
+        data["claps"][str(anchor_id)] = {
+            "task_id": tid,
+            "guild_id": guild_id,
+            "channel_id": getattr(channel, "id", None),
+            "brief": brief,
+            "status": status,
+            "participants": participants,
+            "clappers": [],  # outsider ids who've already clapped (the per-outsider cap)
+            "log_ids": [],  # completion ids the claps logged (so an undo can void them)
+        }
+    try:
+        await channel.get_partial_message(anchor_id).add_reaction(EMOJI_CLAP)
+    except discord.HTTPException:
+        pass
+    if bot.user:  # tidy now-dead 👏 buttons left on this task's older posts
+        for mid in stale:
+            try:
+                await channel.get_partial_message(mid).remove_reaction(EMOJI_CLAP, bot.user)
+            except discord.HTTPException:
+                pass
+
+
+async def _arm_game_clap(
+    event: dict, kind: str, status: str, channel: discord.abc.Messageable
+) -> None:
+    """Arm a 👏 on a just-finalized pitch-in / do-em-up round so an outsider can
+    tip its scorers a bonus point each. No-op when the round closed with nobody in
+    (or its post is gone). A recurring game's next round retires this one's 👏 the
+    same way a chore's next completion does — keyed on the shared game id."""
+    participants = _game_participants(event, kind)
+    mid = event.get("message_id")
+    if not participants or mid is None:
+        return
+    await _arm_clap(
+        event["id"], mid, channel, event["guild_id"], event["brief"], status, participants
+    )
+
+
+async def _handle_clap(
+    payload: discord.RawReactionActionEvent, channel: discord.abc.Messageable
+) -> None:
+    """A 👏 on a ✅-completed post. From a non-participant it awards every
+    participant a +1 bonus point (once per outsider) and shows the tally; a
+    participant clapping their own finish is ignored."""
+    snap = await store.snapshot()
+    rec0 = snap["claps"].get(str(payload.message_id))
+    if not rec0:
+        return  # a 👏 on something we don't track — ignore
+    reacted = channel.get_partial_message(payload.message_id)
+    if any(p["user_id"] == payload.user_id for p in rec0["participants"]):
+        # You can't clap your own chore — drop the reaction (needs Manage Messages).
+        await _remove_user_reaction(reacted, payload)
+        return
+
+    tz, now = _game_tz(snap, rec0["guild_id"]), now_utc()
+    new_records: list[dict] = []
+    body = None
+    async with store.txn() as data:
+        rec = data["claps"].get(str(payload.message_id))
+        if not rec:
+            return  # retired/undone between the snapshot and here
+        if payload.user_id in rec["clappers"]:
+            return  # one clap per outsider — a repeat (or re-add) is a no-op
+        if any(p["user_id"] == payload.user_id for p in rec["participants"]):
+            return  # a participant slipped in after the snapshot
+        rec["clappers"].append(payload.user_id)
+        for p in rec["participants"]:
+            r = _clap_record(rec, p, tz, now)
+            rec.setdefault("log_ids", []).append(r["id"])
+            new_records.append(r)
+        body = clap_status(rec)
+    for r in new_records:
+        await store.log_completion(r)
+    if body is not None:
+        try:
+            await reacted.edit(content=body, allowed_mentions=NO_PINGS)
+        except discord.HTTPException:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1078,6 +1254,8 @@ async def finalize_pitchin(pid: str, channel: discord.abc.Messageable) -> bool:
         await pm.clear_reactions()
     except discord.HTTPException:
         pass
+    # Reactions are cleared above, so add the 👏 (which _arm_clap does) afterwards.
+    await _arm_game_clap(event, "pitchin", body, channel)
     return True
 
 
@@ -1116,6 +1294,7 @@ async def finalize_doemup(did: str, channel: discord.abc.Messageable) -> bool:
         )
     except discord.HTTPException:
         pass
+    await _arm_game_clap(event, "doemup", body, channel)
     return True
 
 
@@ -1848,6 +2027,9 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
                 for mid, rec in list(data["requeue"].items()):
                     if rec.get("task_id") == tid:
                         data["requeue"].pop(mid, None)
+                for mid, rec in list(data["claps"].items()):
+                    if rec.get("task_id") == tid:
+                        data["claps"].pop(mid, None)
                 panels = _take_task_panels(data, tid)
                 removed = data["tasks"].pop(tid, None)
         await _delete_panels(panels)
@@ -1862,6 +2044,9 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
                 if g and str(g["guild_id"]) == str(interaction.guild_id):
                     live_mid = g.get("message_id")
                     data["game_messages"].pop(str(live_mid), None)
+                    for mid, rec in list(data["claps"].items()):
+                        if rec.get("task_id") == game["id"]:
+                            data["claps"].pop(mid, None)
                     removed = data[section].pop(game["id"], None)
             if removed and live_mid:
                 ch = (bot.get_channel(int(removed["channel_id"]))
@@ -2351,7 +2536,9 @@ async def farmhelp(interaction: discord.Interaction) -> None:
             "ℹ️ **Info** — shows the longer description, if any\n"
             "❌ **Skip** — skips just this time (recurring) or cancels (one-off)\n"
             "↩️ **Undo** — appears after ✅/⏩/❌ to reverse it\n"
-            "🔄 **Requeue** — appears on a completed chore; re-posts it right now"
+            "🔄 **Requeue** — appears on a completed chore; re-posts it right now\n"
+            "👏 **Clap** — on a finished chore, pitch-in, or do-em-up; anyone who "
+            "*didn't* do it taps to tip every doer a bonus point (one clap each)"
         ),
         inline=False,
     )
@@ -2381,7 +2568,8 @@ async def farmhelp(interaction: discord.Interaction) -> None:
             "• `/doemup brief:\"thistle bush removed\"` — tap ➕ once per one you did "
             "(➖ to fix); the tally updates live. Optional `points` each, `deadline`, "
             "and `point_limit` (auto-closes at that total). 🏁 ends it.\n"
-            "Points from both feed the `/leaderboard`."
+            "Points from both feed the `/leaderboard` — and a closed round grows a "
+            "👏 anyone who sat it out can tap to tip every scorer a bonus point."
         ),
         inline=False,
     )

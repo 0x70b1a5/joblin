@@ -34,6 +34,8 @@ EMPTY: dict[str, Any] = {
     "messages": {},
     "undo": {},
     "requeue": {},  # completed-post message id -> {task_id, before, guild_id, channel_id}
+    "claps": {},  # completed-post message id -> {task_id, guild_id, channel_id, brief,
+    #   status, participants:[{user_id,user_name}], clappers:[user_id], log_ids:[completion id]}
     "snooze_panels": {},  # panel message id -> {task_id, anchor_id, unit, brief}
     "pitchins": {},  # pitch-in id -> pitch-in dict (see models.py)
     "doemups": {},  # do-em-up id -> do-em-up dict (see models.py)
