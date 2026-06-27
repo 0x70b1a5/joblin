@@ -624,6 +624,56 @@ async def test_pitchin_recurring() -> None:
         assert "Deleted" in inter.response.content
 
 
+async def test_pitchin_at_deferred() -> None:
+    """`/pitchin at:` defers the first round to its slot instead of posting now:
+    a recurring one sits dormant until the scheduler opens it (then runs its fixed
+    window), and a one-off `at` schedules a single round for later."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        slot = (now.astimezone(tz) + dt.timedelta(hours=2)).strftime("%H:%M")
+
+        # Recurring daily with an explicit 5-minute window, deferred to its slot.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.pitchin.callback(
+            inter, brief="Dawn tidy", at=slot, expires="in 5 minutes", repeat="daily"
+        )
+        snap = await st.snapshot()
+        assert len(snap["pitchins"]) == 1
+        p = next(iter(snap["pitchins"].values()))
+        pid = p["id"]
+        assert p["recurring"] and p["freq"] == "days" and p["interval_days"] == 1
+        assert p["message_id"] is None and not ch.msgs, "deferred -> nothing posted yet"
+        assert p["duration_secs"] == 300, "the 5-minute window each round reuses"
+        nd = m.from_iso(p["next_due"])
+        assert nd > now and nd.astimezone(tz).strftime("%H:%M") == slot, "fires at its slot"
+        assert "🤝 Scheduled" in inter.response.content and "opens" in inter.response.content
+
+        # Force the slot due -> the sweep opens a live round with the stored window.
+        async with st.txn() as data:
+            data["pitchins"][pid]["next_due"] = m.to_iso(m.now_utc() - dt.timedelta(seconds=1))
+        await bot.sweep_games(m.now_utc(), await st.snapshot())
+        p = (await st.snapshot())["pitchins"][pid]
+        assert p["message_id"] is not None and p["next_due"] is None, "now live"
+        assert 290 <= (m.from_iso(p["expires_at"]) - m.now_utc()).total_seconds() <= 305
+
+        # A one-off `at` schedules a single deferred round (default 24h window).
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.pitchin.callback(inter, brief="One and done", at="in 1 hour")
+        one = next(q for q in (await st.snapshot())["pitchins"].values()
+                   if q["brief"] == "One and done")
+        assert not one["recurring"] and one["message_id"] is None
+        assert one["next_due"] is not None and one["duration_secs"] == 86400
+        assert "🤝 Scheduled" in inter.response.content
+
+        # A past explicit `at` is rejected; nothing new is scheduled.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.pitchin.callback(inter, brief="Too late", at="2000-01-01 00:00")
+        assert "past" in inter.response.content
+        assert len((await st.snapshot())["pitchins"]) == 2
+
+
 async def test_doemup_recurring() -> None:
     """A recurring do-em-up rolls on after its deadline (and re-posts live buttons),
     a point_limit closes just the round, and the creator's End stops the series."""
@@ -683,6 +733,57 @@ async def test_doemup_recurring() -> None:
         await bot.deletetask.callback(inter, did)
         assert did not in (await st.snapshot())["doemups"]
         assert "Deleted" in inter.response.content
+
+
+async def test_doemup_at_deferred() -> None:
+    """`/doemup at:` defers the first round to its slot: a recurring one sits
+    dormant until the scheduler opens it, and a one-off `at` with no deadline opens
+    at its time and stays open until 🏁 (exercising the deferred-no-window path)."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        slot = (now.astimezone(tz) + dt.timedelta(hours=2)).strftime("%H:%M")
+
+        # Recurring daily with a 90-minute window, deferred to its slot.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.doemup.callback(
+            inter, brief="Dawn reps", at=slot, deadline="in 90 minutes", repeat="daily"
+        )
+        snap = await st.snapshot()
+        rec = next(iter(snap["doemups"].values()))
+        rid = rec["id"]
+        assert rec["recurring"] and rec["message_id"] is None and not ch.msgs
+        assert rec["duration_secs"] == 5400 and rec["deadline"] is None
+        nd = m.from_iso(rec["next_due"])
+        assert nd > now and nd.astimezone(tz).strftime("%H:%M") == slot
+        assert "💪 Scheduled" in inter.response.content and "opens" in inter.response.content
+
+        # Force the slot due -> the sweep opens a live round with the stored window.
+        async with st.txn() as data:
+            data["doemups"][rid]["next_due"] = m.to_iso(m.now_utc() - dt.timedelta(seconds=1))
+        await bot.sweep_games(m.now_utc(), await st.snapshot())
+        rec = (await st.snapshot())["doemups"][rid]
+        assert rec["message_id"] is not None and rec["next_due"] is None
+        assert 5390 <= (m.from_iso(rec["deadline"]) - m.now_utc()).total_seconds() <= 5405
+
+        # A one-off `at` with no deadline: deferred, then open until 🏁 (no auto-close).
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.doemup.callback(inter, brief="Later, open-ended", at="in 1 hour")
+        one = next(q for q in (await st.snapshot())["doemups"].values()
+                   if q["brief"] == "Later, open-ended")
+        assert not one["recurring"] and one["message_id"] is None
+        assert one["duration_secs"] is None, "no window -> runs until 🏁 when it opens"
+        async with st.txn() as data:
+            data["doemups"][one["id"]]["next_due"] = m.to_iso(m.now_utc() - dt.timedelta(seconds=1))
+        await bot.sweep_games(m.now_utc(), await st.snapshot())
+        one = (await st.snapshot())["doemups"][one["id"]]
+        assert one["message_id"] is not None and one["deadline"] is None, "open until 🏁"
+
+        # A past explicit `at` is rejected.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.doemup.callback(inter, brief="Too late", at="2000-01-01 00:00")
+        assert "past" in inter.response.content
 
 
 async def test_doemup_recurring_limit_rolls_on() -> None:
@@ -1339,7 +1440,9 @@ def main() -> None:
     asyncio.run(test_doemup_lifecycle())
     asyncio.run(test_doemup_limit_and_deadline())
     asyncio.run(test_pitchin_recurring())
+    asyncio.run(test_pitchin_at_deferred())
     asyncio.run(test_doemup_recurring())
+    asyncio.run(test_doemup_at_deferred())
     asyncio.run(test_doemup_recurring_limit_rolls_on())
     asyncio.run(test_delete_live_game())
     asyncio.run(test_game_commands_recurring())

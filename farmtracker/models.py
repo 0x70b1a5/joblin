@@ -572,9 +572,10 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
 # A game may carry the same recurrence columns a task does — ``recurring``,
 # ``freq``, ``interval_days``, ``weekdays``, ``monthdays``, ``time_of_day`` (see
 # the task schema at the top of this file) — plus:
-#   "next_due":      str | None,   # set ONLY while dormant between rounds: the
-#                                  #   instant the next round should be posted.
-#                                  #   None while a round is live (or one-off).
+#   "next_due":      str | None,   # set while dormant: the instant the next round
+#                                  #   should be posted — between rounds, or before
+#                                  #   a first round deferred by an `at:` slot.
+#                                  #   None while a round is live.
 #   "duration_secs": int | None,   # how long each round stays open. Set from an
 #                                  #   explicit expires/deadline; None means the
 #                                  #   round runs until the next scheduled slot.

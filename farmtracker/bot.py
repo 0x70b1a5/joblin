@@ -1153,9 +1153,14 @@ async def repost_doemup(did: str, channel: discord.abc.Messageable) -> None:
         return
     tz, now = _game_tz(snap, d0["guild_id"]), now_utc()
     dur = d0.get("duration_secs")
-    dl = (now + dt.timedelta(seconds=int(dur))) if dur else _game_next_round(d0, tz, now)
+    if dur:
+        deadline_iso = to_iso(now + dt.timedelta(seconds=int(dur)))
+    elif d0.get("recurring"):  # no fixed window -> run this round to the next slot
+        deadline_iso = to_iso(_game_next_round(d0, tz, now))
+    else:  # a deferred one-off with no deadline opens and stays open until 🏁
+        deadline_iso = None
     d_live = {**d0, "tallies": {}, "ended": False,
-              "deadline": to_iso(dl), "next_due": None}
+              "deadline": deadline_iso, "next_due": None}
     msg = await _send_doemup(channel, d_live)
     orphan = False
     async with store.txn() as data:
@@ -1164,7 +1169,7 @@ async def repost_doemup(did: str, channel: discord.abc.Messageable) -> None:
             orphan = True
         else:
             d.update({"message_id": msg.id, "tallies": {},
-                      "deadline": to_iso(dl), "next_due": None})
+                      "deadline": deadline_iso, "next_due": None})
             data["game_messages"][str(msg.id)] = {"kind": "doemup", "id": did}
     if orphan:
         await safe_delete(msg)
@@ -1193,6 +1198,33 @@ async def post_pitchin(
     return pid, msg
 
 
+async def schedule_pitchin(
+    *, guild_id: int, creator_id: int, channel_id: int, brief: str,
+    description: Optional[str], points_each: int, max_scorers: Optional[int],
+    now: dt.datetime, recurrence: Optional[dict], duration_secs: Optional[int],
+    starts_at: dt.datetime,
+) -> str:
+    """Create a pitch-in whose first round is deferred: it sits dormant (no post)
+    until the scheduler opens it at ``starts_at``. Used when ``/pitchin`` is given
+    an ``at:`` — a recurring round then fires at its wall-clock slot, and a one-off
+    can be scheduled for later — instead of posting the instant it's created."""
+    pid = new_id()
+    p = {
+        "id": pid, "guild_id": guild_id, "channel_id": channel_id,
+        "message_id": None, "brief": brief, "description": description,
+        "created_by": creator_id, "created_at": to_iso(now),
+        "points_each": points_each, "max_scorers": max_scorers,
+        "expires_at": None, "scorers": [], "ended": False,
+        **_game_recurrence_fields(recurrence, duration_secs),
+        # The recurrence helper zeroes next_due/duration for the live-now path;
+        # a deferred round needs its slot, and a one-off needs its open span kept.
+        "next_due": to_iso(starts_at), "duration_secs": duration_secs,
+    }
+    async with store.txn() as data:
+        data["pitchins"][pid] = p
+    return pid
+
+
 async def post_doemup(
     channel: discord.abc.Messageable, *, guild_id: int, creator_id: int, brief: str,
     description: Optional[str], points_each: int, deadline: Optional[str],
@@ -1214,6 +1246,32 @@ async def post_doemup(
         data["doemups"][did] = d
         data["game_messages"][str(msg.id)] = {"kind": "doemup", "id": did}
     return did, msg
+
+
+async def schedule_doemup(
+    *, guild_id: int, creator_id: int, channel_id: int, brief: str,
+    description: Optional[str], points_each: int, point_limit: Optional[int],
+    now: dt.datetime, recurrence: Optional[dict], duration_secs: Optional[int],
+    starts_at: dt.datetime,
+) -> str:
+    """Create a do-em-up whose first round is deferred to ``starts_at`` — the
+    do-em-up analogue of :func:`schedule_pitchin`. It sits dormant (no post) until
+    the scheduler opens it; a deferred one-off with no window then runs until 🏁."""
+    did = new_id()
+    d = {
+        "id": did, "guild_id": guild_id, "channel_id": channel_id,
+        "message_id": None, "brief": brief, "description": description,
+        "created_by": creator_id, "created_at": to_iso(now),
+        "points_each": points_each, "deadline": None, "point_limit": point_limit,
+        "tallies": {}, "ended": False,
+        **_game_recurrence_fields(recurrence, duration_secs),
+        # The recurrence helper zeroes next_due/duration for the live-now path;
+        # a deferred round needs its slot, and a windowed one needs its span kept.
+        "next_due": to_iso(starts_at), "duration_secs": duration_secs,
+    }
+    async with store.txn() as data:
+        data["doemups"][did] = d
+    return did
 
 
 async def _handle_pitchin_reaction(
@@ -1955,17 +2013,18 @@ deletetask.autocomplete("task")(delete_autocomplete)
 
 
 def _game_recurrence_from(
-    repeat: Optional[str], tz: ZoneInfo, now: dt.datetime
+    repeat: Optional[str], tz: ZoneInfo, now: dt.datetime, at: Optional[str] = None
 ) -> Optional[dict]:
     """Parse a game's ``repeat`` into a recurrence rule, or None for a one-off.
     Mirrors :func:`schedule_from_rule`: a bare ``monthly`` takes today's date, and
-    every round is pinned to the wall-clock time the game is started at."""
+    every round fires at ``at`` (the wall-clock time the game is started at when
+    ``at`` is omitted)."""
     rule = parse_repeat(repeat)  # raises ValueError on junk
     if rule["freq"] == "once":
         return None
     if rule["freq"] == "monthly" and not rule["monthdays"]:
         rule["monthdays"] = [now.astimezone(tz).day]
-    rule["time_of_day"] = time_of_day_from(None, tz, now)
+    rule["time_of_day"] = time_of_day_from(at, tz, now)
     return rule
 
 
@@ -1975,7 +2034,8 @@ def _game_recurrence_from(
 )
 @app_commands.describe(
     brief="What to pitch in on, e.g. 'laundry bonanza' (required)",
-    expires="When this round closes — in 2h, tonight, 18:00, tomorrow 8am (default: in 24h)",
+    at="When the first round opens — now, 06:00, tomorrow 8am. Recurring? sets the daily slot (default: now)",
+    expires="When a round closes — in 5m, tonight, 18:00, tomorrow 8am (default: in 24h; recurring: at the next slot)",
     points="Points each pitcher-inner earns (default: 1)",
     max_scorers="Optional cap: only the first N to pitch in score",
     repeat="Repeat it — daily, weekdays, mon/thu, monthly on the 1st (default: once)",
@@ -1984,6 +2044,7 @@ def _game_recurrence_from(
 async def pitchin(
     interaction: discord.Interaction,
     brief: app_commands.Range[str, 1, 200],
+    at: Optional[str] = None,
     expires: Optional[str] = None,
     points: app_commands.Range[int, 1, 100] = 1,
     max_scorers: Optional[app_commands.Range[int, 1, 100]] = None,
@@ -1999,30 +2060,42 @@ async def pitchin(
         return
     tz, now = ZoneInfo(cfg["timezone"]), now_utc()
     try:
-        recurrence = _game_recurrence_from(repeat, tz, now)
+        recurrence = _game_recurrence_from(repeat, tz, now, at)
     except ValueError as e:
         await interaction.response.send_message(
             f"❌ {e}\nSee `/farmhelp` for the `repeat` formats.", ephemeral=True
         )
         return
+    # With `at`, the first round is deferred to its scheduled slot (a recurring
+    # one fires at that wall-clock time rather than whenever it was created, and a
+    # one-off can be set for later); without it, the round opens right now.
+    deferred = bool(at)
     duration_secs = None
     try:
-        if expires:
-            exp = resolve_when(expires, tz, now)
-            if recurrence:  # an explicit window each round repeats
-                duration_secs = max(1, int((exp - now).total_seconds()))
-        elif recurrence:  # no window given -> the round runs until the next slot
-            exp = next_due(recurrence, tz, now, now)
+        if deferred:
+            start = first_due(recurrence, tz, now) if recurrence else resolve_when(at, tz, now)
+            if start <= now:
+                raise ValueError("that start time is already in the past")
         else:
-            exp = now + dt.timedelta(hours=24)
+            start = now
+        if expires:
+            exp = resolve_when(expires, tz, start)  # clock times land on the slot's day
+        elif recurrence:  # no window given -> the round runs until the next slot
+            exp = next_due(recurrence, tz, start, start)
+        else:
+            exp = start + dt.timedelta(hours=24)
+        if exp <= start:
+            raise ValueError("that close time is already in the past")
+        # A repeating round, or any deferred round, stores its open span as a
+        # duration the scheduler reuses each time it (re)opens the post.
+        if recurrence:
+            if expires:  # an explicit window each round repeats
+                duration_secs = max(1, int((exp - start).total_seconds()))
+        elif deferred:  # a one-off scheduled for later keeps its open span too
+            duration_secs = max(1, int((exp - start).total_seconds()))
     except ValueError as e:
         await interaction.response.send_message(
             f"❌ {e}\nSee `/farmhelp` for the time formats.", ephemeral=True
-        )
-        return
-    if exp <= now:
-        await interaction.response.send_message(
-            "❌ That close time is already in the past.", ephemeral=True
         )
         return
     channel = bot.get_channel(int(cfg["channel_id"]))
@@ -2032,21 +2105,33 @@ async def pitchin(
         )
         return
 
-    await post_pitchin(
-        channel, guild_id=interaction.guild_id, creator_id=interaction.user.id,
-        brief=str(brief), description=(description[:1000] if description else None),
-        expires_at=to_iso(exp), points_each=int(points),
-        max_scorers=(int(max_scorers) if max_scorers else None), now=now,
-        recurrence=recurrence, duration_secs=duration_secs,
-    )
-    cap = f" · first {max_scorers} score" if max_scorers else ""
-    if recurrence:
-        rep = f" · 🔁 {describe_repeat(recurrence)} (`/deletetask` to stop it)"
-        when = f"first round closes {discord_ts(exp, 'R')}"
+    if deferred:
+        await schedule_pitchin(
+            guild_id=interaction.guild_id, creator_id=interaction.user.id,
+            channel_id=channel.id, brief=str(brief),
+            description=(description[:1000] if description else None),
+            points_each=int(points),
+            max_scorers=(int(max_scorers) if max_scorers else None), now=now,
+            recurrence=recurrence, duration_secs=duration_secs, starts_at=start,
+        )
     else:
-        rep, when = "", f"closes {discord_ts(exp, 'R')}"
+        await post_pitchin(
+            channel, guild_id=interaction.guild_id, creator_id=interaction.user.id,
+            brief=str(brief), description=(description[:1000] if description else None),
+            expires_at=to_iso(exp), points_each=int(points),
+            max_scorers=(int(max_scorers) if max_scorers else None), now=now,
+            recurrence=recurrence, duration_secs=duration_secs,
+        )
+    cap = f" · first {max_scorers} score" if max_scorers else ""
+    rep = f" · 🔁 {describe_repeat(recurrence)} (`/deletetask` to stop it)" if recurrence else ""
+    if deferred:
+        verb, when = "Scheduled", f"first round opens {discord_ts(start, 'R')}"
+    elif recurrence:
+        verb, when = "Posted", f"first round closes {discord_ts(exp, 'R')}"
+    else:
+        verb, when = "Posted", f"closes {discord_ts(exp, 'R')}"
     await interaction.response.send_message(
-        f"🤝 Posted **{brief}** in <#{cfg['channel_id']}> — {when}{cap}{rep}.",
+        f"🤝 {verb} **{brief}** in <#{cfg['channel_id']}> — {when}{cap}{rep}.",
         ephemeral=True,
     )
 
@@ -2057,6 +2142,7 @@ async def pitchin(
 )
 @app_commands.describe(
     brief="What's being done one-at-a-time, e.g. 'thistle bush removed' (required)",
+    at="When the first round opens — now, 06:00, tomorrow 8am. Recurring? sets the daily slot (default: now)",
     points="Points per ➕ (default: 1)",
     deadline="Optional auto-close time — tonight, in 3h, tomorrow 18:00",
     point_limit="Optional cap: auto-close once this many points are tallied",
@@ -2066,6 +2152,7 @@ async def pitchin(
 async def doemup(
     interaction: discord.Interaction,
     brief: app_commands.Range[str, 1, 200],
+    at: Optional[str] = None,
     points: app_commands.Range[int, 1, 100] = 1,
     deadline: Optional[str] = None,
     point_limit: Optional[app_commands.Range[int, 1, 100000]] = None,
@@ -2081,27 +2168,35 @@ async def doemup(
         return
     tz, now = ZoneInfo(cfg["timezone"]), now_utc()
     try:
-        recurrence = _game_recurrence_from(repeat, tz, now)
+        recurrence = _game_recurrence_from(repeat, tz, now, at)
     except ValueError as e:
         await interaction.response.send_message(
             f"❌ {e}\nSee `/farmhelp` for the `repeat` formats.", ephemeral=True
         )
         return
+    # With `at`, the first round is deferred to its scheduled slot (see /pitchin);
+    # without it, the round opens right now.
+    deferred = bool(at)
     deadline_iso, duration_secs = None, None
     try:
+        if deferred:
+            start = first_due(recurrence, tz, now) if recurrence else resolve_when(at, tz, now)
+            if start <= now:
+                raise ValueError("that start time is already in the past")
+        else:
+            start = now
         if deadline:
-            dl = resolve_when(deadline, tz, now)
-            if dl <= now:
-                await interaction.response.send_message(
-                    "❌ That deadline is already in the past.", ephemeral=True
-                )
-                return
+            dl = resolve_when(deadline, tz, start)  # clock times land on the slot's day
+            if dl <= start:
+                raise ValueError("that deadline is already in the past")
             deadline_iso = to_iso(dl)
-            if recurrence:  # an explicit window each round repeats
-                duration_secs = max(1, int((dl - now).total_seconds()))
+            # A repeating round, or any deferred round, stores its open span as a
+            # duration the scheduler reuses each time it (re)opens the post.
+            if recurrence or deferred:
+                duration_secs = max(1, int((dl - start).total_seconds()))
         elif recurrence:  # recurring needs a close: run each round to the next slot
-            deadline_iso = to_iso(next_due(recurrence, tz, now, now))
-        # else: a plain one-off do-em-up stays open until 🏁
+            deadline_iso = to_iso(next_due(recurrence, tz, start, start))
+        # else: a plain one-off do-em-up stays open until 🏁 (even when deferred)
     except ValueError as e:
         await interaction.response.send_message(
             f"❌ {e}\nSee `/farmhelp` for the time formats.", ephemeral=True
@@ -2111,6 +2206,23 @@ async def doemup(
     if channel is None:
         await interaction.response.send_message(
             "❌ I can't see the configured channel — check `/farmconfig`.", ephemeral=True
+        )
+        return
+
+    if deferred:
+        await schedule_doemup(
+            guild_id=interaction.guild_id, creator_id=interaction.user.id,
+            channel_id=channel.id, brief=str(brief),
+            description=(description[:1000] if description else None),
+            points_each=int(points),
+            point_limit=(int(point_limit) if point_limit else None), now=now,
+            recurrence=recurrence, duration_secs=duration_secs, starts_at=start,
+        )
+        opens = f" — first round opens {discord_ts(start, 'R')}"
+        rep = f" · 🔁 {describe_repeat(recurrence)} (`/deletetask` to stop it)" if recurrence else ""
+        await interaction.response.send_message(
+            f"💪 Scheduled **{brief}** in <#{cfg['channel_id']}>{opens}{rep}.",
+            ephemeral=True,
         )
         return
 
@@ -2136,8 +2248,10 @@ async def doemup(
 
 # The friendly "when"/"repeat" autocompletes (live previews of the resolved
 # instant / rule) are the same ones /newtask uses for `at` and `repeat`.
+pitchin.autocomplete("at")(at_autocomplete)
 pitchin.autocomplete("expires")(at_autocomplete)
 pitchin.autocomplete("repeat")(repeat_autocomplete)
+doemup.autocomplete("at")(at_autocomplete)
 doemup.autocomplete("deadline")(at_autocomplete)
 doemup.autocomplete("repeat")(repeat_autocomplete)
 
@@ -2261,6 +2375,9 @@ async def farmhelp(interaction: discord.Interaction) -> None:
             "`mon,thu`, `monthly on the 1st`) and it re-posts a fresh round each "
             "slot. 🏁 just closes the current round (it rolls on); stop the whole "
             "series with `/deletetask`.\n"
+            "• Add `at:` to either to set the slot — e.g. `/pitchin … at:06:00 "
+            "expires:06:05 repeat:daily` opens 06:00–06:05 every day. The first round "
+            "waits for that time instead of posting the moment you create it.\n"
             "• `/doemup brief:\"thistle bush removed\"` — tap ➕ once per one you did "
             "(➖ to fix); the tally updates live. Optional `points` each, `deadline`, "
             "and `point_limit` (auto-closes at that total). 🏁 ends it.\n"
