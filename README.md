@@ -50,9 +50,9 @@ the family chores.
 | `/newtask` | anyone | `brief`, optional `at` (default **now**), optional `repeat` (default **once**), optional `description`, optional `bounty` (a 2-point chore the creator can't complete). Both `at` and `repeat` autocomplete with a live preview. Posts a **public** confirmation so the family sees the new chore. |
 | `/pitchin` | anyone | Post a **pitch-in**: `brief`, optional `expires` (default **24h**), `points` each (default 1), `max_scorers`, `description`. Everyone who taps ✅ before it closes earns a point. See [Pitch-ins & do-em-ups](#pitch-ins--do-em-ups). |
 | `/doemup` | anyone | Post a **do-em-up**: `brief`, optional `points` per ➕ (default 1), `deadline`, `point_limit`, `description`. Tap ➕ once per thing you did; the tally updates live. See [Pitch-ins & do-em-ups](#pitch-ins--do-em-ups). |
-| `/edittask` | anyone | Change a task's `brief`, `at`, `repeat`, `description` (or `clear_description`), or `bounty`. Pick the task from autocomplete or paste its `id` from `/listtasks`. |
-| `/deletetask` | anyone | Permanently delete a task (autocompletes existing tasks). |
-| `/listtasks` | anyone | List all tasks with their **`id`**, schedule, and when each next posts — **paged** with ◀/▶ buttons so every id stays reachable, and showing 🔔×_n_, the lifetime number of times each chore has had to be nagged. |
+| `/edit` | anyone | One command with a subcommand per type — **`/edit task`**, **`/edit pitchin`**, **`/edit doemup`** — each showing only its own fields (so `bounty` appears only on tasks, `max_scorers` only on pitch-ins, etc.). Change the `brief`, `at`/slot, `repeat`, `description`, points, cap, or close time; pick the item from autocomplete or paste its `id` from `/listtasks`. A schedule change to a **live** round applies from the next round. |
+| `/deletetask` | anyone | Permanently delete a task, pitch-in, or do-em-up (autocompletes all three; deleting a recurring game stops the whole series). |
+| `/listtasks` | anyone | List all tasks **plus pitch-ins (🤝) and do-em-ups (💪)** with their **`id`**, schedule, and state (next post / 🟢 open / next round) — **paged** with ◀/▶ buttons so every id stays reachable, and showing 🔔×_n_, the lifetime number of times each chore has had to be nagged. |
 | `/listopen` | anyone | Post a public checklist of everything **open right now** — pending chores plus live pitch-ins / do-em-ups — each an **inline jump link** to the original post where it's done (never a nag), grouped and ordered by when it's due. Cuts the scrollback when lots are doable any time of day. |
 | `/leaderboard` | anyone | Monthly **points** per person — one per chore, **two** per bounty, plus pitch-in / do-em-up points — with each past month's winner shown by their **⭐ stars**, and the month's bountiful **zone** (`month` defaults to current). |
 | `/vitrine` | anyone | Gaze upon a collection of **trinkets** — the inert *objets d'art* earned at each month's end, one per whole multiple of the bar cleared, grouped by month. `user` defaults to yourself. |
@@ -66,13 +66,14 @@ the family chores.
 - Monthly: `/newtask brief:"Pay the feed bill" at:09:00 repeat:"monthly on the 1st"`
 - Right now (one-off): `/newtask brief:"Move the sheep"` *(at defaults to now, repeat to once)*
 - One-off later: `/newtask brief:"Vet visit" at:"tomorrow 14:00" description:"Bring vaccination records"`
-- Fix a typo / reschedule: `/edittask task:<id> brief:"Refill the water trough" repeat:"every 3 days"`
+- Fix a typo / reschedule: `/edit task task:<id> brief:"Refill the water trough" repeat:"every 3 days"`
+- Open a recurring game later in the day: `/edit doemup event:<id> at:22:30` *(moves the daily slot; any live round finishes on its old time first)*
 - Put up a bounty: `/newtask brief:"Muck out the barn" bounty:true`
 
 ### Bounties, stars & trinkets
 - **Bounties** are chores you can't (or won't) do yourself. Create one with
   `/newtask brief:"Muck out the barn" bounty:true` (or toggle it on an existing
-  task with `/edittask task:<id> bounty:true`). A bounty is **worth 2 points**
+  task with `/edit task task:<id> bounty:true`). A bounty is **worth 2 points**
   and its **creator can't tap ✅** — if they try, the bot gently declines and
   leaves it for someone else. Bounty posts are tagged 💰 so everyone sees the prize.
 - **Points & stars** drive the `/leaderboard`. Every completed chore is a point;

@@ -8,9 +8,11 @@ import discord
 from ..models import (
     EMOJI_FLEX,
     EMOJI_HANDSHAKE,
+    describe_repeat,
     discord_ts,
     from_iso,
     now_utc,
+    recurrence_of,
 )
 from .core import (
     NO_PINGS,
@@ -114,7 +116,7 @@ class ListPaginator(discord.ui.View):
                 pass
 
 
-@bot.tree.command(name="listtasks", description="List every task with its id, schedule, and next post")
+@bot.tree.command(name="listtasks", description="List every task, pitch-in & do-em-up with its id, schedule, and state")
 async def listtasks(interaction: discord.Interaction) -> None:
     snap = await store.snapshot()
     mine = [t for t in snap["tasks"].values() if str(t["guild_id"]) == str(interaction.guild_id)]
@@ -144,19 +146,45 @@ async def listtasks(interaction: discord.Interaction) -> None:
             f"• `{t['id']}` **{t['brief']}**{info}{flag} — {schedule_label(t)} · {state}{nag}"
         )
 
+    # Pitch-ins and do-em-ups list alongside tasks now (each with its id) so they
+    # can be retimed/renamed with /edit or torn down with /deletetask. Sorted
+    # together by their next relevant time, appended after the chores.
+    game_rows: list[tuple[dt.datetime, str]] = []
+    for section, icon, close_key in (("pitchins", EMOJI_HANDSHAKE, "expires_at"),
+                                     ("doemups", EMOJI_FLEX, "deadline")):
+        for g in snap[section].values():
+            if str(g["guild_id"]) != str(interaction.guild_id) or g.get("ended"):
+                continue
+            sched = describe_repeat(recurrence_of(g)) if g.get("recurring") else "one-off"
+            close = g.get(close_key)
+            if g.get("message_id"):  # a round is open right now
+                when = from_iso(close) if close else now_utc()
+                state = f"🟢 open · closes {discord_ts(from_iso(close), 'R')}" if close else "🟢 open"
+            elif g.get("next_due"):  # scheduled, or recurring & dormant between rounds
+                when = from_iso(g["next_due"])
+                state = f"next {discord_ts(when, 'R')}"
+            else:
+                when, state = now_utc(), "—"
+            info = " ℹ️" if g.get("description") else ""
+            game_rows.append(
+                (when, f"• `{g['id']}` {icon} **{g['brief']}**{info} — {sched} · {state}")
+            )
+    rows.extend(row for _, row in sorted(game_rows, key=lambda x: x[0]))
+
     if not rows:
         await interaction.response.send_message(
-            "No tasks yet. Create one with `/newtask`.", ephemeral=True
+            "No tasks or events yet. Create one with `/newtask`, `/pitchin`, or `/doemup`.",
+            ephemeral=True,
         )
         return
 
-    head = "**Farm tasks** — edit with `/edittask` using the `id`, remove with `/deletetask`\n"
+    head = "**Farm tasks & events** — edit with `/edit`, remove with `/deletetask`\n"
     chunks = _chunk_rows(rows)
     multi = len(chunks) > 1
     pages: list[str] = []
     for i, chunk in enumerate(chunks):
         foot = (
-            f"\n\n_Page {i + 1}/{len(chunks)} · {len(rows)} tasks · 🔔 = times nagged_"
+            f"\n\n_Page {i + 1}/{len(chunks)} · {len(rows)} items · 🔔 = times nagged_"
             if multi else ""
         )
         pages.append(head + "\n".join(chunk) + foot)
@@ -290,7 +318,7 @@ async def farmhelp(interaction: discord.Interaction) -> None:
             "• `/doemup` — per-unit task: tap ➕ for each one you do\n"
             "• `/listtasks` — list chores with their ids (paged; 🔔×n = times nagged)\n"
             "• `/listopen` — post what's open right now, each a tap-through link to its post\n"
-            "• `/edittask` — change a chore (paste its id from the list)\n"
+            "• `/edit` — change a task, pitch-in, or do-em-up (`/edit task|pitchin|doemup`)\n"
             "• `/deletetask` — remove a chore for good\n"
             "• `/leaderboard` — monthly points ranking & ⭐ stars 🏆\n"
             "• `/vitrine` — your cabinet of month's-end trinkets 🖼️\n"
@@ -355,6 +383,9 @@ async def farmhelp(interaction: discord.Interaction) -> None:
             "• `/doemup brief:\"thistle bush removed\"` — tap ➕ once per one you did "
             "(➖ to fix); the tally updates live. Optional `points` each, `deadline`, "
             "and `point_limit` (auto-closes at that total). 🏁 ends it.\n"
+            "• Change one later with `/edit pitchin` / `/edit doemup` — retime (`at`), "
+            "rename, or adjust points/cap; a schedule change applies from the next "
+            "round.\n"
             "Points from both feed the `/leaderboard` — and a closed round grows a "
             "👏 anyone who sat it out can tap to tip every scorer a bonus point."
         ),

@@ -1120,7 +1120,7 @@ async def test_legacy_migration() -> None:
 
             def __init__(s): s.response = _Resp()
 
-        await bot.edittask.callback(_Inter(), "leg2", repeat="mon,thu")
+        await bot.edit_task.callback(_Inter(), "leg2", repeat="mon,thu")
         t = (await st.snapshot())["tasks"]["leg2"]
         assert t["freq"] == "weekly" and t["weekdays"] == [0, 3] and t["time_of_day"] == "07:30"
 
@@ -1736,6 +1736,85 @@ async def test_listtasks_pagination() -> None:
             assert f"t{i:02d}" in allpages, f"id t{i:02d} must be reachable"
 
 
+async def test_edit_games() -> None:
+    """/edit pitchin|doemup: retiming a dormant recurring game moves its slot and
+    next round; editing a live game re-renders its post; a schedule change to a
+    live round applies from the next round; bad/empty edits are rejected."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        rule = {"freq": "days", "interval_days": 1, "weekdays": [], "monthdays": [],
+                "time_of_day": "07:00"}
+
+        # Recurring pitch-in, closed so it's dormant between rounds. /edit pitchin
+        # at: moves the daily slot later in the day (the "go to bed later" case).
+        pid, _ = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Bed o'clock", description=None,
+            expires_at=m.to_iso(now - dt.timedelta(seconds=1)), points_each=1,
+            max_scorers=None, now=now, recurrence=rule, duration_secs=300,
+        )
+        await bot.sweep_games(m.now_utc(), await st.snapshot())  # close -> dormant
+        p = (await st.snapshot())["pitchins"][pid]
+        assert p["message_id"] is None and p["next_due"] is not None, "dormant"
+
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.edit_pitchin.callback(inter, event=pid, at="22:30")
+        p = (await st.snapshot())["pitchins"][pid]
+        nd = m.from_iso(p["next_due"])
+        assert p["time_of_day"] == "22:30", "slot moved"
+        assert nd > m.now_utc() and nd.astimezone(tz).strftime("%H:%M") == "22:30"
+        assert "Updated" in inter.response.content and "next round" in inter.response.content
+
+        # Live do-em-up: editing brief + points re-renders the open post in place.
+        did, msg = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="Old name", description=None,
+            points_each=1, deadline=None, point_limit=None, now=m.now_utc(),
+            recurrence=None, duration_secs=None,
+        )
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.edit_doemup.callback(inter, event=did, brief="New name", points=3)
+        dd = (await st.snapshot())["doemups"][did]
+        assert dd["brief"] == "New name" and dd["points_each"] == 3
+        assert "New name" in ch.msgs[msg.id].content, "live post re-rendered"
+        assert ch.msgs[msg.id].view is not None, "buttons kept on re-render"
+
+        # Live pitch-in: /edit pitchin expires: pulls in this round's close time.
+        pid2, msg2 = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Open now", description=None,
+            expires_at=m.to_iso(m.now_utc() + dt.timedelta(hours=1)), points_each=1,
+            max_scorers=None, now=m.now_utc(), recurrence=None, duration_secs=None,
+        )
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.edit_pitchin.callback(inter, event=pid2, expires="in 10 minutes")
+        left = (m.from_iso((await st.snapshot())["pitchins"][pid2]["expires_at"])
+                - m.now_utc()).total_seconds()
+        assert 580 <= left <= 605, "close pulled in to ~10 min"
+
+        # A schedule change to a LIVE recurring round applies from the next round:
+        # the slot updates but the current open post is left running.
+        did2, _ = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="Live recurring", description=None,
+            points_each=1, deadline=m.to_iso(m.now_utc() + dt.timedelta(hours=1)),
+            point_limit=None, now=m.now_utc(), recurrence=rule, duration_secs=3600,
+        )
+        before_mid = (await st.snapshot())["doemups"][did2]["message_id"]
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.edit_doemup.callback(inter, event=did2, at="06:15")
+        dd2 = (await st.snapshot())["doemups"][did2]
+        assert dd2["time_of_day"] == "06:15", "future rounds use the new slot"
+        assert dd2["message_id"] == before_mid and dd2["next_due"] is None, "live round untouched"
+        assert "next round" in inter.response.content
+
+        # Errors: unknown event, and an empty edit.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.edit_pitchin.callback(inter, event="nope-nope")
+        assert "not found" in inter.response.content.lower()
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.edit_doemup.callback(inter, event=did)
+        assert "nothing to change" in inter.response.content.lower()
+
+
 def main() -> None:
     test_emoji_key()
     test_time_parsing()
@@ -1779,6 +1858,7 @@ def main() -> None:
     asyncio.run(test_delete_live_game())
     asyncio.run(test_game_commands_recurring())
     asyncio.run(test_game_commands())
+    asyncio.run(test_edit_games())
     print("✅ all smoke tests passed")
 
 

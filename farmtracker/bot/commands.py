@@ -10,6 +10,8 @@ from discord import app_commands
 
 from .. import trinkets
 from ..models import (
+    EMOJI_FLEX,
+    EMOJI_HANDSHAKE,
     UTC,
     describe_repeat,
     discord_ts,
@@ -20,6 +22,8 @@ from ..models import (
     now_utc,
     parse_repeat,
     recurrence_of,
+    render_doemup,
+    render_pitchin,
     resolve_when,
     time_of_day_from,
     to_iso,
@@ -36,6 +40,8 @@ from .helpers import (
     schedule_label,
 )
 from .games import (
+    _game_next_round,
+    make_doemup_view,
     post_doemup,
     post_pitchin,
     schedule_doemup,
@@ -49,7 +55,7 @@ from .reactions import (
 
 
 # ---------------------------------------------------------------------------
-# Scheduling from user input (shared by /newtask and /edittask)
+# Scheduling from user input (shared by /newtask and /edit task)
 # ---------------------------------------------------------------------------
 def schedule_from_rule(
     rule: dict,
@@ -346,7 +352,7 @@ async def newtask(
         body += "\nℹ️ Details attached."
     if bounty:
         body += "\n💰 **Bounty** — worth 2 points; anyone *but* you can complete it."
-    body += f"\n· `{tid}` — change it any time with `/edittask`"
+    body += f"\n· `{tid}` — change it any time with `/edit task`"
     # Public on purpose: the family should see when a chore is added.
     await interaction.response.send_message(body, allowed_mentions=NO_PINGS)
 
@@ -473,7 +479,13 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
         )
 
 
-@bot.tree.command(name="edittask", description="Edit a task's text, time, or repeat (ids come from /listtasks)")
+# One /edit command with a subcommand per type (task / pitchin / doemup), so each
+# only ever shows its own fields — no bounty on a pitch-in, no max_scorers on a
+# task. Registered on the tree at the end of the file once all three are defined.
+edit = app_commands.Group(name="edit", description="Edit a task, pitch-in, or do-em-up")
+
+
+@edit.command(name="task", description="Edit a task's text, time, repeat, or bounty")
 @app_commands.describe(
     task="The task to edit — pick from the list, or paste its id",
     brief="New short text (optional)",
@@ -483,7 +495,7 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
     clear_description="Remove the existing long description",
     bounty="Make this a 2-point bounty the creator can't complete (or turn it off)",
 )
-async def edittask(
+async def edit_task(
     interaction: discord.Interaction,
     task: str,
     brief: Optional[app_commands.Range[str, 1, 200]] = None,
@@ -598,10 +610,10 @@ async def delete_autocomplete(interaction: discord.Interaction, current: str):
 
 
 # Register the shared autocompletes onto each command that needs them.
-for _cmd in (newtask, edittask):
+for _cmd in (newtask, edit_task):
     _cmd.autocomplete("at")(at_autocomplete)
     _cmd.autocomplete("repeat")(repeat_autocomplete)
-edittask.autocomplete("task")(task_autocomplete)
+edit_task.autocomplete("task")(task_autocomplete)
 deletetask.autocomplete("task")(delete_autocomplete)
 
 
@@ -849,22 +861,289 @@ doemup.autocomplete("deadline")(at_autocomplete)
 doemup.autocomplete("repeat")(repeat_autocomplete)
 
 
+# --- /edit pitchin and /edit doemup (shared engine) ------------------------
+def _find_game_in(snap: dict, guild_id: int, section: str, text: str) -> Optional[dict]:
+    """Resolve a single section's game by id, then exact, then substring brief —
+    the section-scoped twin of :func:`_find_game`, so ``/edit pitchin`` only ever
+    matches pitch-ins (and ``/edit doemup`` only do-em-ups)."""
+    g = snap[section].get(text)
+    if g and str(g["guild_id"]) == str(guild_id):
+        return g
+    needle = (text or "").strip().lower()
+    mine = [g for g in snap[section].values() if str(g["guild_id"]) == str(guild_id)]
+    for g in mine:
+        if g["id"].lower() == needle or g["brief"].strip().lower() == needle:
+            return g
+    for g in mine:
+        if needle and needle in g["brief"].lower():
+            return g
+    return None
+
+
+def _set_game_recurrence(g: dict, rec: Optional[dict]) -> None:
+    """Write the recurrence columns onto a game from a rule (or None for a
+    one-off), leaving next_due / duration_secs / message_id to the caller."""
+    if rec:
+        g.update({"recurring": True, "freq": rec["freq"],
+                  "interval_days": rec.get("interval_days", 0),
+                  "weekdays": rec.get("weekdays", []),
+                  "monthdays": rec.get("monthdays", []),
+                  "time_of_day": rec["time_of_day"]})
+    else:
+        g.update({"recurring": False, "freq": "once", "interval_days": 0,
+                  "weekdays": [], "monthdays": [], "time_of_day": None})
+
+
+def _game_event_autocomplete(section: str, icon: str):
+    """Build an autocomplete that lists just one section's games (pitch-ins or
+    do-em-ups), so each /edit subcommand offers only its own kind."""
+    async def _ac(interaction: discord.Interaction, current: str):
+        snap = await store.snapshot()
+        cur = current.lower()
+        out: list[app_commands.Choice] = []
+        for gid, g in snap[section].items():
+            if str(g["guild_id"]) != str(interaction.guild_id):
+                continue
+            sched = describe_repeat(recurrence_of(g)) if g.get("recurring") else "one-off"
+            label = f"{icon} {g['brief']} ({sched})"
+            if cur in label.lower() or cur in gid.lower():
+                out.append(app_commands.Choice(name=label[:100], value=gid))
+            if len(out) >= 25:
+                break
+        return out
+    return _ac
+
+
+async def _apply_game_edit(
+    interaction: discord.Interaction, *, kind: str, section: str,
+    close_field: str, cap_field: str, event_text: str,
+    brief: Optional[str], at: Optional[str], repeat: Optional[str],
+    description: Optional[str], clear_description: bool,
+    close: Optional[str], points: Optional[int], cap: Optional[int],
+) -> None:
+    """Shared engine for /edit pitchin and /edit doemup — they differ only in the
+    close field (expires_at vs deadline) and the cap field (max_scorers vs
+    point_limit). A schedule change recomputes the next open slot for a
+    scheduled/dormant round; for a live round it applies from the next round (the
+    open post is left alone except for an explicit close-time change)."""
+    noun = "pitch-in" if kind == "pitchin" else "do-em-up"
+    snap = await store.snapshot()
+    event = _find_game_in(snap, interaction.guild_id, section, event_text)
+    if not event:
+        await interaction.response.send_message(
+            f"❌ {noun.capitalize()} not found. Use `/listtasks` to see ids.", ephemeral=True)
+        return
+    if (brief is None and at is None and repeat is None and description is None
+            and not clear_description and close is None and points is None and cap is None):
+        await interaction.response.send_message(
+            "❌ Nothing to change — set at least one field.", ephemeral=True)
+        return
+
+    cfg = guild_config(snap, interaction.guild_id)
+    recompute = at is not None or repeat is not None or close is not None
+    if recompute and not config_ready(cfg):
+        await interaction.response.send_message(
+            "❌ Set a timezone with `/farmconfig` before changing the schedule.", ephemeral=True)
+        return
+    tz = ZoneInfo(cfg["timezone"]) if (cfg and cfg.get("timezone")) else UTC
+    now = now_utc()
+
+    new_rec = None
+    rec_changed = at is not None or repeat is not None
+    if rec_changed:
+        try:
+            if repeat is not None:
+                new_rec = _game_recurrence_from(repeat, tz, now, at)
+            else:  # only `at` changed — keep the existing rule, move its slot
+                new_rec = recurrence_of(event) if event.get("recurring") else None
+                if new_rec is not None and at is not None:
+                    new_rec = {**new_rec, "time_of_day": time_of_day_from(at, tz, now)}
+        except ValueError as e:
+            await interaction.response.send_message(
+                f"❌ {e}\nSee `/farmhelp` for the formats.", ephemeral=True)
+            return
+
+    updated = None
+    err = None
+    async with store.txn() as data:
+        g = data[section].get(event["id"])
+        if g and str(g["guild_id"]) == str(interaction.guild_id):
+            live = bool(g.get("message_id"))
+            if brief is not None:
+                g["brief"] = str(brief)
+            if clear_description:
+                g["description"] = None
+            elif description is not None:
+                g["description"] = description[:1000]
+            if points is not None:
+                g["points_each"] = int(points)
+            if cap is not None:
+                g[cap_field] = int(cap)
+
+            if rec_changed:
+                _set_game_recurrence(g, new_rec)
+                if not live:  # scheduled or dormant — recompute the next open slot
+                    if new_rec:
+                        g["next_due"] = to_iso(_game_next_round(g, tz, now))
+                    elif at is not None:
+                        start = resolve_when(at, tz, now)
+                        if start <= now:
+                            err = "that start time is already in the past"
+                        else:
+                            g["next_due"] = to_iso(start)
+
+            if err is None and close is not None:
+                base = now if live else (from_iso(g["next_due"]) if g.get("next_due") else now)
+                new_close = resolve_when(close, tz, base)
+                if new_close <= base:
+                    err = "that close time is already in the past"
+                else:
+                    if live:
+                        g[close_field] = to_iso(new_close)
+                    if g.get("recurring") or not live:
+                        g["duration_secs"] = max(1, int((new_close - base).total_seconds()))
+
+            if err is None:
+                updated = json.loads(json.dumps(g))
+
+    if err:
+        await interaction.response.send_message(
+            f"❌ {err}\nSee `/farmhelp` for the time formats.", ephemeral=True)
+        return
+    if not updated:
+        await interaction.response.send_message(
+            f"❌ {noun.capitalize()} not found.", ephemeral=True)
+        return
+
+    # Re-render a live post so any text/points/close change shows immediately.
+    live_mid = updated.get("message_id")
+    if live_mid:
+        channel = (bot.get_channel(int(updated["channel_id"]))
+                   if updated.get("channel_id") else None)
+        if channel is not None:
+            try:
+                if kind == "pitchin":
+                    await channel.get_partial_message(int(live_mid)).edit(
+                        content=render_pitchin(updated), allowed_mentions=NO_PINGS)
+                else:
+                    await channel.get_partial_message(int(live_mid)).edit(
+                        content=render_doemup(updated),
+                        view=make_doemup_view(updated["id"]), allowed_mentions=NO_PINGS)
+            except discord.HTTPException:
+                pass
+
+    sched = describe_repeat(recurrence_of(updated)) if updated.get("recurring") else "one-off"
+    tail = ""
+    if updated.get("next_due"):
+        nd = from_iso(updated["next_due"])
+        tail = f" · next round {discord_ts(nd, 'F')} ({discord_ts(nd, 'R')})"
+    elif live_mid and rec_changed:
+        tail = " · live now — the new schedule applies from the next round"
+    await interaction.response.send_message(
+        f"✏️ Updated **{updated['brief']}** ({sched}){tail}.",
+        ephemeral=True, allowed_mentions=NO_PINGS)
+
+
+@edit.command(name="pitchin", description="Edit a pitch-in's text, schedule, points, or cap")
+@app_commands.describe(
+    event="The pitch-in to edit — pick from the list, or paste its id",
+    brief="New short text (optional)",
+    at="New open time / recurring slot — 06:00, tonight, tomorrow 8am (optional)",
+    repeat="New repeat — once, daily, weekdays, mon/thu, monthly on the 1st (optional)",
+    description="New extra details (optional)",
+    clear_description="Remove the existing description",
+    expires="New close time for the (next) round — in 5m, 18:00, tonight (optional)",
+    points="New points each pitcher-inner earns (optional)",
+    max_scorers="New cap: only the first N score (optional)",
+)
+async def edit_pitchin(
+    interaction: discord.Interaction,
+    event: str,
+    brief: Optional[app_commands.Range[str, 1, 200]] = None,
+    at: Optional[str] = None,
+    repeat: Optional[str] = None,
+    description: Optional[str] = None,
+    clear_description: bool = False,
+    expires: Optional[str] = None,
+    points: Optional[app_commands.Range[int, 1, 100]] = None,
+    max_scorers: Optional[app_commands.Range[int, 1, 100]] = None,
+) -> None:
+    await _apply_game_edit(
+        interaction, kind="pitchin", section="pitchins",
+        close_field="expires_at", cap_field="max_scorers", event_text=event,
+        brief=brief, at=at, repeat=repeat, description=description,
+        clear_description=clear_description, close=expires, points=points, cap=max_scorers,
+    )
+
+
+@edit.command(name="doemup", description="Edit a do-em-up's text, schedule, points, or limit")
+@app_commands.describe(
+    event="The do-em-up to edit — pick from the list, or paste its id",
+    brief="New short text (optional)",
+    at="New open time / recurring slot — 06:00, tonight, tomorrow 8am (optional)",
+    repeat="New repeat — once, daily, weekdays, mon/thu, monthly on the 1st (optional)",
+    description="New extra details (optional)",
+    clear_description="Remove the existing description",
+    deadline="New auto-close time for the (next) round — in 3h, tonight, 18:00 (optional)",
+    points="New points per ➕ (optional)",
+    point_limit="New cap: auto-close once this many points tally (optional)",
+)
+async def edit_doemup(
+    interaction: discord.Interaction,
+    event: str,
+    brief: Optional[app_commands.Range[str, 1, 200]] = None,
+    at: Optional[str] = None,
+    repeat: Optional[str] = None,
+    description: Optional[str] = None,
+    clear_description: bool = False,
+    deadline: Optional[str] = None,
+    points: Optional[app_commands.Range[int, 1, 100]] = None,
+    point_limit: Optional[app_commands.Range[int, 1, 100000]] = None,
+) -> None:
+    await _apply_game_edit(
+        interaction, kind="doemup", section="doemups",
+        close_field="deadline", cap_field="point_limit", event_text=event,
+        brief=brief, at=at, repeat=repeat, description=description,
+        clear_description=clear_description, close=deadline, points=points, cap=point_limit,
+    )
+
+
+edit_pitchin.autocomplete("event")(_game_event_autocomplete("pitchins", EMOJI_HANDSHAKE))
+edit_pitchin.autocomplete("at")(at_autocomplete)
+edit_pitchin.autocomplete("expires")(at_autocomplete)
+edit_pitchin.autocomplete("repeat")(repeat_autocomplete)
+edit_doemup.autocomplete("event")(_game_event_autocomplete("doemups", EMOJI_FLEX))
+edit_doemup.autocomplete("at")(at_autocomplete)
+edit_doemup.autocomplete("deadline")(at_autocomplete)
+edit_doemup.autocomplete("repeat")(repeat_autocomplete)
+
+# All three subcommands are defined — register the group on the tree.
+bot.tree.add_command(edit)
+
+
 __all__ = [
+    "_apply_game_edit",
     "_cancel_game_message",
     "_dedup",
     "_find_game",
+    "_find_game_in",
     "_find_task",
+    "_game_event_autocomplete",
     "_game_recurrence_from",
     "_guild_tz",
     "_human_until",
     "_repeat_label",
+    "_set_game_recurrence",
     "_tz_autocomplete",
     "_when_label",
     "at_autocomplete",
     "delete_autocomplete",
     "deletetask",
     "doemup",
-    "edittask",
+    "edit",
+    "edit_doemup",
+    "edit_pitchin",
+    "edit_task",
     "farmconfig",
     "newtask",
     "pitchin",
