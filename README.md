@@ -239,7 +239,17 @@ farmtracker/
   models.py   # task schema, natural-language `at` parsing, `repeat` rules,
               #   DST-aware recurrence, and pitch-in / do-em-up render + tally
   store.py    # JSON store (asyncio.Lock + atomic writes) + completion log
-  bot.py      # commands, scheduler tick, reaction + button handlers, entry point
+  bot/        # the Discord bot, split by concern (re-exports a flat surface):
+    core.py        # FarmBot instance, the Store, shared constants
+    helpers.py     # small formatting + occurrence I/O helpers
+    scheduler.py   # the 30s tick: fire tasks, post nags
+    reactions.py   # reaction events: done/skip/ffwd/snooze, undo, requeue
+    claps.py       # 👏 bonus-point claps on finished work
+    games.py       # pitch-ins & do-em-ups (ad-hoc point events)
+    commands.py    # the slash commands + autocompletes
+    listing.py     # /listtasks, /listopen, /farmhelp + paginator
+    scoring.py     # /leaderboard, ⭐ stars, /vitrine
+    admin.py       # /redeploy, error handler, entry point
   trinkets.py # the end-of-month objet-d'art generator + the vitrine (derived)
 ```
 
