@@ -1,4 +1,4 @@
-"""Shared singletons: the FarmBot instance, the Store, and constants.
+"""Shared singletons: the JoblinBot instance, the Store, and constants.
 
 Dependency-free (only stdlib + discord + Store) so every other module in the
 package can import from it without import cycles.
@@ -14,9 +14,9 @@ from discord.ext import commands
 
 from ..store import Store
 
-log = logging.getLogger("farmtracker")
+log = logging.getLogger("joblin")
 
-DATA_DIR = pathlib.Path(os.getenv("FARMTRACKER_DATA_DIR", "data"))
+DATA_DIR = pathlib.Path(os.getenv("JOBLIN_DATA_DIR", "data"))
 store = Store(DATA_DIR / "store.json", DATA_DIR / "completions.jsonl")
 
 # Repo root (the directory containing pyproject.toml), used by /redeploy to
@@ -25,7 +25,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 
 NO_PINGS = discord.AllowedMentions.none()
 
-# A small curated list for the /farmconfig timezone autocomplete. Any valid
+# A small curated list for the /joblinconfig timezone autocomplete. Any valid
 # IANA name is accepted; this is just for convenience.
 COMMON_TZS = [
     "UTC",
@@ -43,7 +43,7 @@ COMMON_TZS = [
 ]
 
 
-class FarmBot(commands.Bot):
+class JoblinBot(commands.Bot):
     def __init__(self) -> None:
         # Default (non-privileged) intents cover guilds + reactions, which is
         # all we need: slash commands and raw reaction events. We do NOT need
@@ -69,9 +69,9 @@ class FarmBot(commands.Bot):
             log.info("Synced global commands (may take up to ~1h to appear)")
 
 
-bot = FarmBot()
+bot = JoblinBot()
 
 __all__ = [
-    "bot", "FarmBot", "store", "log", "DATA_DIR", "REPO_ROOT",
+    "bot", "JoblinBot", "store", "log", "DATA_DIR", "REPO_ROOT",
     "NO_PINGS", "COMMON_TZS",
 ]

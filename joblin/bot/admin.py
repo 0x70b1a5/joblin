@@ -114,7 +114,7 @@ async def redeploy(interaction: discord.Interaction, sync_deps: bool = True) -> 
         os.chdir(REPO_ROOT)
         sys.stdout.flush()
         sys.stderr.flush()
-        os.execv(sys.executable, [sys.executable, "-m", "farmtracker"])
+        os.execv(sys.executable, [sys.executable, "-m", "joblin"])
 
 
 @bot.tree.error

@@ -84,7 +84,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         return
 
     # Clap (👏) likewise lives on a ✅-completed (de-registered) post and is keyed
-    # off its own table — a non-participant's tap tips the doer a bonus point.
+    # off its own table — a non-participant's tap tips the doer a bonus punto.
     if key == emoji_key(EMOJI_CLAP):
         await _handle_clap(payload, channel)
         return
@@ -303,7 +303,7 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
         try:
             await channel.send(
                 f"💰 {mention}, this is **your** bounty — someone else has to claim it "
-                "(it's worth 2 points!).",
+                "(it's worth 2 puntos!).",
                 reference=reacted,
                 allowed_mentions=NO_PINGS,
             )
@@ -351,7 +351,7 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
     await _delete_panels(panels)
     if record:
         await store.log_completion(record)
-        bonus = " 💰 **+2 pts**" if task.get("bounty") else ""
+        bonus = " 💰 **+2 puntos**" if task.get("bounty") else ""
         status = (
             f"~~**{task['brief']}**~~\n"
             f"✅ Completed by {mention}{bonus} • {discord_ts(completed, 't')}"
@@ -361,7 +361,7 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
             await _arm_undo("done", tid, before, message_ids[-1], channel, completion_id=completion_id)
             await _arm_requeue(tid, before, message_ids[-1], channel, task["guild_id"])
             # The doer is this occurrence's sole participant; anyone *else* can 👏
-            # them a bonus point on the finished post.
+            # them a bonus punto on the finished post.
             participants = [{"user_id": payload.user_id, "user_name": display}]
             await _arm_clap(
                 tid, message_ids[-1], channel, task["guild_id"], task["brief"], status, participants
@@ -544,7 +544,7 @@ async def _handle_undo(
         data["undo"].pop(str(payload.message_id), None)
         # Undoing a ✅ turns its post back into a live occurrence, so the 🔄
         # requeue and 👏 claps we armed on that same post no longer apply. Any
-        # bonus points the claps already paid are retracted below — but only when
+        # bonus puntos the claps already paid are retracted below — but only when
         # the undo actually takes (a refused ↩️ leaves the completion, and its
         # claps, standing).
         data["requeue"].pop(str(payload.message_id), None)
@@ -555,7 +555,7 @@ async def _handle_undo(
     if outcome == "ok":
         if action == "done" and completion_id:
             await store.void_completion(completion_id)
-        for lid in clap_log_ids:  # retract every bonus point the claps awarded
+        for lid in clap_log_ids:  # retract every bonus punto the claps awarded
             await store.void_completion(lid)
         await _restore_anchor(channel, payload.message_id, before)
     elif outcome == "refused":

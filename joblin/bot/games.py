@@ -41,12 +41,12 @@ from .claps import _arm_game_clap
 
 
 # ---------------------------------------------------------------------------
-# Pitch-ins and do-em-ups  (ad-hoc point events; see models.py for the schemas)
+# Pitch-ins and do-em-ups  (ad-hoc punto events; see models.py for the schemas)
 # ---------------------------------------------------------------------------
 # Both are posted immediately by their slash command into the configured farm
 # channel, resolve by people reacting (pitch-in ✅) or clicking buttons (do-em-up
-# ➕/➖), and close at an expiry/deadline, a point cap, or the creator's manual
-# end. Closing awards points to the same completion log as chores (with a
+# ➕/➖), and close at an expiry/deadline, a punto cap, or the creator's manual
+# end. Closing awards puntos to the same completion log as chores (with a
 # ``points`` field), so one /leaderboard totals chores and games alike. The
 # ``ended`` flag is flipped inside the same txn that pops the row, so an
 # expiry-tick and a manual end racing each other can only award once.
@@ -56,7 +56,7 @@ def _game_record(
     event: dict, kind: str, user_id: int, user_name: str, points: int,
     tz: ZoneInfo, now: dt.datetime,
 ) -> dict:
-    """A completion-log row for one person's points from a pitch-in / do-em-up.
+    """A completion-log row for one person's puntos from a pitch-in / do-em-up.
     Same shape as a chore completion (so /leaderboard reads them uniformly) with
     an added ``points`` count (chores omit it and are read as 1)."""
     return {
@@ -76,7 +76,7 @@ def _game_record(
 
 
 def game_records(event: dict, kind: str, tz: ZoneInfo, now: dt.datetime) -> list[dict]:
-    """Every point-award row owed when an event closes: one per pitch-in scorer,
+    """Every punto-award row owed when an event closes: one per pitch-in scorer,
     or one per do-em-up tallier (worth their unit count × ``points_each``)."""
     pe = event.get("points_each", 1)
     recs: list[dict] = []

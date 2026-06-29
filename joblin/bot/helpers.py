@@ -40,8 +40,8 @@ def schedule_label(task: dict) -> str:
 
 
 def bounty_tag(task: dict) -> str:
-    """A small inline marker shown on a bounty's posts (worth 2 pts, not the poster)."""
-    return " 💰 *bounty · 2 pts*" if task.get("bounty") else ""
+    """A small inline marker shown on a bounty's posts (worth 2 puntos, not the poster)."""
+    return " 💰 *bounty · 2 puntos*" if task.get("bounty") else ""
 
 
 def post_content(task: dict, *, reminder: bool, cfg: dict) -> str:

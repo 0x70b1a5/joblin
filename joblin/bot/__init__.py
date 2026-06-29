@@ -54,7 +54,7 @@ from . import scoring
 from . import admin
 
 # Re-export every submodule's public surface (incl. the ``main`` entry point
-# used by __main__.py) so `import farmtracker.bot as bot; bot.<name>` and the
+# used by __main__.py) so `import joblin.bot as bot; bot.<name>` and the
 # smoke tests keep resolving exactly as before the split.
 _SUBMODULES = (core, helpers, claps, games, scheduler, reactions,
                commands, listing, scoring, admin)

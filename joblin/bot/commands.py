@@ -102,15 +102,15 @@ def schedule_from_rule(
 # ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
-@bot.tree.command(name="farmconfig", description="Set the channel, timezone, and optional reminder role")
+@bot.tree.command(name="joblinconfig", description="Set the channel, timezone, and optional reminder role")
 @app_commands.describe(
     channel="Channel where tasks are posted",
     timezone="IANA timezone, e.g. Europe/Berlin (autocompletes)",
     reminder_role="Role to ping on overdue hourly reminders (optional)",
-    item_bar="Points per trinket each month — every multiple earns another (default 25)",
+    item_bar="Puntos per trinket each month — every multiple earns another (default 25)",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
-async def farmconfig(
+async def joblinconfig(
     interaction: discord.Interaction,
     channel: Optional[discord.TextChannel] = None,
     timezone: Optional[str] = None,
@@ -129,7 +129,7 @@ async def farmconfig(
 
     if item_bar is not None and item_bar < 1:
         await interaction.response.send_message(
-            "❌ The trinket bar must be at least 1 point.", ephemeral=True
+            "❌ The trinket bar must be at least 1 punto.", ephemeral=True
         )
         return
 
@@ -159,14 +159,14 @@ async def farmconfig(
         f"• Channel: {ch}\n"
         f"• Timezone: {tz}\n"
         f"• Reminder role: {role}\n"
-        f"• Trinket bar: **{bar} pts** each — every multiple earns another 🖼️"
+        f"• Trinket bar: **{bar} puntos** each — every multiple earns another 🖼️"
     )
     if not config_ready(current):
         msg += "\n\n⚠️ Set **both** a channel and a timezone before creating tasks."
     await interaction.response.send_message(msg, ephemeral=True, allowed_mentions=NO_PINGS)
 
 
-@farmconfig.autocomplete("timezone")
+@joblinconfig.autocomplete("timezone")
 async def _tz_autocomplete(interaction: discord.Interaction, current: str):
     cur = current.lower()
     matches = [z for z in COMMON_TZS if cur in z.lower()][:25]
@@ -294,7 +294,7 @@ async def task_autocomplete(interaction: discord.Interaction, current: str):
     at="When/what time — now, in 2h, 18:00, tomorrow 8am, 2026-06-20 14:00 (default: now)",
     repeat="How often — once, daily, every 2 days, weekdays, mon/thu, monthly on the 1st (default: once)",
     description="Optional longer details, revealed by the ℹ️ reaction",
-    bounty="Worth 2 points, and only someone other than you can complete it (default: off)",
+    bounty="Worth 2 puntos, and only someone other than you can complete it (default: off)",
 )
 async def newtask(
     interaction: discord.Interaction,
@@ -308,7 +308,7 @@ async def newtask(
     cfg = guild_config(snap, interaction.guild_id)
     if not config_ready(cfg):
         await interaction.response.send_message(
-            "❌ Run `/farmconfig` to set a channel and timezone first.", ephemeral=True
+            "❌ Run `/joblinconfig` to set a channel and timezone first.", ephemeral=True
         )
         return
 
@@ -317,7 +317,7 @@ async def newtask(
         sched = schedule_from_rule(parse_repeat(repeat), at, tz, now, at_given=at is not None)
     except ValueError as e:
         await interaction.response.send_message(
-            f"❌ {e}\nSee `/farmhelp` for the `at` and `repeat` formats.", ephemeral=True
+            f"❌ {e}\nSee `/joblinhelp` for the `at` and `repeat` formats.", ephemeral=True
         )
         return
 
@@ -351,7 +351,7 @@ async def newtask(
     if description:
         body += "\nℹ️ Details attached."
     if bounty:
-        body += "\n💰 **Bounty** — worth 2 points; anyone *but* you can complete it."
+        body += "\n💰 **Bounty** — worth 2 puntos; anyone *but* you can complete it."
     body += f"\n· `{tid}` — change it any time with `/edit task`"
     # Public on purpose: the family should see when a chore is added.
     await interaction.response.send_message(body, allowed_mentions=NO_PINGS)
@@ -402,7 +402,7 @@ async def _cancel_game_message(
     channel: discord.abc.Messageable, brief: str, mid: int, *, is_doemup: bool
 ) -> None:
     """Make a deleted game's live post inert: strike it through as cancelled and
-    strip its reactions/buttons. No points are awarded (delete ≠ close)."""
+    strip its reactions/buttons. No puntos are awarded (delete ≠ close)."""
     pm = channel.get_partial_message(mid)
     try:
         await pm.edit(content=f"🗑️ ~~**{brief}**~~ — cancelled.",
@@ -493,7 +493,7 @@ edit = app_commands.Group(name="edit", description="Edit a task, pitch-in, or do
     repeat="New repeat — once, daily, every 2 days, weekdays, mon/thu, monthly on the 1st (optional)",
     description="New longer details (optional)",
     clear_description="Remove the existing long description",
-    bounty="Make this a 2-point bounty the creator can't complete (or turn it off)",
+    bounty="Make this a 2-punto bounty the creator can't complete (or turn it off)",
 )
 async def edit_task(
     interaction: discord.Interaction,
@@ -526,7 +526,7 @@ async def edit_task(
     recompute = at is not None or repeat is not None
     if recompute and not config_ready(cfg):
         await interaction.response.send_message(
-            "❌ Set a timezone with `/farmconfig` before changing the schedule.", ephemeral=True
+            "❌ Set a timezone with `/joblinconfig` before changing the schedule.", ephemeral=True
         )
         return
 
@@ -541,7 +541,7 @@ async def edit_task(
             )
         except ValueError as e:
             await interaction.response.send_message(
-                f"❌ {e}\nSee `/farmhelp` for the `at` and `repeat` formats.", ephemeral=True
+                f"❌ {e}\nSee `/joblinhelp` for the `at` and `repeat` formats.", ephemeral=True
             )
             return
 
@@ -583,8 +583,8 @@ async def edit_task(
         body += f"\nNext post: {discord_ts(nd, 'F')} ({discord_ts(nd, 'R')})"
     if bounty is not None:
         body += (
-            "\n💰 Now a **bounty** — worth 2 points; you can't complete it yourself."
-            if bounty else "\n💰 Bounty removed — back to a normal 1-point chore."
+            "\n💰 Now a **bounty** — worth 2 puntos; you can't complete it yourself."
+            if bounty else "\n💰 Bounty removed — back to a normal 1-punto chore."
         )
     # Public on purpose: shared chores changing is something the family should see.
     await interaction.response.send_message(body, allowed_mentions=NO_PINGS)
@@ -635,13 +635,13 @@ def _game_recurrence_from(
 
 @bot.tree.command(
     name="pitchin",
-    description="Start a pitch-in: everyone who ✅s before it closes earns a point",
+    description="Start a pitch-in: everyone who ✅s before it closes earns a punto",
 )
 @app_commands.describe(
     brief="What to pitch in on, e.g. 'laundry bonanza' (required)",
     at="When the first round opens — now, 06:00, tomorrow 8am. Recurring? sets the daily slot (default: now)",
     expires="When a round closes — in 5m, tonight, 18:00, tomorrow 8am (default: in 24h; recurring: at the next slot)",
-    points="Points each pitcher-inner earns (default: 1)",
+    puntos="Puntos each pitcher-inner earns (default: 1)",
     max_scorers="Optional cap: only the first N to pitch in score",
     repeat="Repeat it — daily, weekdays, mon/thu, monthly on the 1st (default: once)",
     description="Optional extra details shown on the post",
@@ -651,7 +651,7 @@ async def pitchin(
     brief: app_commands.Range[str, 1, 200],
     at: Optional[str] = None,
     expires: Optional[str] = None,
-    points: app_commands.Range[int, 1, 100] = 1,
+    puntos: app_commands.Range[int, 1, 100] = 1,
     max_scorers: Optional[app_commands.Range[int, 1, 100]] = None,
     repeat: Optional[str] = None,
     description: Optional[str] = None,
@@ -660,7 +660,7 @@ async def pitchin(
     cfg = guild_config(snap, interaction.guild_id)
     if not config_ready(cfg):
         await interaction.response.send_message(
-            "❌ Run `/farmconfig` to set a channel and timezone first.", ephemeral=True
+            "❌ Run `/joblinconfig` to set a channel and timezone first.", ephemeral=True
         )
         return
     tz, now = ZoneInfo(cfg["timezone"]), now_utc()
@@ -668,7 +668,7 @@ async def pitchin(
         recurrence = _game_recurrence_from(repeat, tz, now, at)
     except ValueError as e:
         await interaction.response.send_message(
-            f"❌ {e}\nSee `/farmhelp` for the `repeat` formats.", ephemeral=True
+            f"❌ {e}\nSee `/joblinhelp` for the `repeat` formats.", ephemeral=True
         )
         return
     # With `at`, the first round is deferred to its scheduled slot (a recurring
@@ -700,13 +700,13 @@ async def pitchin(
             duration_secs = max(1, int((exp - start).total_seconds()))
     except ValueError as e:
         await interaction.response.send_message(
-            f"❌ {e}\nSee `/farmhelp` for the time formats.", ephemeral=True
+            f"❌ {e}\nSee `/joblinhelp` for the time formats.", ephemeral=True
         )
         return
     channel = bot.get_channel(int(cfg["channel_id"]))
     if channel is None:
         await interaction.response.send_message(
-            "❌ I can't see the configured channel — check `/farmconfig`.", ephemeral=True
+            "❌ I can't see the configured channel — check `/joblinconfig`.", ephemeral=True
         )
         return
 
@@ -715,7 +715,7 @@ async def pitchin(
             guild_id=interaction.guild_id, creator_id=interaction.user.id,
             channel_id=channel.id, brief=str(brief),
             description=(description[:1000] if description else None),
-            points_each=int(points),
+            points_each=int(puntos),
             max_scorers=(int(max_scorers) if max_scorers else None), now=now,
             recurrence=recurrence, duration_secs=duration_secs, starts_at=start,
         )
@@ -723,7 +723,7 @@ async def pitchin(
         await post_pitchin(
             channel, guild_id=interaction.guild_id, creator_id=interaction.user.id,
             brief=str(brief), description=(description[:1000] if description else None),
-            expires_at=to_iso(exp), points_each=int(points),
+            expires_at=to_iso(exp), points_each=int(puntos),
             max_scorers=(int(max_scorers) if max_scorers else None), now=now,
             recurrence=recurrence, duration_secs=duration_secs,
         )
@@ -743,14 +743,14 @@ async def pitchin(
 
 @bot.tree.command(
     name="doemup",
-    description="Start a do-em-up: tap ➕ for each one you do; points tally live",
+    description="Start a do-em-up: tap ➕ for each one you do; puntos tally live",
 )
 @app_commands.describe(
     brief="What's being done one-at-a-time, e.g. 'thistle bush removed' (required)",
     at="When the first round opens — now, 06:00, tomorrow 8am. Recurring? sets the daily slot (default: now)",
-    points="Points per ➕ (default: 1)",
+    puntos="Puntos per ➕ (default: 1)",
     deadline="Optional auto-close time — tonight, in 3h, tomorrow 18:00",
-    point_limit="Optional cap: auto-close once this many points are tallied",
+    point_limit="Optional cap: auto-close once this many puntos are tallied",
     repeat="Repeat it — daily, weekdays, mon/thu, monthly on the 1st (default: once)",
     description="Optional extra details shown on the post",
 )
@@ -758,7 +758,7 @@ async def doemup(
     interaction: discord.Interaction,
     brief: app_commands.Range[str, 1, 200],
     at: Optional[str] = None,
-    points: app_commands.Range[int, 1, 100] = 1,
+    puntos: app_commands.Range[int, 1, 100] = 1,
     deadline: Optional[str] = None,
     point_limit: Optional[app_commands.Range[int, 1, 100000]] = None,
     repeat: Optional[str] = None,
@@ -768,7 +768,7 @@ async def doemup(
     cfg = guild_config(snap, interaction.guild_id)
     if not config_ready(cfg):
         await interaction.response.send_message(
-            "❌ Run `/farmconfig` to set a channel and timezone first.", ephemeral=True
+            "❌ Run `/joblinconfig` to set a channel and timezone first.", ephemeral=True
         )
         return
     tz, now = ZoneInfo(cfg["timezone"]), now_utc()
@@ -776,7 +776,7 @@ async def doemup(
         recurrence = _game_recurrence_from(repeat, tz, now, at)
     except ValueError as e:
         await interaction.response.send_message(
-            f"❌ {e}\nSee `/farmhelp` for the `repeat` formats.", ephemeral=True
+            f"❌ {e}\nSee `/joblinhelp` for the `repeat` formats.", ephemeral=True
         )
         return
     # With `at`, the first round is deferred to its scheduled slot (see /pitchin);
@@ -804,13 +804,13 @@ async def doemup(
         # else: a plain one-off do-em-up stays open until 🏁 (even when deferred)
     except ValueError as e:
         await interaction.response.send_message(
-            f"❌ {e}\nSee `/farmhelp` for the time formats.", ephemeral=True
+            f"❌ {e}\nSee `/joblinhelp` for the time formats.", ephemeral=True
         )
         return
     channel = bot.get_channel(int(cfg["channel_id"]))
     if channel is None:
         await interaction.response.send_message(
-            "❌ I can't see the configured channel — check `/farmconfig`.", ephemeral=True
+            "❌ I can't see the configured channel — check `/joblinconfig`.", ephemeral=True
         )
         return
 
@@ -819,7 +819,7 @@ async def doemup(
             guild_id=interaction.guild_id, creator_id=interaction.user.id,
             channel_id=channel.id, brief=str(brief),
             description=(description[:1000] if description else None),
-            points_each=int(points),
+            points_each=int(puntos),
             point_limit=(int(point_limit) if point_limit else None), now=now,
             recurrence=recurrence, duration_secs=duration_secs, starts_at=start,
         )
@@ -834,7 +834,7 @@ async def doemup(
     await post_doemup(
         channel, guild_id=interaction.guild_id, creator_id=interaction.user.id,
         brief=str(brief), description=(description[:1000] if description else None),
-        points_each=int(points), deadline=deadline_iso,
+        points_each=int(puntos), deadline=deadline_iso,
         point_limit=(int(point_limit) if point_limit else None), now=now,
         recurrence=recurrence, duration_secs=duration_secs,
     )
@@ -919,7 +919,7 @@ async def _apply_game_edit(
     close_field: str, cap_field: str, event_text: str,
     brief: Optional[str], at: Optional[str], repeat: Optional[str],
     description: Optional[str], clear_description: bool,
-    close: Optional[str], points: Optional[int], cap: Optional[int],
+    close: Optional[str], puntos: Optional[int], cap: Optional[int],
 ) -> None:
     """Shared engine for /edit pitchin and /edit doemup — they differ only in the
     close field (expires_at vs deadline) and the cap field (max_scorers vs
@@ -934,7 +934,7 @@ async def _apply_game_edit(
             f"❌ {noun.capitalize()} not found. Use `/listtasks` to see ids.", ephemeral=True)
         return
     if (brief is None and at is None and repeat is None and description is None
-            and not clear_description and close is None and points is None and cap is None):
+            and not clear_description and close is None and puntos is None and cap is None):
         await interaction.response.send_message(
             "❌ Nothing to change — set at least one field.", ephemeral=True)
         return
@@ -943,7 +943,7 @@ async def _apply_game_edit(
     recompute = at is not None or repeat is not None or close is not None
     if recompute and not config_ready(cfg):
         await interaction.response.send_message(
-            "❌ Set a timezone with `/farmconfig` before changing the schedule.", ephemeral=True)
+            "❌ Set a timezone with `/joblinconfig` before changing the schedule.", ephemeral=True)
         return
     tz = ZoneInfo(cfg["timezone"]) if (cfg and cfg.get("timezone")) else UTC
     now = now_utc()
@@ -960,7 +960,7 @@ async def _apply_game_edit(
                     new_rec = {**new_rec, "time_of_day": time_of_day_from(at, tz, now)}
         except ValueError as e:
             await interaction.response.send_message(
-                f"❌ {e}\nSee `/farmhelp` for the formats.", ephemeral=True)
+                f"❌ {e}\nSee `/joblinhelp` for the formats.", ephemeral=True)
             return
 
     updated = None
@@ -975,8 +975,8 @@ async def _apply_game_edit(
                 g["description"] = None
             elif description is not None:
                 g["description"] = description[:1000]
-            if points is not None:
-                g["points_each"] = int(points)
+            if puntos is not None:
+                g["points_each"] = int(puntos)
             if cap is not None:
                 g[cap_field] = int(cap)
 
@@ -1008,14 +1008,14 @@ async def _apply_game_edit(
 
     if err:
         await interaction.response.send_message(
-            f"❌ {err}\nSee `/farmhelp` for the time formats.", ephemeral=True)
+            f"❌ {err}\nSee `/joblinhelp` for the time formats.", ephemeral=True)
         return
     if not updated:
         await interaction.response.send_message(
             f"❌ {noun.capitalize()} not found.", ephemeral=True)
         return
 
-    # Re-render a live post so any text/points/close change shows immediately.
+    # Re-render a live post so any text/puntos/close change shows immediately.
     live_mid = updated.get("message_id")
     if live_mid:
         channel = (bot.get_channel(int(updated["channel_id"]))
@@ -1044,7 +1044,7 @@ async def _apply_game_edit(
         ephemeral=True, allowed_mentions=NO_PINGS)
 
 
-@edit.command(name="pitchin", description="Edit a pitch-in's text, schedule, points, or cap")
+@edit.command(name="pitchin", description="Edit a pitch-in's text, schedule, puntos, or cap")
 @app_commands.describe(
     event="The pitch-in to edit — pick from the list, or paste its id",
     brief="New short text (optional)",
@@ -1053,7 +1053,7 @@ async def _apply_game_edit(
     description="New extra details (optional)",
     clear_description="Remove the existing description",
     expires="New close time for the (next) round — in 5m, 18:00, tonight (optional)",
-    points="New points each pitcher-inner earns (optional)",
+    puntos="New puntos each pitcher-inner earns (optional)",
     max_scorers="New cap: only the first N score (optional)",
 )
 async def edit_pitchin(
@@ -1065,18 +1065,18 @@ async def edit_pitchin(
     description: Optional[str] = None,
     clear_description: bool = False,
     expires: Optional[str] = None,
-    points: Optional[app_commands.Range[int, 1, 100]] = None,
+    puntos: Optional[app_commands.Range[int, 1, 100]] = None,
     max_scorers: Optional[app_commands.Range[int, 1, 100]] = None,
 ) -> None:
     await _apply_game_edit(
         interaction, kind="pitchin", section="pitchins",
         close_field="expires_at", cap_field="max_scorers", event_text=event,
         brief=brief, at=at, repeat=repeat, description=description,
-        clear_description=clear_description, close=expires, points=points, cap=max_scorers,
+        clear_description=clear_description, close=expires, puntos=puntos, cap=max_scorers,
     )
 
 
-@edit.command(name="doemup", description="Edit a do-em-up's text, schedule, points, or limit")
+@edit.command(name="doemup", description="Edit a do-em-up's text, schedule, puntos, or limit")
 @app_commands.describe(
     event="The do-em-up to edit — pick from the list, or paste its id",
     brief="New short text (optional)",
@@ -1085,8 +1085,8 @@ async def edit_pitchin(
     description="New extra details (optional)",
     clear_description="Remove the existing description",
     deadline="New auto-close time for the (next) round — in 3h, tonight, 18:00 (optional)",
-    points="New points per ➕ (optional)",
-    point_limit="New cap: auto-close once this many points tally (optional)",
+    puntos="New puntos per ➕ (optional)",
+    point_limit="New cap: auto-close once this many puntos tally (optional)",
 )
 async def edit_doemup(
     interaction: discord.Interaction,
@@ -1097,14 +1097,14 @@ async def edit_doemup(
     description: Optional[str] = None,
     clear_description: bool = False,
     deadline: Optional[str] = None,
-    points: Optional[app_commands.Range[int, 1, 100]] = None,
+    puntos: Optional[app_commands.Range[int, 1, 100]] = None,
     point_limit: Optional[app_commands.Range[int, 1, 100000]] = None,
 ) -> None:
     await _apply_game_edit(
         interaction, kind="doemup", section="doemups",
         close_field="deadline", cap_field="point_limit", event_text=event,
         brief=brief, at=at, repeat=repeat, description=description,
-        clear_description=clear_description, close=deadline, points=points, cap=point_limit,
+        clear_description=clear_description, close=deadline, puntos=puntos, cap=point_limit,
     )
 
 
@@ -1144,7 +1144,7 @@ __all__ = [
     "edit_doemup",
     "edit_pitchin",
     "edit_task",
-    "farmconfig",
+    "joblinconfig",
     "newtask",
     "pitchin",
     "repeat_autocomplete",

@@ -1,12 +1,16 @@
-# 🚜 farmtracker
+# 🧹 Joblin
 
-A small Discord bot for **small-scale farm chore logistics**. Create recurring
-or one-off chores; when each is due the bot posts it to your farm channel and
-self-reacts with buttons the family taps to complete, snooze, expand, or skip.
-Completions are logged so you can run a monthly **leaderboard** — with **points**,
-double-value **bounties**, a **⭐ star** for each month's winner, and a rolled
-**🖼️ trinket** for everyone who clears the month's points bar — to gamify
-the family chores.
+**A gamification framework for chores.**
+
+> "I miss the days when you could just Do Chores, without expectation of *puntos*."
+
+Joblin is a small Discord bot for **household & small-farm chore logistics**.
+Create recurring or one-off chores; when each is due the bot posts it to your
+chosen channel and self-reacts with buttons the family taps to complete, snooze,
+expand, or skip. Completions are logged so you can run a monthly **leaderboard**
+— with **puntos**, double-value **bounties**, a **⭐ star** for each month's
+winner, and a rolled **🖼️ trinket** for everyone who clears the month's puntos
+bar — to gamify the family chores.
 
 ---
 
@@ -17,7 +21,7 @@ the family chores.
   `weekdays`, `weekends`), or **days of the month** (`1st,15th`, `last day`).
   Each task has a mandatory **brief** and an optional longer **description**.
 - A task can be flagged a **bounty** (`/newtask … bounty:true`): it's worth
-  **2 points** instead of 1, and **only someone other than its creator** can
+  **2 puntos** instead of 1, and **only someone other than its creator** can
   complete it — handy for a chore you're putting up for the rest of the family.
 - You say *when* with two friendly, optional fields:
   - **`at`** — a time or date in plain language: `now` (the default), `in 2h`,
@@ -36,7 +40,7 @@ the family chores.
   | ❌ | **Skip** — skips just *this* occurrence of a recurring task (it returns next cycle); deletes a one-off. To remove a recurring task entirely, use `/deletetask`. |
   | ↩️ | **Undo** — appears right after a ✅/⏩/❌ and reverses it: a completion is un-logged (so it leaves the leaderboard too), a snooze is rolled back, and a skip/delete is restored. Survives restarts; only the most recent action on an occurrence is undoable, and only until that chore next comes due. |
   | 🔄 | **Requeue** — appears on a ✅-completed post; re-fires that chore **right now** as a fresh occurrence (handy when, say, the water trough is empty again an hour later) without waiting for its next scheduled slot. Finishing the re-run rolls the recurrence on to its normal next slot. Survives restarts; the most recent completed post per task carries the button. |
-  | 👏 | **Clap** — appears on a finished chore, **pitch-in, or do-em-up** post; anyone who *didn't* take part can tap it to tip **every** doer a **+1 bonus point** (one clap per outsider, so a crowd can stack several). The bonus lands on the leaderboard like any other point; undoing a chore's ✅ retracts its claps. Survives restarts; the most recent finished post per task/game carries the button. |
+  | 👏 | **Clap** — appears on a finished chore, **pitch-in, or do-em-up** post; anyone who *didn't* take part can tap it to tip **every** doer a **+1 bonus punto** (one clap per outsider, so a crowd can stack several). The bonus lands on the leaderboard like any other punto; undoing a chore's ✅ retracts its claps. Survives restarts; the most recent finished post per task/game carries the button. |
 - If nobody completes or snoozes within the hour, the bot **re-posts hourly**
   until the chore is done (optionally pinging a role).
 - Everything survives restarts: due times, pending occurrences, snooze timers,
@@ -46,17 +50,17 @@ the family chores.
 
 | Command | Who | What |
 |---|---|---|
-| `/farmconfig` | Manage Server | Set the post **channel**, **timezone** (IANA, e.g. `Europe/Berlin`), an optional **reminder role**, and the **`item_bar`** — points per trinket each month, where every whole multiple earns another (default **25**). Run with no options to view current config. |
-| `/newtask` | anyone | `brief`, optional `at` (default **now**), optional `repeat` (default **once**), optional `description`, optional `bounty` (a 2-point chore the creator can't complete). Both `at` and `repeat` autocomplete with a live preview. Posts a **public** confirmation so the family sees the new chore. |
-| `/pitchin` | anyone | Post a **pitch-in**: `brief`, optional `expires` (default **24h**), `points` each (default 1), `max_scorers`, `description`. Everyone who taps ✅ before it closes earns a point. See [Pitch-ins & do-em-ups](#pitch-ins--do-em-ups). |
-| `/doemup` | anyone | Post a **do-em-up**: `brief`, optional `points` per ➕ (default 1), `deadline`, `point_limit`, `description`. Tap ➕ once per thing you did; the tally updates live. See [Pitch-ins & do-em-ups](#pitch-ins--do-em-ups). |
-| `/edit` | anyone | One command with a subcommand per type — **`/edit task`**, **`/edit pitchin`**, **`/edit doemup`** — each showing only its own fields (so `bounty` appears only on tasks, `max_scorers` only on pitch-ins, etc.). Change the `brief`, `at`/slot, `repeat`, `description`, points, cap, or close time; pick the item from autocomplete or paste its `id` from `/listtasks`. A schedule change to a **live** round applies from the next round. |
+| `/joblinconfig` | Manage Server | Set the post **channel**, **timezone** (IANA, e.g. `Europe/Berlin`), an optional **reminder role**, and the **`item_bar`** — puntos per trinket each month, where every whole multiple earns another (default **25**). Run with no options to view current config. |
+| `/newtask` | anyone | `brief`, optional `at` (default **now**), optional `repeat` (default **once**), optional `description`, optional `bounty` (a 2-punto chore the creator can't complete). Both `at` and `repeat` autocomplete with a live preview. Posts a **public** confirmation so the family sees the new chore. |
+| `/pitchin` | anyone | Post a **pitch-in**: `brief`, optional `expires` (default **24h**), `puntos` each (default 1), `max_scorers`, `description`. Everyone who taps ✅ before it closes earns a punto. See [Pitch-ins & do-em-ups](#pitch-ins--do-em-ups). |
+| `/doemup` | anyone | Post a **do-em-up**: `brief`, optional `puntos` per ➕ (default 1), `deadline`, `point_limit`, `description`. Tap ➕ once per thing you did; the tally updates live. See [Pitch-ins & do-em-ups](#pitch-ins--do-em-ups). |
+| `/edit` | anyone | One command with a subcommand per type — **`/edit task`**, **`/edit pitchin`**, **`/edit doemup`** — each showing only its own fields (so `bounty` appears only on tasks, `max_scorers` only on pitch-ins, etc.). Change the `brief`, `at`/slot, `repeat`, `description`, puntos, cap, or close time; pick the item from autocomplete or paste its `id` from `/listtasks`. A schedule change to a **live** round applies from the next round. |
 | `/deletetask` | anyone | Permanently delete a task, pitch-in, or do-em-up (autocompletes all three; deleting a recurring game stops the whole series). |
 | `/listtasks` | anyone | List all tasks **plus pitch-ins (🤝) and do-em-ups (💪)** with their **`id`**, schedule, and state (next post / 🟢 open / next round) — **paged** with ◀/▶ buttons so every id stays reachable, and showing 🔔×_n_, the lifetime number of times each chore has had to be nagged. |
 | `/listopen` | anyone | Post a public checklist of everything **open right now** — pending chores plus live pitch-ins / do-em-ups — each an **inline jump link** to the original post where it's done (never a nag), grouped and ordered by when it's due. Cuts the scrollback when lots are doable any time of day. |
-| `/leaderboard` | anyone | Monthly **points** per person — one per chore, **two** per bounty, plus pitch-in / do-em-up points — with each past month's winner shown by their **⭐ stars**, and the month's bountiful **zone** (`month` defaults to current). |
+| `/leaderboard` | anyone | Monthly **puntos** per person — one per chore, **two** per bounty, plus pitch-in / do-em-up puntos — with each past month's winner shown by their **⭐ stars**, and the month's bountiful **zone** (`month` defaults to current). |
 | `/vitrine` | anyone | Gaze upon a collection of **trinkets** — the inert *objets d'art* earned at each month's end, one per whole multiple of the bar cleared, grouped by month. `user` defaults to yourself. |
-| `/farmhelp` | anyone | Quick reference for the commands, the `at`/`repeat` syntax, and the reactions. |
+| `/joblinhelp` | anyone | Quick reference for the commands, the `at`/`repeat` syntax, and the reactions. |
 | `/redeploy` | bot owner | `git pull`, `uv sync`, then restart the bot in place (same tmux pane, so the log continues). Reports the pull result and aborts without restarting if the pull or sync fails. See [Running & updating on a VPS](#running--updating-on-a-vps). |
 
 ### Examples
@@ -73,20 +77,20 @@ the family chores.
 ### Bounties, stars & trinkets
 - **Bounties** are chores you can't (or won't) do yourself. Create one with
   `/newtask brief:"Muck out the barn" bounty:true` (or toggle it on an existing
-  task with `/edit task task:<id> bounty:true`). A bounty is **worth 2 points**
+  task with `/edit task task:<id> bounty:true`). A bounty is **worth 2 puntos**
   and its **creator can't tap ✅** — if they try, the bot gently declines and
   leaves it for someone else. Bounty posts are tagged 💰 so everyone sees the prize.
-- **Points & stars** drive the `/leaderboard`. Every completed chore is a point;
-  bounties are two. At each month's end whoever has the most points wins and earns
+- **Puntos & stars** drive the `/leaderboard`. Every completed chore is a punto;
+  bounties are two. At each month's end whoever has the most puntos wins and earns
   a permanent **⭐ star**, shown next to their name on every future leaderboard
   (a tie shares the star). The current month is still up for grabs, so its star
   isn't awarded until the month closes. Stars are derived from the completion log,
   so an **undo** that voids a completion also updates the standings honestly.
 - **Trinkets 🖼️** are a *parallel* reward to the star: at each month's close, a
   worker earns one **inert** *objet d'art* into their `/vitrine` for **every whole
-  multiple** of the **bar** (`/farmconfig item_bar:`, default **25**) their monthly
-  points reached — 50 points on a 25 bar earns two. They cost no points and do
-  nothing — so the chore economy stays sealed and no points are ever created from
+  multiple** of the **bar** (`/joblinconfig item_bar:`, default **25**) their monthly
+  puntos reached — 50 puntos on a 25 bar earns two. They cost no puntos and do
+  nothing — so the chore economy stays sealed and no puntos are ever created from
   nothing. Each month a different **zone** is *in season*
   (the Bean Zone, the Vaults, the Menagerie, the Scriptorium…), chosen
   deterministically from the year-month and announced on the `/leaderboard`. The
@@ -99,36 +103,36 @@ the family chores.
   from a `sha256("trinket", guild, user, month, zone, idx)` seed, so the same
   collection comes back every time, with no stored award state and nothing to
   reconcile after an undo. The tables are blended from *Vaults of Vaarn* and *Flayed Sun*;
-  see `farmtracker/trinkets.py`.
+  see `joblin/trinkets.py`.
 
 ## Pitch-ins & do-em-ups
 
 Two lightweight, **post-now** task types for ad-hoc bursts of work — unlike chores
 they don't schedule or recur; you fire one off and the family piles on. Both award
-points to the same monthly **`/leaderboard`** as chores (a chore completion is
-worth 1 point).
+puntos to the same monthly **`/leaderboard`** as chores (a chore completion is
+worth 1 punto).
 
 - **`/pitchin`** — a shared call to action (a "laundry bonanza"). The bot posts it
-  and self-reacts ✅; **everyone who taps ✅ before it closes earns a point** — so a
+  and self-reacts ✅; **everyone who taps ✅ before it closes earns a punto** — so a
   bonanza with three pitcher-inners is +1 to all three. It closes at its `expires`
-  time (**default 24h**) or when the creator taps 🏁. Options: `points` (worth more
+  time (**default 24h**) or when the creator taps 🏁. Options: `puntos` (worth more
   than one each) and `max_scorers` (only the first *N* score, and it closes the
   moment it fills). Pull your ✅ back off before it closes and you drop out.
   - `/pitchin brief:"Laundry bonanza" expires:tonight`
-  - `/pitchin brief:"Stack the firewood" points:2 max_scorers:4`
+  - `/pitchin brief:"Stack the firewood" puntos:2 max_scorers:4`
 
-- **`/doemup`** — one point **per thing done** ("1 pt per thistle bush removed").
+- **`/doemup`** — one punto **per thing done** ("1 punto per thistle bush removed").
   The post carries **➕ / ➖** buttons: tap ➕ once for each one you do (➖ to fix a
   miscount) and the message **edits itself** to show a live per-person tally and
   running total. It stays open until an optional `deadline`, an optional
-  `point_limit` (auto-closes once that many points are tallied), or the creator
-  taps **🏁 End**. Option: `points` (per ➕).
+  `point_limit` (auto-closes once that many puntos are tallied), or the creator
+  taps **🏁 End**. Option: `puntos` (per ➕).
   - `/doemup brief:"Thistle bush removed"`
   - `/doemup brief:"Bale stacked" deadline:"tomorrow 18:00" point_limit:200`
 
 When a pitch-in or do-em-up closes, its post is rewritten in place as a one-line
 result (e.g. *"🤝 Laundry bonanza — pitched in! +1 each to Ann, Bo & Cy"*) and its
-points are written to the leaderboard. Both **survive restarts** like everything
+puntos are written to the leaderboard. Both **survive restarts** like everything
 else: the live state lives in the store, the do-em-up buttons are re-registered on
 startup, and each close is driven by the same 30-second tick as chore reminders —
 so a close that fell due while the bot was down simply fires on the next tick.
@@ -140,7 +144,7 @@ Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync                       # create the venv & install deps
 cp .env.example .env          # then paste your bot token into .env
-uv run python -m farmtracker  # run the bot
+uv run python -m joblin  # run the bot
 ```
 
 ## Running & updating on a VPS
@@ -149,7 +153,7 @@ On the server, launch the bot through the supervisor script **inside its tmux
 window** instead of running it directly:
 
 ```bash
-tmux new -s farmtracker       # (first time) make the window
+tmux new -s joblin       # (first time) make the window
 ./run.sh                      # pull + sync + run, and auto-restart on exit
 # Ctrl-B D to detach; the bot keeps running.
 ```
@@ -210,7 +214,7 @@ mid-tick is safe and the bot resumes cleanly on restart.
    Reactions, Manage Messages** (Manage Messages lets it tidy reactions on
    resolved tasks; if you configure a reminder role, also add **Mention
    @everyone/roles**). Permissions integer: `207936`.
-4. In your server, run `/farmconfig channel:#farm timezone:Europe/Berlin` first.
+4. In your server, run `/joblinconfig channel:#farm timezone:Europe/Berlin` first.
    - Tip: set `DEV_GUILD_ID` in `.env` to your server id so commands appear
      instantly while you test (global sync can take up to ~1h the first time).
 
@@ -227,28 +231,28 @@ mid-tick is safe and the bot resumes cleanly on restart.
 - **Storage** is a single JSON document (`data/store.json`) for config, tasks, and
   live pitch-ins / do-em-ups, plus an append-only JSONL **completion log**
   (`data/completions.jsonl`) for stats — chore completions and pitch-in / do-em-up
-  points both land there (the latter carry a `points` count), so one query totals
+  puntos both land there (the latter carry a `points` count), so one query totals
   the leaderboard. The bot is a single asyncio process, so concurrency safety is just an
   `asyncio.Lock` around each read-modify-write plus **atomic writes** (temp file
   + `fsync` + `os.replace`) so a crash can't corrupt the store. See the module
-  docstring in `farmtracker/store.py`. Swapping to SQLite later is easy if the
+  docstring in `joblin/store.py`. Swapping to SQLite later is easy if the
   stats grow.
 
 ### Layout
 ```
-farmtracker/
+joblin/
   models.py   # task schema, natural-language `at` parsing, `repeat` rules,
               #   DST-aware recurrence, and pitch-in / do-em-up render + tally
   store.py    # JSON store (asyncio.Lock + atomic writes) + completion log
   bot/        # the Discord bot, split by concern (re-exports a flat surface):
-    core.py        # FarmBot instance, the Store, shared constants
+    core.py        # JoblinBot instance, the Store, shared constants
     helpers.py     # small formatting + occurrence I/O helpers
     scheduler.py   # the 30s tick: fire tasks, post nags
     reactions.py   # reaction events: done/skip/ffwd/snooze, undo, requeue
-    claps.py       # 👏 bonus-point claps on finished work
-    games.py       # pitch-ins & do-em-ups (ad-hoc point events)
+    claps.py       # 👏 bonus-punto claps on finished work
+    games.py       # pitch-ins & do-em-ups (ad-hoc punto events)
     commands.py    # the slash commands + autocompletes
-    listing.py     # /listtasks, /listopen, /farmhelp + paginator
+    listing.py     # /listtasks, /listopen, /joblinhelp + paginator
     scoring.py     # /leaderboard, ⭐ stars, /vitrine
     admin.py       # /redeploy, error handler, entry point
   trinkets.py # the end-of-month objet-d'art generator + the vitrine (derived)
@@ -290,10 +294,10 @@ farmtracker/
   clapped). It rides on a ✅-completed chore as well as a closed **pitch-in** or
   **do-em-up** round — for a game the participants are its scorers/talliers, so one
   clap tips *all* of them. A tap from anyone who isn't a participant appends a
-  `clap` row (worth 1 point) to the completion log for each participant — capped at
+  `clap` row (worth 1 punto) to the completion log for each participant — capped at
   one clap per outsider, and ignored entirely from a participant. Undoing a chore's
   ✅ voids its bonus rows along with the completion (games have no undo; `/deletetask`
-  retires the button without touching already-awarded points). Only the most recent
+  retires the button without touching already-awarded puntos). Only the most recent
   finished post per task/game carries the button.
 - Editing a task's schedule recomputes its next post immediately — unless a
   reminder is **live right now**, in which case that occurrence is left alone and

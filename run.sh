@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Supervisor loop for farmtracker.
+# Supervisor loop for Joblin.
 #
 # Run this *inside* the bot's tmux window instead of launching the bot
 # directly:
 #
 #     ./run.sh                          # new way
-#     # uv run python -m farmtracker    # old way (no auto-update/restart)
+#     # uv run python -m joblin    # old way (no auto-update/restart)
 #
 # Each iteration pulls the latest code, syncs deps, and runs the bot in the
 # foreground. When the bot stops, the loop pulls again and restarts it — so a
@@ -29,10 +29,10 @@ while true; do
     echo "=== $(date '+%F %T') supervisor: uv sync ==="
     uv sync || echo "!!! uv sync failed — starting anyway"
 
-    echo "=== $(date '+%F %T') supervisor: starting farmtracker (Ctrl-C here to stop for good) ==="
-    uv run python -m farmtracker
+    echo "=== $(date '+%F %T') supervisor: starting Joblin (Ctrl-C here to stop for good) ==="
+    uv run python -m joblin
     code=$?
 
-    echo "=== $(date '+%F %T') supervisor: farmtracker exited (code $code); restarting in 3s ==="
+    echo "=== $(date '+%F %T') supervisor: Joblin exited (code $code); restarting in 3s ==="
     sleep 3
 done

@@ -22,11 +22,11 @@ from .helpers import guild_config
 
 
 # ---------------------------------------------------------------------------
-# Leaderboard scoring — points (bounties count double) and monthly ⭐ stars
+# Leaderboard scoring — puntos (bounties count double) and monthly ⭐ stars
 # ---------------------------------------------------------------------------
 def _completion_points(rec: dict) -> int:
-    """Points a logged completion is worth. Bounties record ``points: 2``; older
-    records predate the field and count as the normal 1 point."""
+    """Puntos a logged completion is worth. Bounties record ``points: 2``; older
+    records predate the field and count as the normal 1 punto."""
     p = rec.get("points")
     return int(p) if isinstance(p, (int, float)) and p > 0 else 1
 
@@ -55,7 +55,7 @@ def monthly_scores(records: list[dict], guild_id: int) -> dict[str, dict[int, di
 
 
 def star_counts(records: list[dict], guild_id: int, current_month: str) -> dict[int, int]:
-    """Stars per user: one for each *past* month they led on points (a tie shares
+    """Stars per user: one for each *past* month they led on puntos (a tie shares
     the star). The current (and any future) month isn't decided yet, so it's
     excluded — the title is still up for grabs until the month closes."""
     stars: dict[int, int] = {}
@@ -72,7 +72,7 @@ def star_counts(records: list[dict], guild_id: int, current_month: str) -> dict[
 
 
 def _guild_bar(cfg: Optional[dict]) -> int:
-    """The guild's trinket bar (monthly points to earn one), defaulted & sane."""
+    """The guild's trinket bar (monthly puntos to earn one), defaulted & sane."""
     try:
         return max(1, int(cfg.get("item_bar")))  # type: ignore[union-attr]
     except (TypeError, ValueError, AttributeError):
@@ -82,8 +82,8 @@ def _guild_bar(cfg: Optional[dict]) -> int:
 def vitrine_for(records: list[dict], guild_id: int, user_id: int, bar: int,
                 current_month: str) -> list[dict]:
     """Every trinket a user has earned: one deterministic roll per *whole multiple*
-    of ``bar`` their points reached, for each *past* month (50 pts against a
-    25-point bar → two). Like stars, it's derived from the log — the current
+    of ``bar`` their puntos reached, for each *past* month (50 puntos against a
+    25-punto bar → two). Like stars, it's derived from the log — the current
     month is still in play, so it's excluded. Sorted oldest→newest, idx 0…n−1
     within a month."""
     out: list[dict] = []
@@ -98,7 +98,7 @@ def vitrine_for(records: list[dict], guild_id: int, user_id: int, bar: int,
     return out
 
 
-@bot.tree.command(name="leaderboard", description="Monthly chore points & ⭐ stars")
+@bot.tree.command(name="leaderboard", description="Monthly chore puntos & ⭐ stars")
 @app_commands.describe(month="Month as YYYY-MM (defaults to the current month)")
 async def leaderboard(interaction: discord.Interaction, month: Optional[str] = None) -> None:
     snap = await store.snapshot()
@@ -138,14 +138,14 @@ async def leaderboard(interaction: discord.Interaction, month: Optional[str] = N
         badge = medals[i] if i < 3 else f"`{i + 1}.`"
         star = f" ⭐×{stars[uid]}" if stars.get(uid) else ""
         pts = ent["points"]
-        lines.append(f"{badge} <@{uid}> — **{pts} pt{'' if pts == 1 else 's'}**{star}")
+        lines.append(f"{badge} <@{uid}> — **{pts} punto{'' if pts == 1 else 's'}**{star}")
 
     total_pts = sum(ent["points"] for ent in bucket.values())
     total_chores = sum(ent["chores"] for ent in bucket.values())
     when = "this month" if month == current_month else f"in {month}"
     footer = (
         f"_{total_chores} chore{'' if total_chores == 1 else 's'} · "
-        f"{total_pts} pt{'' if total_pts == 1 else 's'} {when}._"
+        f"{total_pts} punto{'' if total_pts == 1 else 's'} {when}._"
     )
     if month == current_month:
         footer += "\n⭐ Whoever tops the board when the month ends earns a star."
@@ -215,13 +215,13 @@ async def vitrine(interaction: discord.Interaction, user: Optional[discord.Membe
     ent = monthly_scores(records, interaction.guild_id).get(current_month, {}).get(target.id)
     pts = ent["points"] if ent else 0
     secured = pts // bar
-    to_next = bar - pts % bar  # 1…bar: points until the next trinket tips over
+    to_next = bar - pts % bar  # 1…bar: puntos until the next trinket tips over
     zk = trinkets.zone_for_month(current_month)
     z = f"{trinkets.zone_emoji(zk)} {current_month}: **{trinkets.zone_label(zk)}** in season"
     if secured == 0:
-        foot = f"{z} — **{pts}/{bar} pts**, {to_next} to go for your first trinket"
+        foot = f"{z} — **{pts}/{bar} puntos**, {to_next} to go for your first trinket"
     else:
-        foot = (f"{z} — at **{pts} pts** you've secured "
+        foot = (f"{z} — at **{pts} puntos** you've secured "
                 f"**{secured} trinket{'' if secured == 1 else 's'}** ✨, "
                 f"**{to_next}** more for the next")
 

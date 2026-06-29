@@ -1,7 +1,7 @@
 [project]
-name = "farmtracker"
+name = "joblin"
 version = "0.1.0"
-description = "A Discord bot for small-scale farm chore logistics, reminders, and family gamification."
+description = "Joblin — a gamification framework for chores: a Discord bot for chore logistics, reminders, and a family puntos economy."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -12,4 +12,4 @@ dependencies = [
 
 # Intentionally no [build-system]: this is an application, not a library.
 # `uv` will just manage the virtualenv + dependencies. Run it with:
-#     uv run python -m farmtracker
+#     uv run python -m joblin

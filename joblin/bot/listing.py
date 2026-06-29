@@ -300,10 +300,10 @@ async def listopen(interaction: discord.Interaction) -> None:
     )
 
 
-@bot.tree.command(name="farmhelp", description="How to use farmtracker — commands, scheduling, and reactions")
-async def farmhelp(interaction: discord.Interaction) -> None:
+@bot.tree.command(name="joblinhelp", description="How to use Joblin — commands, scheduling, and reactions")
+async def joblinhelp(interaction: discord.Interaction) -> None:
     embed = discord.Embed(
-        title="🚜 farmtracker help",
+        title="🚜 Joblin help",
         description=(
             "Create one-off or recurring chores. When one is due I post it in the "
             "farm channel and self-react with buttons the family taps."
@@ -313,17 +313,17 @@ async def farmhelp(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="Commands",
         value=(
-            "• `/newtask` — add a chore (see scheduling below; `bounty:true` for a 2-pointer)\n"
+            "• `/newtask` — add a chore (see scheduling below; `bounty:true` for a 2-punto bounty)\n"
             "• `/pitchin` — group task: everyone who ✅s before it closes scores\n"
             "• `/doemup` — per-unit task: tap ➕ for each one you do\n"
             "• `/listtasks` — list chores with their ids (paged; 🔔×n = times nagged)\n"
             "• `/listopen` — post what's open right now, each a tap-through link to its post\n"
             "• `/edit` — change a task, pitch-in, or do-em-up (`/edit task|pitchin|doemup`)\n"
             "• `/deletetask` — remove a chore for good\n"
-            "• `/leaderboard` — monthly points ranking & ⭐ stars 🏆\n"
+            "• `/leaderboard` — monthly puntos ranking & ⭐ stars 🏆\n"
             "• `/vitrine` — your cabinet of month's-end trinkets 🖼️\n"
-            "• `/farmconfig` — channel, timezone, reminder role, trinket bar *(Manage Server)*\n"
-            "• `/farmhelp` — this message"
+            "• `/joblinconfig` — channel, timezone, reminder role, trinket bar *(Manage Server)*\n"
+            "• `/joblinhelp` — this message"
         ),
         inline=False,
     )
@@ -353,7 +353,7 @@ async def farmhelp(interaction: discord.Interaction) -> None:
             "↩️ **Undo** — appears after ✅/⏩/❌ to reverse it\n"
             "🔄 **Requeue** — appears on a completed chore; re-posts it right now\n"
             "👏 **Clap** — on a finished chore, pitch-in, or do-em-up; anyone who "
-            "*didn't* do it taps to tip every doer a bonus point (one clap each)"
+            "*didn't* do it taps to tip every doer a bonus punto (one clap each)"
         ),
         inline=False,
     )
@@ -361,17 +361,17 @@ async def farmhelp(interaction: discord.Interaction) -> None:
         name="💰 Bounties & ⭐ stars",
         value=(
             "Mark a chore you can't do yourself with `bounty:true`: it's worth "
-            "**2 points** and only **someone else** can tap ✅ on it. Every completed "
-            "chore is a point (bounties two); whoever leads the month's `/leaderboard` "
+            "**2 puntos** and only **someone else** can tap ✅ on it. Every completed "
+            "chore is a punto (bounties two); whoever leads the month's `/leaderboard` "
             "earns a permanent **⭐ star** shown there for keeps."
         ),
         inline=False,
     )
     embed.add_field(
-        name="Pitch-ins & do-em-ups (bonus points 🏆)",
+        name="Pitch-ins & do-em-ups (bonus puntos 🏆)",
         value=(
             "• `/pitchin brief:\"laundry bonanza\"` — everyone who taps ✅ before it "
-            "closes earns a point. Optional `expires` (default 24h), `points` each, "
+            "closes earns a punto. Optional `expires` (default 24h), `puntos` each, "
             "and `max_scorers` (only the first N score). 🏁 ends it early.\n"
             "• Add `repeat:` to either (same as a chore — `daily`, `weekdays`, "
             "`mon,thu`, `monthly on the 1st`) and it re-posts a fresh round each "
@@ -381,27 +381,27 @@ async def farmhelp(interaction: discord.Interaction) -> None:
             "expires:06:05 repeat:daily` opens 06:00–06:05 every day. The first round "
             "waits for that time instead of posting the moment you create it.\n"
             "• `/doemup brief:\"thistle bush removed\"` — tap ➕ once per one you did "
-            "(➖ to fix); the tally updates live. Optional `points` each, `deadline`, "
+            "(➖ to fix); the tally updates live. Optional `puntos` each, `deadline`, "
             "and `point_limit` (auto-closes at that total). 🏁 ends it.\n"
             "• Change one later with `/edit pitchin` / `/edit doemup` — retime (`at`), "
-            "rename, or adjust points/cap; a schedule change applies from the next "
+            "rename, or adjust puntos/cap; a schedule change applies from the next "
             "round.\n"
-            "Points from both feed the `/leaderboard` — and a closed round grows a "
-            "👏 anyone who sat it out can tap to tip every scorer a bonus point."
+            "Puntos from both feed the `/leaderboard` — and a closed round grows a "
+            "👏 anyone who sat it out can tap to tip every scorer a bonus punto."
         ),
         inline=False,
     )
     embed.add_field(
         name="🖼️ Trinkets & the vitrine",
         value=(
-            "Clear the month's **bar** of points (default **25**, set with "
-            "`/farmconfig item_bar:`) and when the month closes an inert **trinket** "
+            "Clear the month's **bar** of puntos (default **25**, set with "
+            "`/joblinconfig item_bar:`) and when the month closes an inert **trinket** "
             "— a rolled *objet d'art* — lands in your `/vitrine`; clear it several "
-            "times over (50 pts on a 25-pt bar) and you collect that many. Each "
+            "times over (50 puntos on a 25-punto bar) and you collect that many. Each "
             "month a different **zone** is *in season* (the Bean Zone, the Vaults, the "
             "Menagerie…), shown on the `/leaderboard`: ~7 in 10 of your trinkets are "
             "rolled from it, the rest stray in from other zones. Trinkets cost no "
-            "points and do nothing but delight; the ⭐ star still goes to the top scorer."
+            "puntos and do nothing but delight; the ⭐ star still goes to the top scorer."
         ),
         inline=False,
     )
@@ -417,7 +417,7 @@ __all__ = [
     "_chunk_rows",
     "_open_embeds",
     "_safe_link_label",
-    "farmhelp",
+    "joblinhelp",
     "listopen",
     "listtasks",
     "message_link",

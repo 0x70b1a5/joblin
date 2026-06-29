@@ -12,7 +12,7 @@ Task dict schema
     "guild_id":     int,            # discord server id
     "brief":        str,            # short text posted in the channel
     "description":  str | None,     # long text revealed by the info reaction
-    "bounty":       bool,           # worth 2 points; the creator can't complete it
+    "bounty":       bool,           # worth 2 puntos; the creator can't complete it
     "recurring":    bool,           # True => repeats, False => one-off
     "freq":         str,            # "once"|"days"|"weekly"|"monthly" (see below)
     "interval_days":int,            # >=1 for freq "days" (1 == daily), else 0
@@ -73,7 +73,7 @@ EMOJI_INFO = "ℹ️"
 EMOJI_DELETE = "❌"
 EMOJI_UNDO = "↩️"  # appears after a ✅/⏩/❌ action so it can be reverted
 EMOJI_REQUEUE = "🔄"  # appears on a ✅-completed post to re-fire the chore now
-EMOJI_CLAP = "👏"  # appears on a ✅-completed post; an outsider's tap tips its doer a bonus point
+EMOJI_CLAP = "👏"  # appears on a ✅-completed post; an outsider's tap tips its doer a bonus punto
 EMOJI_END = "🏁"  # creator-only "end now" on a pitch-in (✅) or do-em-up post
 EMOJI_HANDSHAKE = "🤝"  # header icon on a pitch-in post
 EMOJI_FLEX = "💪"  # header icon on a do-em-up post
@@ -582,13 +582,13 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
 
 
 # ===========================================================================
-# Pitch-ins and do-em-ups: post-now point events, optionally recurring.
+# Pitch-ins and do-em-ups: post-now punto events, optionally recurring.
 # ===========================================================================
 # These live in their own store sections (``pitchins`` / ``doemups``) rather
 # than ``tasks``, because they resolve by people reacting/clicking rather than
 # through the nag machinery: they are posted immediately by their slash command,
-# then close at an expiry/deadline, a point cap, or a creator's manual end.
-# Points they award are written to the same completion log as chores (with a
+# then close at an expiry/deadline, a punto cap, or a creator's manual end.
+# Puntos they award are written to the same completion log as chores (with a
 # ``points`` field) so a single ``/leaderboard`` totals both.
 #
 # Recurrence (optional)
@@ -604,7 +604,7 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
 #                                  #   explicit expires/deadline; None means the
 #                                  #   round runs until the next scheduled slot.
 # When a recurring game's round auto-closes (expiry/deadline/cap) it awards
-# points, rewrites its post as a result line, then goes dormant with ``next_due``
+# puntos, rewrites its post as a result line, then goes dormant with ``next_due``
 # set; the scheduler re-posts a fresh round at that instant. A creator's 🏁 ends
 # the whole series instead. ``recurrence_of`` reads a game just like a task.
 #
@@ -623,7 +623,7 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
 #     "description": str | None,
 #     "created_by":  int,            # only this user's 🏁 ends it early
 #     "created_at":  str,            # ISO-8601 UTC
-#     "points_each": int,            # points every pitcher-inner earns (>=1)
+#     "points_each": int,            # puntos every pitcher-inner earns (>=1)
 #     "max_scorers": int | None,     # optional cap on how many can score
 #     "expires_at":  str | None,     # ISO-8601 UTC; auto-closes at/after this
 #                                    #   (None only while dormant between rounds)
@@ -636,17 +636,17 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
 #
 # do-em-up dict schema
 # --------------------
-# A per-unit grind ("1 pt per thistle bush"): each ➕ adds one unit to that
-# person's tally for ``points_each`` points; ➖ corrects a mistake. The post
+# A per-unit grind ("1 punto per thistle bush"): each ➕ adds one unit to that
+# person's tally for ``points_each`` puntos; ➖ corrects a mistake. The post
 # edits itself to show the running tallies. Closes at an optional ``deadline``,
-# the creator's 🏁, or — if ``point_limit`` is set — once that many points have
+# the creator's 🏁, or — if ``point_limit`` is set — once that many puntos have
 # been tallied in total.
 # {
 #     …same id/guild_id/channel_id/message_id/brief/description/created_by/
 #       created_at/points_each/ended fields as above…
 #     "deadline":    str | None,     # ISO-8601 UTC auto-close, or None (open /
 #                                    #   dormant between rounds)
-#     "point_limit": int | None,     # optional total-points cap
+#     "point_limit": int | None,     # optional total-puntos cap
 #     "tallies":     dict,           # {str(user_id): {"name": str, "count": int}}
 #     …plus the optional recurrence columns described above…
 # }
@@ -714,7 +714,7 @@ def render_pitchin(p: dict, *, final: bool = False) -> str:
 
 # --- Do-em-ups -------------------------------------------------------------
 def doemup_total_points(d: dict) -> int:
-    """Total points tallied so far = (sum of unit counts) × points_each."""
+    """Total puntos tallied so far = (sum of unit counts) × points_each."""
     units = sum(e.get("count", 0) for e in d.get("tallies", {}).values())
     return units * d.get("points_each", 1)
 
@@ -770,12 +770,12 @@ def render_doemup(d: dict, *, final: bool = False) -> str:
         if parts:
             return (
                 f"{EMOJI_FLEX} ~~**{brief}**~~ — done!\n"
-                f"{tally_line}  —  **{_plural(total, 'pt')}** logged"
+                f"{tally_line}  —  **{_plural(total, 'punto')}** logged"
             )
         return f"{EMOJI_FLEX} ~~**{brief}**~~ — closed with nothing tallied."
 
     limit = d.get("point_limit")
-    head = f"{total}/{limit} pts" if limit else f"**{_plural(total, 'pt')}**"
+    head = f"{total}/{limit} puntos" if limit else f"**{_plural(total, 'punto')}**"
     dl = d.get("deadline")
     closes = f" — closes {discord_ts(from_iso(dl), 'R')}" if dl else ""
     desc = f"\n{d['description']}" if d.get("description") else ""

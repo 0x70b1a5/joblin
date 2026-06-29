@@ -3,13 +3,13 @@
 The deal
 --------
 At the close of each month, a worker earns one inert, decorative **trinket** for
-*every whole multiple* of the guild's **bar** (``/farmconfig item_bar``, default
-:data:`DEFAULT_BAR`) their monthly points reached — clear it once for one, twice
-over (50 points against a 25-point bar) for two. Each trinket draws its own
+*every whole multiple* of the guild's **bar** (``/joblinconfig item_bar``, default
+:data:`DEFAULT_BAR`) their monthly puntos reached — clear it once for one, twice
+over (50 puntos against a 25-punto bar) for two. Each trinket draws its own
 **zone**: the month's featured ("in-season") zone is favoured (~70%), but the odd
 one strays in from another — a rotating *bonus*, not a monopoly. A trinket has no
-mechanical effect and costs no points; it is a milestone reward sitting *beside*
-the ⭐ star, not a purchase. The chore economy stays sealed: points are never
+mechanical effect and costs no puntos; it is a milestone reward sitting *beside*
+the ⭐ star, not a purchase. The chore economy stays sealed: puntos are never
 spent, so none are ever created from nothing.
 
 Why it's all derived, never stored
@@ -53,7 +53,7 @@ import hashlib
 import random
 from typing import Optional
 
-DEFAULT_BAR = 25  # monthly points needed to earn a trinket, unless reconfigured
+DEFAULT_BAR = 25  # monthly puntos needed to earn a trinket, unless reconfigured
 
 # A single trinket's chance of being rolled from the month's featured ("in-season")
 # zone. The remaining ~30% stray in from one of the *other* zones, drawn uniformly —
@@ -431,7 +431,7 @@ def zone_blurb(ym: str, bar: int, *, past: bool = False) -> str:
     if past:
         return f"{z['emoji']} _{ym} was {z['name']} — {z['blurb']}._"
     return (
-        f"{z['emoji']} _{ym}: **{z['name']}** is in season — every **{bar} pts** you "
+        f"{z['emoji']} _{ym}: **{z['name']}** is in season — every **{bar} puntos** you "
         f"clear earns a trinket, most from it, the odd one straying in from afar._"
     )
 
@@ -549,8 +549,8 @@ def zone_pick_for(guild_id: int, user_id: int, ym: str, idx: int) -> tuple[str, 
 def roll_for(guild_id: int, user_id: int, ym: str, idx: int = 0) -> dict:
     """The deterministic trinket a worker earns as their ``idx``-th award in ``ym``.
 
-    A worker earns one trinket per whole multiple of the bar (50 pts against a
-    25-point bar → two); ``idx`` (0-based) picks which one. Each trinket draws its
+    A worker earns one trinket per whole multiple of the bar (50 puntos against a
+    25-punto bar → two); ``idx`` (0-based) picks which one. Each trinket draws its
     own zone via :func:`zone_pick_for` — the featured zone ~70% of the time, an
     off-season zone the rest — then rolls an item from it. Same inputs → same
     trinket, forever; it carries its month, index, picked zone, and season flag.

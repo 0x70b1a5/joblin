@@ -28,11 +28,11 @@ from .helpers import (
 # ---------------------------------------------------------------------------
 # A finished post grows a 👏 button so the rest of the family can cheer the doers
 # on: a tap from anyone who *didn't* take part tips every participant a +1 bonus
-# point — capped at one clap per outsider. The same button rides a ✅-completed
+# punto — capped at one clap per outsider. The same button rides a ✅-completed
 # chore (participant = the completer) and a closed pitch-in / do-em-up round
 # (participants = its scorers / talliers), so one clap can tip several people at
 # once. Bonuses are written to the same completion log as chores (kind "clap",
-# points 1), so /leaderboard totals them like any other point, and undoing a
+# points 1), so /leaderboard totals them like any other punto, and undoing a
 # chore's ✅ retracts them (games have no undo). Like ↩️/🔄, the table is keyed by
 # the finished post's id, survives restarts, and only the most recent finished
 # post per task/game carries a live 👏.
@@ -66,7 +66,7 @@ def clap_status(rec: dict) -> str:
     parts = rec["participants"]
     names = ", ".join(p["user_name"] for p in parts)
     each = " each" if len(parts) > 1 else ""
-    return f"{rec['status']}\n👏 ×{n} · +{n} pt{each} to {names}"
+    return f"{rec['status']}\n👏 ×{n} · +{n} punto{each} to {names}"
 
 
 def _game_participants(event: dict, kind: str) -> list[dict]:
@@ -123,7 +123,7 @@ async def _arm_game_clap(
     event: dict, kind: str, status: str, channel: discord.abc.Messageable
 ) -> None:
     """Arm a 👏 on a just-finalized pitch-in / do-em-up round so an outsider can
-    tip its scorers a bonus point each. No-op when the round closed with nobody in
+    tip its scorers a bonus punto each. No-op when the round closed with nobody in
     (or its post is gone). A recurring game's next round retires this one's 👏 the
     same way a chore's next completion does — keyed on the shared game id."""
     participants = _game_participants(event, kind)
@@ -139,7 +139,7 @@ async def _handle_clap(
     payload: discord.RawReactionActionEvent, channel: discord.abc.Messageable
 ) -> None:
     """A 👏 on a ✅-completed post. From a non-participant it awards every
-    participant a +1 bonus point (once per outsider) and shows the tally; a
+    participant a +1 bonus punto (once per outsider) and shows the tally; a
     participant clapping their own finish is ignored."""
     snap = await store.snapshot()
     rec0 = snap["claps"].get(str(payload.message_id))

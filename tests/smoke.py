@@ -15,15 +15,15 @@ import sys
 import tempfile
 from zoneinfo import ZoneInfo
 
-# Make `farmtracker` importable when run straight from the repo (the package
+# Make `joblin` importable when run straight from the repo (the package
 # isn't pip-installed; running a script puts tests/ — not the root — on path).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 # Importing the bot module runs every @bot.tree.command decorator and builds
-# the FarmBot instance — a real smoke test of the command definitions.
-import farmtracker.bot  # noqa: E402, F401
-from farmtracker import models as m  # noqa: E402
-from farmtracker.store import Store  # noqa: E402
+# the JoblinBot instance — a real smoke test of the command definitions.
+import joblin.bot  # noqa: E402, F401
+from joblin import models as m  # noqa: E402
+from joblin.store import Store  # noqa: E402
 
 UTC = dt.timezone.utc
 
@@ -84,7 +84,7 @@ def test_schedule_now_recurring_fires_today() -> None:
     # End-to-end: `at:"now"` through the command's scheduler-field builder must
     # land its first fire at/just-before now for every recurrence kind, so the
     # 30s scheduler loop posts it on the next tick rather than 24h+ later.
-    from farmtracker.bot.commands import schedule_from_rule
+    from joblin.bot.commands import schedule_from_rule
     tz = ZoneInfo("Europe/Berlin")
     now = dt.datetime(2026, 6, 19, 13, 5, 30, tzinfo=tz).astimezone(UTC)  # Friday 13:05:30
     for repeat in ("daily", "every 2 days", "fri", "monthly"):
@@ -243,7 +243,7 @@ def test_oneoff_parse() -> None:
 
 
 def test_can_undo() -> None:
-    from farmtracker.bot import can_undo
+    from joblin.bot import can_undo
 
     rec = {"recurring": True, "pending": {"due_at": "2026-06-14T06:00:00+00:00", "message_ids": [1]}}
     # recurring complete/skip: only while no new occurrence has fired, task alive.
@@ -431,7 +431,7 @@ class FakeInteraction:
 
 async def _game_setup(d):
     """A fresh store wired into the bot module, a fake farm channel, and config."""
-    import farmtracker.bot as bot
+    import joblin.bot as bot
 
     st = Store(pathlib.Path(d) / "store.json", pathlib.Path(d) / "log.jsonl")
     st.load()
@@ -447,7 +447,7 @@ async def _game_setup(d):
 
 async def test_pitchin_lifecycle() -> None:
     """Post a pitch-in, two people ✅, one un-✅s, a non-creator 🏁 is ignored,
-    then the creator 🏁 closes it and awards a point to whoever's still in."""
+    then the creator 🏁 closes it and awards a punto to whoever's still in."""
     with tempfile.TemporaryDirectory() as d:
         bot, st, ch = await _game_setup(d)
         now = m.now_utc()
@@ -474,7 +474,7 @@ async def test_pitchin_lifecycle() -> None:
         await bot.on_raw_reaction_add(FakePayload(mid, m.EMOJI_END, user_id=42, member=FakeMember(42, "Pat")))
         assert pid in (await st.snapshot())["pitchins"], "only the creator ends a pitch-in"
 
-        # The creator 🏁 closes it: Pat earns 1 point, the post is finalized.
+        # The creator 🏁 closes it: Pat earns 1 punto, the post is finalized.
         await bot.on_raw_reaction_add(FakePayload(mid, m.EMOJI_END, user_id=1, member=FakeMember(1, "Boss")))
         snap = await st.snapshot()
         assert pid not in snap["pitchins"] and str(mid) not in snap["game_messages"]
@@ -489,7 +489,7 @@ async def test_pitchin_lifecycle() -> None:
 
 async def test_pitchin_cap_and_points() -> None:
     """max_scorers closes the pitch-in the instant it fills; points_each>1 pays
-    each scorer that many points."""
+    each scorer that many puntos."""
     with tempfile.TemporaryDirectory() as d:
         bot, st, ch = await _game_setup(d)
         now = m.now_utc()
@@ -529,7 +529,7 @@ async def test_pitchin_expiry() -> None:
 
 async def test_doemup_lifecycle() -> None:
     """Drive the do-em-up buttons: ➕ tallies live, ➖ corrects, a non-creator End
-    is refused, the creator End closes it and awards count×points, and the points
+    is refused, the creator End closes it and awards count×puntos, and the puntos
     land on the unified /leaderboard."""
     with tempfile.TemporaryDirectory() as d:
         bot, st, ch = await _game_setup(d)
@@ -570,13 +570,13 @@ async def test_doemup_lifecycle() -> None:
         assert all(r["kind"] == "doemup" for r in st.read_completions())
         assert "done!" in ch.msgs[mid].content
 
-        # /leaderboard (the upstream points + ⭐ stars board) totals those points:
-        # Pat leads with 5, Bo has 2, footer counts 2 records · 7 pts.
+        # /leaderboard (the upstream puntos + ⭐ stars board) totals those puntos:
+        # Pat leads with 5, Bo has 2, footer counts 2 records · 7 puntos.
         month = now.astimezone(ZoneInfo("Europe/Berlin")).strftime("%Y-%m")
         inter = FakeInteraction(user=FakeUser(1, "Boss"))
         await bot.leaderboard.callback(inter, month=month)
-        assert "<@42> — **5 pts**" in inter.response.content
-        assert "7 pts this month" in inter.response.content
+        assert "<@42> — **5 puntos**" in inter.response.content
+        assert "7 puntos this month" in inter.response.content
 
 
 async def test_doemup_limit_and_deadline() -> None:
@@ -937,7 +937,7 @@ async def test_game_commands() -> None:
         # No config for guild 2 -> refuses and posts nothing.
         inter = FakeInteraction(guild_id=2, user=FakeUser(1, "Boss"))
         await bot.pitchin.callback(inter, brief="Nope")
-        assert "farmconfig" in inter.response.content
+        assert "joblinconfig" in inter.response.content
         assert not (await st.snapshot())["pitchins"]
 
         # Happy path: default 24h expiry; posts and self-reacts ✅ + 🏁.
@@ -979,7 +979,7 @@ async def test_lifecycle_and_snooze() -> None:
     """Drive the real reaction handlers end-to-end against the fake channel:
     fire a weekly task, ✅-complete it (must roll to the next weekday), then
     ⏩-open a snooze panel and pick '2 days' from it."""
-    import farmtracker.bot as bot
+    import joblin.bot as bot
 
     with tempfile.TemporaryDirectory() as d:
         st = Store(pathlib.Path(d) / "store.json", pathlib.Path(d) / "log.jsonl")
@@ -1060,7 +1060,7 @@ async def test_legacy_migration() -> None:
     """A store written by the OLD schema — tasks with no freq/weekdays/monthdays,
     and no top-level snooze_panels key — must load and run without a hiccup, and
     upgrade in place when edited. This guards the family's existing data."""
-    import farmtracker.bot as bot
+    import joblin.bot as bot
 
     tzname = "Europe/Berlin"
     tz = ZoneInfo(tzname)
@@ -1163,7 +1163,7 @@ async def test_requeue() -> None:
     """A ✅-completed post grows a 🔄 button; tapping it re-fires the chore right
     now as a fresh occurrence, rolls on normally when finished, and declines
     while another occurrence is already live."""
-    import farmtracker.bot as bot
+    import joblin.bot as bot
 
     with tempfile.TemporaryDirectory() as d:
         st = Store(pathlib.Path(d) / "store.json", pathlib.Path(d) / "log.jsonl")
@@ -1232,9 +1232,9 @@ async def test_requeue() -> None:
 
 async def test_claps() -> None:
     """A ✅-completed post grows a 👏 button; an outsider's tap tips the doer a
-    bonus point (one per outsider), a participant's own 👏 is ignored, and undoing
+    bonus punto (one per outsider), a participant's own 👏 is ignored, and undoing
     the ✅ retracts both the completion and every clap bonus."""
-    import farmtracker.bot as bot
+    import joblin.bot as bot
 
     with tempfile.TemporaryDirectory() as d:
         st = Store(pathlib.Path(d) / "store.json", pathlib.Path(d) / "log.jsonl")
@@ -1298,7 +1298,7 @@ async def test_claps() -> None:
         month = now.astimezone(tz).strftime("%Y-%m")
         inter = FakeInteraction(user=FakeUser(1, "Boss"))
         await bot.leaderboard.callback(inter, month=month)
-        assert "<@42> — **3 pts**" in inter.response.content
+        assert "<@42> — **3 puntos**" in inter.response.content
 
         # Undoing the ✅ retracts the completion AND every clap bonus.
         await bot.on_raw_reaction_add(FakePayload(posted, "↩️", member=FakeMember(42, "Pat")))
@@ -1310,7 +1310,7 @@ async def test_claps() -> None:
 
 async def test_game_claps() -> None:
     """A closed pitch-in / do-em-up round grows a 👏 button; an outsider's tap tips
-    *every* scorer a bonus point (one clap per outsider), and a scorer's own 👏 is
+    *every* scorer a bonus punto (one clap per outsider), and a scorer's own 👏 is
     ignored."""
     with tempfile.TemporaryDirectory() as d:
         bot, st, ch = await _game_setup(d)
@@ -1379,7 +1379,7 @@ async def test_game_claps() -> None:
 async def test_requeue_oneoff() -> None:
     """A completed one-off is gone from the store; 🔄 rebuilds it from the saved
     snapshot and re-fires it."""
-    import farmtracker.bot as bot
+    import joblin.bot as bot
 
     with tempfile.TemporaryDirectory() as d:
         st = Store(pathlib.Path(d) / "store.json", pathlib.Path(d) / "log.jsonl")
@@ -1417,9 +1417,9 @@ async def test_requeue_oneoff() -> None:
 
 
 def test_points_and_stars() -> None:
-    """Pure scoring helpers: points (bounties double, legacy → 1) and the monthly
+    """Pure scoring helpers: puntos (bounties double, legacy → 1) and the monthly
     ⭐ stars derived from past months only (ties share the star)."""
-    from farmtracker.bot import _completion_points, monthly_scores, star_counts
+    from joblin.bot import _completion_points, monthly_scores, star_counts
 
     assert _completion_points({}) == 1  # legacy record with no 'points' field
     assert _completion_points({"points": 2}) == 2
@@ -1451,8 +1451,8 @@ def test_points_and_stars() -> None:
 
 
 async def test_bounty() -> None:
-    """A bounty is worth 2 points and its creator can't claim it; anyone else can."""
-    import farmtracker.bot as bot
+    """A bounty is worth 2 puntos and its creator can't claim it; anyone else can."""
+    import joblin.bot as bot
 
     with tempfile.TemporaryDirectory() as d:
         st = Store(pathlib.Path(d) / "store.json", pathlib.Path(d) / "log.jsonl")
@@ -1488,7 +1488,7 @@ async def test_bounty() -> None:
         assert st.read_completions() == [], "a blocked self-claim logs nothing"
         assert any("your** bounty" in (msg.content or "") for msg in ch.msgs.values())
 
-        # Someone else claims it -> completed and worth 2 points.
+        # Someone else claims it -> completed and worth 2 puntos.
         await bot.on_raw_reaction_add(
             FakePayload(posted, "✅", user_id=2, member=FakeMember(2, "Pat"))
         )
@@ -1500,7 +1500,7 @@ async def test_bounty() -> None:
 
 def test_trinkets() -> None:
     import random
-    from farmtracker import trinkets as T
+    from joblin import trinkets as T
 
     # Determinism is the whole foundation: identical inputs -> identical trinket,
     # even across processes/restarts (sha256 seed, not the salted builtin hash).
@@ -1531,8 +1531,8 @@ def test_trinkets() -> None:
 
 
 def test_vitrine_award() -> None:
-    import farmtracker.bot as B
-    from farmtracker import trinkets as T
+    import joblin.bot as B
+    from joblin import trinkets as T
 
     # Bar handling: explicit, defaulted, and junk all resolve sanely.
     assert B._guild_bar({"item_bar": 40}) == 40
@@ -1555,13 +1555,13 @@ def test_vitrine_award() -> None:
     assert won[0]["display"] == B.vitrine_for(recs, 1, 5, 3, "2026-03")[0]["display"]
 
     # Multiples: each whole multiple of the bar earns another trinket from that
-    # month. User 5 cleared 3 pts in 2026-01 → three at a 1-pt bar (idx 0,1,2),
-    # one at a 2-pt bar (floor(3/2)), zero once the bar exceeds the score.
+    # month. User 5 cleared 3 puntos in 2026-01 → three at a 1-punto bar (idx 0,1,2),
+    # one at a 2-punto bar (floor(3/2)), zero once the bar exceeds the score.
     many = B.vitrine_for(recs, 1, 5, 1, "2026-03")
-    assert [t["month"] for t in many] == ["2026-01"] * 3, "3 pts / 1-pt bar → 3 trinkets"
+    assert [t["month"] for t in many] == ["2026-01"] * 3, "3 puntos / 1-punto bar → 3 trinkets"
     assert [t["idx"] for t in many] == [0, 1, 2], "indexed 0,1,2 within the month"
     assert len(B.vitrine_for(recs, 1, 5, 2, "2026-03")) == 1, "floor(3/2) = 1"
-    assert B.vitrine_for(recs, 1, 5, 4, "2026-03") == [], "3 pts under a 4-pt bar earns none"
+    assert B.vitrine_for(recs, 1, 5, 4, "2026-03") == [], "3 puntos under a 4-punto bar earns none"
 
     # Each trinket is deterministic and wears the zone its own weighted draw chose
     # (the 70/30 bonus — see test_zone_pick), extras included, stable across calls.
@@ -1575,7 +1575,7 @@ def test_zone_pick() -> None:
     """Each trinket draws its zone independently: the month's featured zone with
     probability FEATURED_WEIGHT (~0.70), else an off-season zone uniformly — a
     bonus, not a monopoly. Deterministic per (guild, user, month, idx)."""
-    from farmtracker import trinkets as T
+    from joblin import trinkets as T
 
     ym = "2026-06"
     featured = T.zone_for_month(ym)
@@ -1807,7 +1807,7 @@ async def test_edit_games() -> None:
             recurrence=None, duration_secs=None,
         )
         inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
-        await bot.edit_doemup.callback(inter, event=did, brief="New name", points=3)
+        await bot.edit_doemup.callback(inter, event=did, brief="New name", puntos=3)
         dd = (await st.snapshot())["doemups"][did]
         assert dd["brief"] == "New name" and dd["points_each"] == 3
         assert "New name" in ch.msgs[msg.id].content, "live post re-rendered"
