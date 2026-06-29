@@ -22,6 +22,7 @@ from .helpers import (
     safe_delete,
 )
 from .games import sweep_games
+from .backup import run_daily_backups
 
 
 
@@ -50,6 +51,7 @@ async def scheduler() -> None:
             log.exception("scheduler error on task %s", tid)
 
     await sweep_games(now, snap)
+    await run_daily_backups(now, snap)
 
 
 @scheduler.before_loop

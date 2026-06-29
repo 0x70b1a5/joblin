@@ -98,20 +98,22 @@ def vitrine_for(records: list[dict], guild_id: int, user_id: int, bar: int,
     return out
 
 
-@bot.tree.command(name="leaderboard", description="Monthly chore puntos & ⭐ stars")
-@app_commands.describe(month="Month as YYYY-MM (defaults to the current month)")
-async def leaderboard(interaction: discord.Interaction, month: Optional[str] = None) -> None:
-    snap = await store.snapshot()
-    cfg = guild_config(snap, interaction.guild_id)
+def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
+                      month: Optional[str] = None) -> tuple[str, bool]:
+    """Render the leaderboard message for ``guild_id`` and ``month``.
+
+    Returns ``(text, is_empty)`` where ``is_empty`` is True when no chores were
+    logged for the month (the slash command shows that variant ephemerally).
+    Pure apart from reading the clock — shared by the ``/leaderboard`` command
+    and the nightly auto-post in ``backup.py``."""
     tz = ZoneInfo(cfg["timezone"]) if cfg and cfg.get("timezone") else UTC
     current_month = now_utc().astimezone(tz).strftime("%Y-%m")
     bar = _guild_bar(cfg)
     if month is None:
         month = current_month
 
-    records = store.read_completions()
-    months = monthly_scores(records, interaction.guild_id)
-    stars = star_counts(records, interaction.guild_id, current_month)
+    months = monthly_scores(records, guild_id)
+    stars = star_counts(records, guild_id, current_month)
 
     # All-time display names so a star holder shows even when idle this month.
     names = {uid: ent["name"] for bucket in months.values() for uid, ent in bucket.items()}
@@ -126,10 +128,7 @@ async def leaderboard(interaction: discord.Interaction, month: Optional[str] = N
                + trinkets.zone_blurb(month, bar, past=month < current_month))
         if star_line:
             msg += "\n\n" + star_line
-        await interaction.response.send_message(
-            msg, ephemeral=True, allowed_mentions=NO_PINGS
-        )
-        return
+        return msg, True
 
     ranking = sorted(bucket.items(), key=lambda kv: (-kv[1]["points"], kv[1]["name"].lower()))
     medals = ["🥇", "🥈", "🥉"]
@@ -155,7 +154,17 @@ async def leaderboard(interaction: discord.Interaction, month: Optional[str] = N
     if star_line:
         msg += "\n\n" + star_line
     msg += "\n\n" + footer
-    await interaction.response.send_message(msg, allowed_mentions=NO_PINGS)
+    return msg, False
+
+
+@bot.tree.command(name="leaderboard", description="Monthly chore puntos & ⭐ stars")
+@app_commands.describe(month="Month as YYYY-MM (defaults to the current month)")
+async def leaderboard(interaction: discord.Interaction, month: Optional[str] = None) -> None:
+    snap = await store.snapshot()
+    cfg = guild_config(snap, interaction.guild_id)
+    records = store.read_completions()
+    msg, empty = build_leaderboard(records, interaction.guild_id, cfg, month)
+    await interaction.response.send_message(msg, ephemeral=empty, allowed_mentions=NO_PINGS)
 
 
 @bot.tree.command(name="vitrine", description="Gaze upon a collection of trinkets won at month's end")
@@ -233,6 +242,7 @@ __all__ = [
     "_completion_points",
     "_guild_bar",
     "_rec_month",
+    "build_leaderboard",
     "leaderboard",
     "monthly_scores",
     "star_counts",

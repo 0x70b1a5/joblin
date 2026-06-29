@@ -50,7 +50,8 @@ Everything keys off `store["messages"][message_id] → task_id`, so reactions ke
 | `trinkets.py` | Deterministic end-of-month trinket generator + vitrine (SHA256-seeded; never builtin `hash()`). |
 | `bot/core.py` | Shared singletons: the `JoblinBot`, the `store`, constants, timezone list. Dependency-free to avoid import cycles. |
 | `bot/__init__.py` | Wires submodules together (decorator registration), flat re-export, store hot-swap for tests. Top docstring = the occurrence/undo lifecycle. |
-| `bot/scheduler.py` | The 30s tick: fire due tasks, send nags, sweep games. |
+| `bot/scheduler.py` | The 30s tick: fire due tasks, send nags, sweep games, run nightly backups. |
+| `bot/backup.py` | Nightly (~23:59 guild-local) self-backup: if the completion log changed since the last run, zip `store.json` + `completions.jsonl` and post it to the channel as an attachment, then auto-post the leaderboard. Restart-safe via a persisted `next_backup_at`. |
 | `bot/reactions.py` | Raw-reaction dispatcher → per-emoji handlers (done/snooze/info/skip/undo/requeue/clap). |
 | `bot/commands.py` | `/joblinconfig`, `/newtask`, `/deletetask`, `/pitchin`, `/doemup`, the `/edit` group, and `schedule_from_rule` (turns rule+`at` into schedule fields). |
 | `bot/games.py` | Pitch-ins & do-em-ups (ad-hoc punto events): posting, button views (`DoEmUpButton`), closing on expiry/cap/deadline/manual end. |

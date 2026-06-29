@@ -46,18 +46,19 @@ from . import core
 from . import helpers
 from . import claps
 from . import games
+from . import scoring
+from . import backup
 from . import scheduler
 from . import reactions
 from . import commands
 from . import listing
-from . import scoring
 from . import admin
 
 # Re-export every submodule's public surface (incl. the ``main`` entry point
 # used by __main__.py) so `import joblin.bot as bot; bot.<name>` and the
 # smoke tests keep resolving exactly as before the split.
-_SUBMODULES = (core, helpers, claps, games, scheduler, reactions,
-               commands, listing, scoring, admin)
+_SUBMODULES = (core, helpers, claps, games, scoring, backup, scheduler,
+               reactions, commands, listing, admin)
 for _mod in _SUBMODULES:
     for _name in getattr(_mod, "__all__", ()):
         globals()[_name] = getattr(_mod, _name)

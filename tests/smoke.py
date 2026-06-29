@@ -356,12 +356,15 @@ class FakeChannel:
         self.deleted: list = []
         self.cleared: list = []
         self.cleared_emoji: list = []
+        self.files: list = []  # discord.File objects passed to send(file=...)
         self._next = 1000
 
     async def send(self, content=None, allowed_mentions=None, **kw) -> FakeMessage:
         self._next += 1
         msg = FakeMessage(self._next, self)
         msg.content = content
+        if kw.get("file") is not None:
+            self.files.append(kw["file"])
         self.msgs[msg.id] = msg
         return msg
 
@@ -1849,6 +1852,88 @@ async def test_edit_games() -> None:
         assert "nothing to change" in inter.response.content.lower()
 
 
+def test_leaderboard_text() -> None:
+    """build_leaderboard renders the board and flags the empty-month case (it's
+    the shared core of /leaderboard and the nightly auto-post)."""
+    import joblin.bot as bot
+
+    cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "item_bar": 25}
+    recs = [
+        {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat", "points": 2},
+        {"guild_id": 1, "month": "2026-04", "user_id": 2, "user_name": "Sam"},
+    ]
+    text, empty = bot.build_leaderboard(recs, 1, cfg, "2026-04")
+    assert not empty
+    assert "Chore leaderboard — 2026-04" in text
+    assert "<@1>" in text and "<@2>" in text
+    # A month with nothing logged → empty flag set, gentle nudge shown.
+    text2, empty2 = bot.build_leaderboard(recs, 1, cfg, "2026-03")
+    assert empty2 and "No chores logged" in text2
+    # Another guild's records never bleed in.
+    _, empty3 = bot.build_leaderboard(recs, 9, cfg, "2026-04")
+    assert empty3
+
+
+async def test_daily_backup() -> None:
+    """Nightly backup: arms on first sight, fires once the deadline passes *and*
+    the log changed (posting a zip + leaderboard), and stays quiet otherwise."""
+    import io
+    import zipfile
+    import joblin.bot as bot
+
+    with tempfile.TemporaryDirectory() as d:
+        _, st, ch = await _game_setup(d)
+        ym = m.now_utc().astimezone(ZoneInfo("Europe/Berlin")).strftime("%Y-%m")
+
+        # 1) First tick on a ready guild only *arms* the schedule — no post.
+        now = m.now_utc()
+        await bot.run_daily_backups(now, await st.snapshot())
+        armed = (await st.snapshot())["configs"]["1"]["next_backup_at"]
+        assert armed and m.from_iso(armed) > now, "next backup armed for the future"
+        assert not ch.msgs and not ch.files, "arming must not post anything"
+
+        # 2) Deadline due + a fresh completion → it fires.
+        async with st.txn() as data:
+            data["configs"]["1"]["next_backup_at"] = m.to_iso(now - dt.timedelta(minutes=1))
+        await st.log_completion(
+            {"id": "c1", "guild_id": 1, "month": ym, "user_id": 1,
+             "user_name": "Pat", "points": 1}
+        )
+        await bot.run_daily_backups(m.now_utc(), await st.snapshot())
+
+        assert len(ch.files) == 1, "one zip attachment posted"
+        assert len(ch.msgs) == 2, "zip caption + leaderboard"
+        captions = [msg.content for msg in ch.msgs.values()]
+        assert any("Nightly backup" in c for c in captions)
+        assert any("Chore leaderboard" in c for c in captions)
+
+        # The zip holds both state files; the log carries our completion.
+        raw = ch.files[0].fp.getvalue()
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            assert set(z.namelist()) == {"store.json", "completions.jsonl"}
+            assert b'"id": "c1"' in z.read("completions.jsonl")
+
+        cfg_now = (await st.snapshot())["configs"]["1"]
+        assert cfg_now.get("last_backup_sig"), "change-detection baseline recorded"
+        assert m.from_iso(cfg_now["next_backup_at"]) > m.now_utc(), "deadline rolled forward"
+
+        # 3) Due again but nothing new logged → deadline rolls, nothing posts.
+        async with st.txn() as data:
+            data["configs"]["1"]["next_backup_at"] = m.to_iso(m.now_utc() - dt.timedelta(minutes=1))
+        await bot.run_daily_backups(m.now_utc(), await st.snapshot())
+        assert len(ch.files) == 1 and len(ch.msgs) == 2, "quiet when nothing was logged"
+
+        # 4) A new completion + due deadline → fires again.
+        async with st.txn() as data:
+            data["configs"]["1"]["next_backup_at"] = m.to_iso(m.now_utc() - dt.timedelta(minutes=1))
+        await st.log_completion(
+            {"id": "c2", "guild_id": 1, "month": ym, "user_id": 2,
+             "user_name": "Sam", "points": 1}
+        )
+        await bot.run_daily_backups(m.now_utc(), await st.snapshot())
+        assert len(ch.files) == 2, "second backup posted after fresh activity"
+
+
 def main() -> None:
     test_emoji_key()
     test_time_parsing()
@@ -1868,6 +1953,8 @@ def main() -> None:
     test_trinkets()
     test_zone_pick()
     test_vitrine_award()
+    test_leaderboard_text()
+    asyncio.run(test_daily_backup())
     asyncio.run(test_void_completion())
     asyncio.run(test_bounty())
     asyncio.run(test_store())
