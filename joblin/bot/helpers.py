@@ -10,6 +10,7 @@ from ..models import (
     EMOJI_DONE,
     EMOJI_FFWD,
     EMOJI_INFO,
+    EMOJI_SKIP,
     UTC,
     describe_repeat,
     recurrence_of,
@@ -59,7 +60,8 @@ async def add_task_reactions(message: discord.Message, task: dict) -> None:
     await message.add_reaction(EMOJI_FFWD)
     if task.get("description"):
         await message.add_reaction(EMOJI_INFO)
-    await message.add_reaction(EMOJI_DELETE)
+    # Recurring chores skip just this occurrence (⏭️); one-offs are deleted (❌).
+    await message.add_reaction(EMOJI_SKIP if task.get("recurring") else EMOJI_DELETE)
 
 
 async def post_occurrence(
@@ -89,7 +91,7 @@ async def safe_delete(message: Optional[discord.Message]) -> None:
 # The functional reactions the bot itself puts on a posted chore. When an
 # occurrence resolves we strip exactly these — never a 😄 / 🎉 a family member
 # piled on for fun — see _clear_bot_reactions.
-TASK_FUNCTIONAL_EMOJIS = (EMOJI_DONE, EMOJI_FFWD, EMOJI_INFO, EMOJI_DELETE)
+TASK_FUNCTIONAL_EMOJIS = (EMOJI_DONE, EMOJI_FFWD, EMOJI_INFO, EMOJI_SKIP, EMOJI_DELETE)
 
 
 async def _clear_bot_reactions(

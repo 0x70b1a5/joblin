@@ -3,8 +3,9 @@
 Lifecycle of a task occurrence
 ------------------------------
 1. The scheduler tick (every 30s) notices ``now >= next_due`` and *fires* it:
-   posts the brief to the configured channel and self-reacts ✅ ⏩ ℹ️ ❌
-   (ℹ️ only if the task has a long description). The task flips to "pending"
+   posts the brief to the configured channel and self-reacts ✅ ⏩ ℹ️ ⏭️/❌
+   (ℹ️ only if the task has a long description; ⏭️ on recurring tasks, ❌ on
+   one-offs). The task flips to "pending"
    with ``remind_at = due + 1h``; ``next_due`` is cleared so it can't re-fire.
 2. While pending, every tick checks ``remind_at``. When it passes, the bot
    posts a fresh nag (optionally pinging a role) and sets ``remind_at = now+1h``.
@@ -13,9 +14,10 @@ Lifecycle of a task occurrence
                       one-offs are removed.
      ⏩  fast-fwd  -> snooze 1h, then 2h, 4h, 8h ... (doubling each press).
      ℹ️  info      -> reply with the long description.
-     ❌  skip      -> recurring: skip just this occurrence; one-off: delete it.
+     ⏭️  skip      -> recurring only: skip just this occurrence.
+     ❌  delete    -> one-off only: delete the task.
                       (Deleting an entire recurring task is /deletetask.)
-     ↩️  undo      -> reverse the most recent ✅/⏩/❌ on that occurrence. The
+     ↩️  undo      -> reverse the most recent ✅/⏩/⏭️/❌ on that occurrence. The
                       bot adds this button right after one of those actions.
      🔄  requeue   -> appears on a ✅-completed post; re-fires the chore right
                       now (a fresh occurrence) without waiting for its next slot.

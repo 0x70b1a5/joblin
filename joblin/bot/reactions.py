@@ -16,6 +16,7 @@ from ..models import (
     EMOJI_FFWD,
     EMOJI_INFO,
     EMOJI_REQUEUE,
+    EMOJI_SKIP,
     EMOJI_SNOOZE_DAYS,
     EMOJI_SNOOZE_HOURS,
     EMOJI_UNDO,
@@ -120,7 +121,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         await _handle_ffwd(tid, task, channel, reacted, payload)
     elif key == emoji_key(EMOJI_DONE):
         await _handle_done(tid, task, cfg, tz, channel, payload, mention, display)
-    elif key == emoji_key(EMOJI_DELETE):
+    elif key in (emoji_key(EMOJI_SKIP), emoji_key(EMOJI_DELETE)):
         await _handle_skip_or_delete(tid, task, tz, channel, mention)
 
 
