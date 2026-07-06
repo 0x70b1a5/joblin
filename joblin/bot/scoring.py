@@ -43,7 +43,11 @@ def _rec_month(rec: dict) -> str:
 def monthly_scores(records: list[dict], guild_id: int) -> dict[str, dict[int, dict]]:
     """Aggregate one guild's completions into
     ``{month: {user_id: {"points", "chores", "claps", "name"}}}`` — "claps" is
-    how many 👏 bonuses the user *received* (one log record per clap)."""
+    how many 👏 bonuses the user *received* (one log record per clap), and
+    "chores" counts only the user's own chore completions. Pitch-in / do-em-up
+    / clap rows add their puntos but not a per-user chore: a game round is one
+    chore *shared* by everyone who scored in it, folded into the footer total
+    by :func:`build_leaderboard` (claps aren't chores at all)."""
     months: dict[str, dict[int, dict]] = {}
     for rec in records:
         if rec.get("guild_id") != guild_id:
@@ -53,7 +57,7 @@ def monthly_scores(records: list[dict], guild_id: int) -> dict[str, dict[int, di
             rec["user_id"], {"points": 0, "chores": 0, "claps": 0, "name": str(rec["user_id"])}
         )
         ent["points"] += _completion_points(rec)
-        ent["chores"] += 1
+        ent["chores"] += rec.get("kind") not in ("pitchin", "doemup", "clap")
         ent["claps"] += rec.get("kind") == "clap"
         ent["name"] = rec.get("user_name", ent["name"])
     return months
@@ -214,7 +218,16 @@ def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
         lines.append(f"{badge} **{pts} punto{'' if pts == 1 else 's'}** — <@{uid}>{star}{clap}")
 
     total_pts = sum(ent["points"] for ent in bucket.values())
-    total_chores = sum(ent["chores"] for ent in bucket.values())
+    # A game round is one chore shared by all its scorers, not one per payout
+    # row. Rows from the same close carry the same game id + timestamp, so
+    # distinct pairs count rounds (each round of a recurring game is its own).
+    game_rounds = {
+        (rec.get("kind"), rec.get("task_id"), rec.get("ts"))
+        for rec in records
+        if rec.get("guild_id") == guild_id and _rec_month(rec) == month
+        and rec.get("kind") in ("pitchin", "doemup")
+    }
+    total_chores = sum(ent["chores"] for ent in bucket.values()) + len(game_rounds)
     when = "this month" if month == current_month else f"in {month}"
     footer = (
         f"_{total_chores} chore{'' if total_chores == 1 else 's'} · "

@@ -421,6 +421,26 @@ def parse_repeat(text: Optional[str]) -> dict:
     )
 
 
+def pin_weekly(rule: dict, at: Optional[str], tz: ZoneInfo, now: dt.datetime,
+               *, at_given: bool) -> dict:
+    """Pin a bare every-7-days rule ("weekly") to a concrete weekday.
+
+    "weekly" parses as ``days``/7, which anchors on whatever day it happens to
+    fire first — and the first fire only keeps the *time* of ``at``, so
+    "sunday 22:00, weekly" created after 22:00 on a Sunday became a Monday
+    task forever. Instead, resolve the day the user actually pointed at (or,
+    with no ``at``, the day the plain today/tomorrow first fire lands) and
+    rewrite the rule as ``weekly`` on that weekday. Requires
+    ``rule["time_of_day"]`` to be set; mutates and returns ``rule``.
+    """
+    if rule["freq"] == "days" and rule["interval_days"] == 7:
+        first = (resolve_when(at, tz, now) if at_given
+                 else compute_first_due(now, tz, rule["time_of_day"]))
+        rule.update(freq="weekly", interval_days=0,
+                    weekdays=[first.astimezone(tz).weekday()])
+    return rule
+
+
 def _parse_weekdays(s: str) -> list[int]:
     if s in ("weekdays", "weekday"):
         return [0, 1, 2, 3, 4]

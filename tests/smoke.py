@@ -87,10 +87,54 @@ def test_schedule_now_recurring_fires_today() -> None:
     from joblin.bot.commands import schedule_from_rule
     tz = ZoneInfo("Europe/Berlin")
     now = dt.datetime(2026, 6, 19, 13, 5, 30, tzinfo=tz).astimezone(UTC)  # Friday 13:05:30
-    for repeat in ("daily", "every 2 days", "fri", "monthly"):
+    for repeat in ("daily", "every 2 days", "fri", "monthly", "weekly"):
         sched = schedule_from_rule(m.parse_repeat(repeat), "now", tz, now, at_given=True)
         assert sched["recurring"] and sched["time_of_day"] == "13:05"
         assert sched["next_due"] <= now, f"{repeat!r} created 'now' should fire immediately"
+
+
+def test_weekly_pins_to_at_weekday() -> None:
+    """`repeat: weekly` means *weekly on the day it starts*: the weekday named
+    in `at` (or where the plain first fire lands) becomes a real weekly rule.
+    Regression: "sunday 22:00" + "weekly" created after 22:00 on a Sunday used
+    to keep only the time, first-fire tomorrow, and be a Monday task forever."""
+    from joblin.bot.commands import schedule_from_rule
+    from joblin.bot.commands.games import _game_recurrence_from
+    tz = ZoneInfo("America/New_York")
+
+    # Created Sunday 23:30, after the 22:00 slot -> next Sunday, still a Sunday.
+    now = dt.datetime(2026, 7, 5, 23, 30, tzinfo=tz).astimezone(UTC)
+    sched = schedule_from_rule(m.parse_repeat("weekly"), "sunday 22:00", tz, now, at_given=True)
+    assert (sched["freq"], sched["weekdays"], sched["interval_days"]) == ("weekly", [6], 0)
+    due = sched["next_due"].astimezone(tz)
+    assert due.date() == dt.date(2026, 7, 12) and (due.hour, due.minute) == (22, 0)
+
+    # Created Sunday morning -> today's 22:00 slot is still ahead.
+    early = dt.datetime(2026, 7, 5, 10, 0, tzinfo=tz).astimezone(UTC)
+    sched2 = schedule_from_rule(m.parse_repeat("weekly"), "sunday 22:00", tz, early, at_given=True)
+    assert sched2["next_due"].astimezone(tz).date() == dt.date(2026, 7, 5)
+
+    # The pinned day needn't be today: Tuesday + "fri 18:00" -> Fridays.
+    tue = dt.datetime(2026, 7, 7, 9, 0, tzinfo=tz).astimezone(UTC)
+    sched3 = schedule_from_rule(m.parse_repeat("weekly"), "fri 18:00", tz, tue, at_given=True)
+    assert sched3["weekdays"] == [4]
+    assert sched3["next_due"].astimezone(tz).date() == dt.date(2026, 7, 10)
+
+    # "every 7 days" is the same cadence and pins the same way.
+    sched4 = schedule_from_rule(m.parse_repeat("every 7 days"), "sunday 22:00", tz, now, at_given=True)
+    assert (sched4["freq"], sched4["weekdays"]) == ("weekly", [6])
+
+    # No `at` (e.g. /edit changing just the repeat): pins where the plain
+    # first fire lands — tomorrow, since the kept 22:00 already passed today.
+    sched5 = schedule_from_rule(m.parse_repeat("weekly"), None, tz, now,
+                                at_given=False, default_tod="22:00")
+    assert (sched5["freq"], sched5["weekdays"]) == ("weekly", [0])
+    assert sched5["next_due"].astimezone(tz).date() == dt.date(2026, 7, 6)
+
+    # Recurring pitch-ins/do-em-ups share the same pinning.
+    rule = _game_recurrence_from("weekly", tz, now, at="sunday 22:00")
+    assert (rule["freq"], rule["weekdays"]) == ("weekly", [6])
+    assert m.first_due(rule, tz, now).astimezone(tz).date() == dt.date(2026, 7, 12)
 
 
 def test_roll_forward_skips_backlog() -> None:
@@ -1453,6 +1497,50 @@ def test_points_and_stars() -> None:
     assert star_counts(recs, 1, current_month="2026-07") == {1: 2, 2: 2}
 
 
+def test_chore_count_shares_games() -> None:
+    """The leaderboard's chore tally: each of your own completions is a chore,
+    but a game round is ONE chore shared by everyone who scored in it (three
+    people pitching in on the car wash = one chore; a do-em-up is one chore
+    however many bricks got laid), and claps aren't chores at all. Regression:
+    every log row used to bump "chores", so the footer's chore count silently
+    tracked the row count instead of the chores done."""
+    from joblin.bot import build_leaderboard, monthly_scores
+
+    recs = [
+        {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "recurring", "points": 1},
+        {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "once", "points": 2},  # a bounty
+        # One pitch-in round, two scorers (same game id + close timestamp).
+        {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "pitchin", "task_id": "g1", "ts": "t1", "points": 1},
+        {"guild_id": 1, "month": "2026-04", "user_id": 2, "user_name": "Sam",
+         "kind": "pitchin", "task_id": "g1", "ts": "t1", "points": 1},
+        # A later round of the same recurring pitch-in is its own chore.
+        {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "pitchin", "task_id": "g1", "ts": "t2", "points": 1},
+        # One do-em-up round: many units, two talliers, still one chore.
+        {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "doemup", "task_id": "g2", "ts": "t3", "points": 5},
+        {"guild_id": 1, "month": "2026-04", "user_id": 2, "user_name": "Sam",
+         "kind": "doemup", "task_id": "g2", "ts": "t3", "points": 3},
+        {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "clap", "points": 1},
+        # A legacy row without "kind" reads as a chore.
+        {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat"},
+    ]
+    ent = monthly_scores(recs, 1)["2026-04"][1]
+    assert ent["points"] == 12  # every row's puntos still count
+    assert ent["chores"] == 3  # own chores only: recurring + once + legacy
+    assert ent["claps"] == 1
+
+    # Footer: 3 own chores + 2 pitch-in rounds + 1 do-em-up round = 6 chores,
+    # while the puntos keep every row's full value (Pat's 12 + Sam's 4).
+    cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "item_bar": 25}
+    text, empty = build_leaderboard(recs, 1, cfg, "2026-04")
+    assert not empty and "_6 chores · 16 puntos in 2026-04._" in text
+
+
 async def test_bounty() -> None:
     """A bounty is worth 2 puntos and its creator can't claim it; anyone else can."""
     import joblin.bot as bot
@@ -2043,11 +2131,13 @@ def main() -> None:
     test_first_due()
     test_first_due_now_fires_immediately()
     test_schedule_now_recurring_fires_today()
+    test_weekly_pins_to_at_weekday()
     test_roll_forward_skips_backlog()
     test_roll_forward_dst()
     test_oneoff_parse()
     test_can_undo()
     test_points_and_stars()
+    test_chore_count_shares_games()
     test_trinkets()
     test_zone_pick()
     test_vitrine_award()

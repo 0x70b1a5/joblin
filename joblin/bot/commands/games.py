@@ -21,6 +21,7 @@ from ...models import (
     next_due,
     now_utc,
     parse_repeat,
+    pin_weekly,
     resolve_when,
     time_of_day_from,
     to_iso,
@@ -44,7 +45,7 @@ def _game_recurrence_from(
     if rule["freq"] == "monthly" and not rule["monthdays"]:
         rule["monthdays"] = [now.astimezone(tz).day]
     rule["time_of_day"] = time_of_day_from(at, tz, now)
-    return rule
+    return pin_weekly(rule, at, tz, now, at_given=at is not None)
 
 
 @bot.tree.command(

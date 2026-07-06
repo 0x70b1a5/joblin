@@ -17,6 +17,7 @@ from ...models import (
     new_id,
     now_utc,
     parse_repeat,
+    pin_weekly,
     resolve_when,
     time_of_day_from,
     to_iso,
@@ -71,6 +72,7 @@ def schedule_from_rule(
 
     tod = time_of_day_from(at, tz, now) if at_given else (default_tod or time_of_day_from(None, tz, now))
     rule["time_of_day"] = tod
+    pin_weekly(rule, at, tz, now, at_given=at_given)  # "sunday 22:00" weekly → Sundays
     return {
         "recurring": True, "freq": rule["freq"], "interval_days": rule["interval_days"],
         "weekdays": rule["weekdays"], "monthdays": rule["monthdays"],
