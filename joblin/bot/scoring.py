@@ -42,17 +42,19 @@ def _rec_month(rec: dict) -> str:
 
 def monthly_scores(records: list[dict], guild_id: int) -> dict[str, dict[int, dict]]:
     """Aggregate one guild's completions into
-    ``{month: {user_id: {"points", "chores", "name"}}}``."""
+    ``{month: {user_id: {"points", "chores", "claps", "name"}}}`` — "claps" is
+    how many 👏 bonuses the user *received* (one log record per clap)."""
     months: dict[str, dict[int, dict]] = {}
     for rec in records:
         if rec.get("guild_id") != guild_id:
             continue
         bucket = months.setdefault(_rec_month(rec), {})
         ent = bucket.setdefault(
-            rec["user_id"], {"points": 0, "chores": 0, "name": str(rec["user_id"])}
+            rec["user_id"], {"points": 0, "chores": 0, "claps": 0, "name": str(rec["user_id"])}
         )
         ent["points"] += _completion_points(rec)
         ent["chores"] += 1
+        ent["claps"] += rec.get("kind") == "clap"
         ent["name"] = rec.get("user_name", ent["name"])
     return months
 
@@ -207,8 +209,9 @@ def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
     for i, (uid, ent) in enumerate(ranking):
         badge = medals[i] if i < 3 else f"`{i + 1}.`"
         star = f" ⭐×{stars[uid]}" if stars.get(uid) else ""
+        clap = f" · 👏×{ent['claps']}" if ent.get("claps") else ""
         pts = ent["points"]
-        lines.append(f"{badge} <@{uid}> — **{pts} punto{'' if pts == 1 else 's'}**{star}")
+        lines.append(f"{badge} **{pts} punto{'' if pts == 1 else 's'}** — <@{uid}>{star}{clap}")
 
     total_pts = sum(ent["points"] for ent in bucket.values())
     total_chores = sum(ent["chores"] for ent in bucket.values())

@@ -578,7 +578,7 @@ async def test_doemup_lifecycle() -> None:
         month = now.astimezone(ZoneInfo("Europe/Berlin")).strftime("%Y-%m")
         inter = FakeInteraction(user=FakeUser(1, "Boss"))
         await bot.leaderboard.callback(inter, month=month)
-        assert "<@42> — **5 puntos**" in inter.response.content
+        assert "**5 puntos** — <@42>" in inter.response.content
         assert "7 puntos this month" in inter.response.content
 
 
@@ -1297,11 +1297,11 @@ async def test_claps() -> None:
             by[r["user_id"]] = by.get(r["user_id"], 0) + r.get("points", 1)
         assert by == {42: 3}, "1 for the chore + 2 clapped bonuses"
 
-        # /leaderboard totals the bonus into Pat's score.
+        # /leaderboard totals the bonus into Pat's score and shows the claps received.
         month = now.astimezone(tz).strftime("%Y-%m")
         inter = FakeInteraction(user=FakeUser(1, "Boss"))
         await bot.leaderboard.callback(inter, month=month)
-        assert "<@42> — **3 puntos**" in inter.response.content
+        assert "**3 puntos** — <@42> · 👏×2" in inter.response.content
 
         # Undoing the ✅ retracts the completion AND every clap bonus.
         await bot.on_raw_reaction_add(FakePayload(posted, "↩️", member=FakeMember(42, "Pat")))
@@ -1444,7 +1444,7 @@ def test_points_and_stars() -> None:
 
     months = monthly_scores(recs, 1)
     assert set(months) == {"2026-04", "2026-05", "2026-06"}, "other guild excluded"
-    assert months["2026-04"][1] == {"points": 3, "chores": 2, "name": "Pat"}
+    assert months["2026-04"][1] == {"points": 3, "chores": 2, "claps": 0, "name": "Pat"}
     assert months["2026-04"][2]["points"] == 1
 
     # June is the current month -> excluded; Pat wins April, ties May -> 2 stars.
@@ -1954,11 +1954,16 @@ def test_leaderboard_text() -> None:
     recs = [
         {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat", "points": 2},
         {"guild_id": 1, "month": "2026-04", "user_id": 2, "user_name": "Sam"},
+        {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "clap", "points": 1},
     ]
     text, empty = bot.build_leaderboard(recs, 1, cfg, "2026-04")
     assert not empty
     assert "Chore leaderboard — 2026-04" in text
-    assert "<@1>" in text and "<@2>" in text
+    # Puntos lead each line; claps received ride the name like nags in /listtasks
+    # (April is a past month, so Pat also wears its ⭐ on the line).
+    assert "**3 puntos** — <@1> ⭐×1 · 👏×1" in text
+    assert "**1 punto** — <@2>" in text and "<@2> · 👏" not in text
     # A month with nothing logged → empty flag set, gentle nudge shown.
     text2, empty2 = bot.build_leaderboard(recs, 1, cfg, "2026-03")
     assert empty2 and "No chores logged" in text2
