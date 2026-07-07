@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-guild-friendly Discord bot for small-farm/household chore logistics: one-off and recurring tasks that post to a channel when due, get resolved by emoji reactions, and feed a family puntos economy (leaderboard ⭐ stars, end-of-month 🖼️ trinkets, plus ad-hoc punto events). Pure stdlib + `discord.py`; persistence is a JSON file plus an append-only log. No database, no web server.
+A single-guild-friendly Discord bot for small-farm/household chore logistics: one-off and recurring tasks that post to a channel when due, get resolved by emoji reactions, and feed a family puntos economy (leaderboard ⭐ stars, end-of-month 🖼️ trinkets, plus ad-hoc punto events). Pure stdlib + `discord.py` (+ its `aiohttp`); persistence is a JSON file plus an append-only log. No database. An optional phone-first web UI (`joblin/web/`, Discord-OAuth-gated) serves the schedule from *inside* the bot process when `WEB_BASE_URL`/`DISCORD_CLIENT_ID`/`DISCORD_CLIENT_SECRET` are set — otherwise no port is ever opened.
 
 ## Commands
 
@@ -17,7 +17,7 @@ uv sync                           # install/sync deps into .venv
 ```
 
 - **Tests**: `tests/smoke.py` is a single script of ~45 plain-`assert` functions (no pytest). Running it imports `joblin.bot`, which executes every `@bot.tree.command` decorator — so it doubles as a smoke test that all slash commands still register. To run **one** test, there's no CLI selector; temporarily call just that function from `main()` at the bottom, or `uv run python -c "import tests.smoke as s; s.test_first_due()"`. **Add new tests by defining `test_*` and registering them in `main()`** (the list there is the runner).
-- **Setup**: copy `.env.example` → `.env`, set `DISCORD_TOKEN`. Set `DEV_GUILD_ID` to sync slash commands to one guild instantly (global sync takes ~1h to propagate). `JOBLIN_DATA_DIR` (default `./data`) holds `store.json` + `completions.jsonl`.
+- **Setup**: copy `.env.example` → `.env`, set `DISCORD_TOKEN`. Set `DEV_GUILD_ID` to sync slash commands to one guild instantly (global sync takes ~1h to propagate). `JOBLIN_DATA_DIR` (default `./data`) holds `store.json` + `completions.jsonl` (+ the auto-generated `web_secret`). The web UI needs `WEB_BASE_URL`, `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET` (and the redirect URI registered in the Developer Portal — see `.env.example`); `WEB_HOST`/`WEB_PORT` (default `0.0.0.0:8710`) move the listener.
 - **Deploy**: production runs under `./run.sh` (a tmux supervisor loop: git pull → `uv sync` → run, restart on exit). `./redeploy.sh` (or the owner-only `/redeploy` slash command) just stops the bot so the loop pulls and restarts. There is no build/lint step.
 
 ## Architecture
@@ -60,6 +60,7 @@ Everything keys off `store["messages"][message_id] → task_id`, so reactions ke
 | `bot/listing.py` | `/listtasks` (paginated), `/listopen`, `/joblinhelp`. |
 | `bot/admin.py` | `main()` entry point, owner-only `/redeploy`, global app-command error handler, `on_ready`. |
 | `bot/helpers.py` | Small formatting/occurrence-I/O helpers (schedule labels, post rendering, safe delete, reaction setup). |
+| `web/` | The optional bundled web UI: `__init__.py` (aiohttp server on the bot's loop — Discord OAuth + signed-cookie sessions, JSON API mirroring `/newtask`, `/edit task`, `/deletetask`; started by `core.setup_hook`, always reads `core.store` so the tests' store swap holds) and `index.html` (the whole frontend: one vanilla-JS mobile-first page, no build step). View + task CRUD only — completing chores/earning puntos stays Discord-only, and games are shown read-only. |
 
 ## Domain concepts (vocabulary you'll meet)
 

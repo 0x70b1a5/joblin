@@ -218,6 +218,36 @@ mid-tick is safe and the bot resumes cleanly on restart.
    - Tip: set `DEV_GUILD_ID` in `.env` to your server id so commands appear
      instantly while you test (global sync can take up to ~1h the first time).
 
+## Web UI
+
+An optional, phone-first schedule viewer/editor served **from inside the bot
+process** (aiohttp on the bot’s own event loop — no second service, no extra
+tmux pane to babysit). It lists every task and game once, chronologically,
+like a calendar’s day view: day/time labels in the left gutter, a “Now”
+section for anything live or overdue, a date picker for how far out to look,
+and a collapsed “Later” bucket for the long-cycle stuff. Tapping a task
+expands it into an editable form backed by the exact same parsing and
+scheduling engine as `/newtask` / `/edit task` / `/deletetask`; the ＋ button
+creates tasks. Pitch-ins and do-em-ups appear read-only, and chores can’t be
+*completed* from the web on purpose — puntos are only ever earned through
+Discord, so the economy has one door.
+
+Setup — all three are required; without them the bot never opens a port:
+
+1. Decide the public URL: a reverse proxy with https (Caddy makes this two
+   lines) or a bare `http://<vps-ip>:8710` to try it out. Put it in `.env` as
+   `WEB_BASE_URL` (no trailing slash).
+2. Developer Portal → your application → **OAuth2**: copy the **Client ID**
+   and **Client Secret** into `.env` (`DISCORD_CLIENT_ID`,
+   `DISCORD_CLIENT_SECRET`), and add `<WEB_BASE_URL>/oauth/callback` to the
+   **Redirects** list on that same page.
+3. Restart the bot; it logs `Web UI listening on …`. Sign in with Discord.
+
+Anyone who shares a Joblin-enabled server with the bot can sign in (the
+burger menu switches servers and logs out). Sessions are HMAC-signed cookies
+good for 14 days; the signing secret is auto-generated into
+`data/web_secret`. `WEB_HOST` / `WEB_PORT` move the listener if you need to.
+
 ## How it’s built
 
 - **`discord.py`** for the gateway, slash commands, raw reaction events, and

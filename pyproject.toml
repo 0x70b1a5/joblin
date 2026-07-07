@@ -5,6 +5,7 @@ description = "Joblin — a gamification framework for chores: a Discord bot for
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "aiohttp>=3.9",  # already pulled in by discord.py; direct dep of joblin.web
     "discord.py>=2.4",
     "python-dotenv>=1.0",
     "tzdata>=2024.1",

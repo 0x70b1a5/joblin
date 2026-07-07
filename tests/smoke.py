@@ -22,6 +22,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 # Importing the bot module runs every @bot.tree.command decorator and builds
 # the JoblinBot instance — a real smoke test of the command definitions.
 import joblin.bot  # noqa: E402, F401
+import joblin.web as webui  # noqa: E402
 from joblin import models as m  # noqa: E402
 from joblin.store import Store  # noqa: E402
 
@@ -2120,6 +2121,140 @@ async def test_daily_backup() -> None:
         assert len(ch.files) == 2, "second backup posted after fresh activity"
 
 
+# ---------------------------------------------------------------------------
+# Web UI: session signing, schedule assembly, and the task CRUD mirrors
+# ---------------------------------------------------------------------------
+def test_web_sessions() -> None:
+    """Sign/verify roundtrip, plus rejection of tampering and expiry."""
+    secret = b"test-secret"
+    exp = int(m.now_utc().timestamp()) + 3600
+    payload = {"uid": "42", "name": "Pat", "guilds": ["1"], "exp": exp}
+    tok = webui.sign_session(payload, secret)
+    assert webui.read_session(tok, secret) == payload
+    assert webui.read_session(tok, b"other-secret") is None, "wrong key rejected"
+    body, sig = tok.split(".", 1)
+    assert webui.read_session(f"{body}x.{sig}", secret) is None, "tampered body rejected"
+    assert webui.read_session("garbage", secret) is None
+    stale = webui.sign_session({**payload, "exp": exp - 7200}, secret)
+    assert webui.read_session(stale, secret) is None, "expired session rejected"
+
+
+def test_web_repeat_input() -> None:
+    """The edit form's repeat prefill must round-trip through parse_repeat
+    (describe_repeat is for humans and e.g. "every 2 weeks" doesn't parse)."""
+    for rule in (
+        {"freq": "once", "interval_days": 0, "weekdays": [], "monthdays": []},
+        {"freq": "days", "interval_days": 1, "weekdays": [], "monthdays": []},
+        {"freq": "days", "interval_days": 14, "weekdays": [], "monthdays": []},
+        {"freq": "weekly", "interval_days": 0, "weekdays": [0, 3], "monthdays": []},
+        {"freq": "weekly", "interval_days": 0, "weekdays": [5, 6], "monthdays": []},
+        {"freq": "monthly", "interval_days": 0, "weekdays": [], "monthdays": [1, 15, 31]},
+    ):
+        back = m.parse_repeat(webui.repeat_input_of(rule))
+        for key in ("freq", "interval_days", "weekdays", "monthdays"):
+            assert back[key] == rule[key], f"{rule} came back as {back}"
+
+
+def test_web_schedule() -> None:
+    """build_schedule: guild filtering, pending/live-first ordering, form
+    prefills, and read-only games — all from a plain snapshot."""
+    now = m.now_utc()
+    base = {"weekdays": [], "monthdays": [], "pending": None}
+    snap = {
+        "configs": {"1": {"channel_id": 9, "timezone": "Europe/Berlin"}},
+        "tasks": {
+            "aa": {**base, "id": "aa", "guild_id": 1, "brief": "Water plants",
+                   "bounty": False, "recurring": True, "freq": "days",
+                   "interval_days": 1, "time_of_day": "18:00",
+                   "next_due": m.to_iso(now + dt.timedelta(days=1))},
+            "bb": {**base, "id": "bb", "guild_id": 1, "brief": "Fix gate",
+                   "bounty": True, "recurring": False, "freq": "once",
+                   "interval_days": 0, "time_of_day": None, "next_due": None,
+                   "pending": {"due_at": m.to_iso(now - dt.timedelta(hours=2)),
+                               "remind_at": m.to_iso(now), "ffwd_count": 0,
+                               "channel_id": 9, "message_ids": [1]}},
+            "zz": {**base, "id": "zz", "guild_id": 2, "brief": "Other farm",
+                   "bounty": False, "recurring": False, "freq": "once",
+                   "interval_days": 0, "time_of_day": None,
+                   "next_due": m.to_iso(now)},
+        },
+        "pitchins": {"pp": {"id": "pp", "guild_id": 1, "brief": "Hay day",
+                            "message_id": 5, "channel_id": 9, "points_each": 2,
+                            "expires_at": m.to_iso(now + dt.timedelta(hours=1)),
+                            "recurring": False}},
+        "doemups": {},
+    }
+    sched = webui.build_schedule(snap, 1)
+    assert sched["timezone"] == "Europe/Berlin" and sched["config_ready"]
+    assert [i["id"] for i in sched["items"]] == ["bb", "pp", "aa"], \
+        "pending/live first (by instant), then scheduled"
+    items = {i["id"]: i for i in sched["items"]}
+    assert items["bb"]["status"] == "pending" and items["bb"]["bounty"]
+    assert items["bb"]["at_input"].count(":") == 1 and "-" in items["bb"]["at_input"]
+    assert items["aa"]["status"] == "scheduled"
+    assert items["aa"]["repeat_input"] == "daily" and items["aa"]["at_input"] == "18:00"
+    assert items["pp"]["status"] == "live" and items["pp"]["editable"] is False
+    # An unconfigured guild still renders (UTC) but flags config_ready=False.
+    bare = webui.build_schedule({**snap, "configs": {}}, 1)
+    assert bare["timezone"] == "UTC" and not bare["config_ready"]
+
+
+async def test_web_task_crud() -> None:
+    """create/edit/delete mirrors of /newtask, /edit task, /deletetask — field
+    presence is intent on edit, pending occurrences are left alone, and delete
+    sweeps the reaction-routing rows."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+
+        # No config → create refuses (same gate as /newtask).
+        missing, err = await webui.create_task(2, 42, {"brief": "x"})
+        assert missing is None and "joblinconfig" in err
+
+        task, err = await webui.create_task(
+            1, 42, {"brief": "Fix fence", "at": "18:00", "repeat": "daily",
+                    "description": "the far paddock", "bounty": True})
+        assert err is None and task["freq"] == "days" and task["bounty"]
+        assert task["time_of_day"] == "18:00" and task["created_by"] == 42
+        tid = task["id"]
+        assert (await st.snapshot())["tasks"][tid]["brief"] == "Fix fence"
+
+        # Editing just the brief must not touch the schedule.
+        before_due = task["next_due"]
+        upd, note, err = await webui.apply_task_edit(1, tid, {"brief": "Fix the fence"})
+        assert err is None and upd["brief"] == "Fix the fence"
+        assert upd["next_due"] == before_due and upd["time_of_day"] == "18:00"
+
+        # Repeat-only edit keeps the standing time_of_day (default_tod path).
+        upd, note, err = await webui.apply_task_edit(1, tid, {"repeat": "mon,thu"})
+        assert err is None and upd["freq"] == "weekly" and upd["weekdays"] == [0, 3]
+        assert upd["time_of_day"] == "18:00"
+
+        # A bad repeat is a clean error, nothing half-written.
+        bad, note, err = await webui.apply_task_edit(1, tid, {"repeat": "blorp"})
+        assert bad is None and err and "repeat" in err
+        assert (await st.snapshot())["tasks"][tid]["freq"] == "weekly"
+
+        # While an occurrence is pending, a schedule edit stores the new rule
+        # but leaves the live occurrence alone (next_due stays None) + notes it.
+        now = m.now_utc()
+        async with st.txn() as data:
+            t = data["tasks"][tid]
+            t["pending"] = {"due_at": m.to_iso(now), "remind_at": m.to_iso(now),
+                            "ffwd_count": 0, "channel_id": 999, "message_ids": [555]}
+            t["next_due"] = None
+            data["messages"]["555"] = tid
+        upd, note, err = await webui.apply_task_edit(1, tid, {"repeat": "daily"})
+        assert err is None and note and "next cycle" in note
+        assert upd["freq"] == "days" and upd["next_due"] is None and upd["pending"]
+
+        # Wrong guild can't delete; the right one sweeps the routing rows too.
+        assert await webui.delete_task(2, tid) is None
+        removed = await webui.delete_task(1, tid)
+        assert removed and removed["id"] == tid
+        snap = await st.snapshot()
+        assert tid not in snap["tasks"] and "555" not in snap["messages"]
+
+
 def main() -> None:
     test_emoji_key()
     test_time_parsing()
@@ -2173,6 +2308,10 @@ def main() -> None:
     asyncio.run(test_game_commands_recurring())
     asyncio.run(test_game_commands())
     asyncio.run(test_edit_games())
+    test_web_sessions()
+    test_web_repeat_input()
+    test_web_schedule()
+    asyncio.run(test_web_task_crud())
     print("✅ all smoke tests passed")
 
 

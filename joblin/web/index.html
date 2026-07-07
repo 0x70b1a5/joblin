@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Joblin</title>
+<meta name="theme-color" content="#F3F5EE" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#171C13" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧹</text></svg>">
+<style>
+/* Farm-ledger look: sage paper, loden green, hay amber for “now”. Times live
+   in a monospace gutter — the gutter is the structure; no rules, no lines. */
+:root {
+  --paper: #F3F5EE;
+  --bar: #FFFFFF;
+  --ink: #26301F;
+  --muted: #75816A;
+  --moss: #44603A;
+  --hay: #A2600C;
+  --hay-soft: #F6E8CE;
+  --danger: #9C3B22;
+  --blurple: #5865F2;
+  --shadow: 0 1px 2px rgba(38, 48, 31, .10);
+  --gutter: 4.8rem;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --display: "Iowan Old Style", Palatino, Georgia, serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #171C13;
+    --bar: #242C1E;
+    --ink: #E9EDDF;
+    --muted: #91A080;
+    --moss: #A9C293;
+    --hay: #E0A75C;
+    --hay-soft: #3A301B;
+    --danger: #E08A72;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .35);
+  }
+}
+* { box-sizing: border-box; margin: 0; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  font-family: var(--sans);
+  background: var(--paper);
+  color: var(--ink);
+  min-height: 100dvh;
+  padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
+}
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+:focus-visible { outline: 2px solid var(--moss); outline-offset: 2px; border-radius: 6px; }
+.hidden { display: none !important; }
+
+/* ---- header ---- */
+header {
+  display: flex; align-items: center; gap: .75rem;
+  padding: calc(.6rem + env(safe-area-inset-top)) 1rem .6rem;
+  position: sticky; top: 0; background: var(--paper); z-index: 5;
+}
+#burger { font-size: 1.35rem; line-height: 1; padding: .3rem .45rem .4rem; }
+#guildname {
+  font-family: var(--display); font-size: 1.25rem; font-weight: 600;
+  letter-spacing: .01em; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#throughwrap { font-size: .78rem; color: var(--muted); display: flex; align-items: center; gap: .35rem; }
+#through {
+  font: inherit; font-size: 16px; /* <16px makes iOS zoom on focus */
+  color: var(--moss); font-weight: 600;
+  background: none; border: 0; padding: .2rem 0; max-width: 8.6rem;
+}
+
+/* ---- schedule list ---- */
+main { padding: .25rem 1rem 0; max-width: 34rem; margin: 0 auto; }
+.sect {
+  font-size: .68rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--moss); margin: 1.1rem 0 .45rem; padding-left: .1rem;
+}
+.sect.now { color: var(--hay); }
+.row { display: grid; grid-template-columns: var(--gutter) 1fr; margin-bottom: .35rem; }
+.gutter {
+  font-family: var(--mono); font-size: .72rem; text-align: right;
+  padding: .55rem .6rem 0 0; color: var(--muted); line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+.gutter .day {
+  display: block; color: var(--moss); font-weight: 700;
+  text-transform: uppercase; letter-spacing: .05em; white-space: nowrap;
+}
+.row.urgent .gutter, .row.urgent .gutter .day, .now-time { color: var(--hay); }
+.bar {
+  display: block; width: 100%; text-align: left;
+  background: var(--bar); border-radius: 12px; box-shadow: var(--shadow);
+  padding: .62rem .85rem; font-size: .95rem; line-height: 1.35;
+}
+.bar:active { transform: scale(.99); }
+.bar .icons { opacity: .85; font-size: .85em; margin-left: .3rem; }
+.row.urgent .bar { background: var(--hay-soft); }
+.row.expanded .bar { border-radius: 12px 12px 0 0; }
+
+/* ---- expanded editor ---- */
+.panel {
+  grid-column: 2; background: var(--bar); border-radius: 0 0 12px 12px;
+  box-shadow: var(--shadow); padding: .35rem .85rem .85rem;
+}
+.meta { font-size: .78rem; color: var(--muted); margin-bottom: .6rem; }
+.field { margin-bottom: .6rem; }
+.field label {
+  display: block; font-size: .68rem; font-weight: 700; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--muted); margin-bottom: .2rem;
+}
+.field input[type="text"], .field textarea {
+  width: 100%; font: inherit; font-size: 16px; color: var(--ink);
+  background: var(--paper); border: 0; border-radius: 8px; padding: .5rem .6rem;
+}
+.field textarea { resize: vertical; min-height: 2.6rem; }
+.field .hint { font-size: .72rem; color: var(--muted); margin-top: .2rem; }
+.check { display: flex; align-items: center; gap: .5rem; font-size: .9rem; margin: .2rem 0 .6rem; }
+.check input { width: 1.1rem; height: 1.1rem; accent-color: var(--moss); }
+.err { color: var(--danger); font-size: .82rem; margin: .4rem 0; white-space: pre-line; }
+.actions { display: flex; gap: .6rem; align-items: center; margin-top: .2rem; }
+.btn {
+  border-radius: 999px; padding: .5rem 1.1rem; font-weight: 650; font-size: .9rem;
+  background: var(--moss); color: var(--paper);
+}
+.btn.quiet { background: none; color: var(--muted); padding: .5rem .4rem; }
+.btn.danger { background: none; color: var(--danger); margin-left: auto; padding: .5rem .4rem; }
+.btn[disabled] { opacity: .5; }
+.gamenote { font-size: .82rem; color: var(--muted); margin: .3rem 0 .5rem; }
+
+/* ---- later / empty / banner ---- */
+#laterbtn { font-size: .8rem; color: var(--muted); padding: .5rem .1rem; }
+.banner {
+  background: var(--hay-soft); color: var(--ink); border-radius: 12px;
+  padding: .7rem .9rem; font-size: .85rem; margin: .8rem 0;
+}
+.empty { color: var(--muted); font-size: .9rem; text-align: center; padding: 3rem 1rem; }
+
+/* ---- FAB / toast ---- */
+#fab {
+  position: fixed; right: 1.1rem; bottom: calc(1.1rem + env(safe-area-inset-bottom));
+  width: 3.4rem; height: 3.4rem; border-radius: 50%;
+  background: var(--moss); color: var(--paper); font-size: 1.7rem; line-height: 1;
+  box-shadow: 0 4px 12px rgba(38,48,31,.3); z-index: 6;
+}
+#toast {
+  position: fixed; left: 50%; transform: translateX(-50%);
+  bottom: calc(5.4rem + env(safe-area-inset-bottom));
+  background: var(--ink); color: var(--paper); font-size: .85rem;
+  padding: .55rem .95rem; border-radius: 999px; max-width: 88vw;
+  box-shadow: var(--shadow); z-index: 8;
+}
+
+/* ---- new-task sheet ---- */
+#sheet {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 7;
+  background: var(--bar); border-radius: 18px 18px 0 0;
+  padding: 1rem 1.1rem calc(1.1rem + env(safe-area-inset-bottom));
+  max-width: 34rem; margin: 0 auto; box-shadow: 0 -6px 24px rgba(0,0,0,.18);
+}
+#sheet h2 { font-family: var(--display); font-size: 1.1rem; margin-bottom: .6rem; }
+
+/* ---- drawer ---- */
+#scrim { position: fixed; inset: 0; background: rgba(20,25,15,.45); z-index: 9; }
+#drawer {
+  position: fixed; top: 0; bottom: 0; left: 0; width: min(78vw, 19rem); z-index: 10;
+  background: var(--paper); padding: calc(1.2rem + env(safe-area-inset-top)) 1.1rem 1.2rem;
+  display: flex; flex-direction: column; box-shadow: 4px 0 24px rgba(0,0,0,.2);
+}
+#whoami { display: flex; align-items: center; gap: .7rem; margin-bottom: 1.4rem; }
+#whoami img { width: 2.4rem; height: 2.4rem; border-radius: 50%; background: var(--bar); }
+#whoami .mark { font-size: 1.8rem; }
+#whoami .name { font-weight: 650; }
+#whoami .sub { font-size: .75rem; color: var(--muted); }
+#drawer .sect { margin-top: 0; }
+.guildbtn {
+  display: block; width: 100%; text-align: left; padding: .6rem .7rem;
+  border-radius: 10px; font-size: .95rem; margin-bottom: .2rem;
+}
+.guildbtn.active { background: var(--bar); box-shadow: var(--shadow); font-weight: 650; }
+#logout {
+  margin-top: auto; color: var(--danger); font-size: .9rem; font-weight: 600;
+  text-decoration: none; padding: .6rem .1rem;
+}
+
+/* ---- login ---- */
+#login {
+  min-height: 92dvh; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: .9rem; padding: 0 2rem; text-align: center;
+}
+#login .mark { font-size: 3rem; }
+#login h1 { font-family: var(--display); font-size: 2.2rem; font-weight: 600; }
+#login p { color: var(--muted); font-size: .95rem; max-width: 18rem; }
+#login a {
+  display: inline-block; background: var(--blurple); color: #fff; text-decoration: none;
+  border-radius: 999px; padding: .75rem 1.5rem; font-weight: 650; margin-top: .8rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
+</style>
+</head>
+<body>
+
+<div id="login" class="hidden">
+  <div class="mark">🧹</div>
+  <h1>Joblin</h1>
+  <p>The farm’s chore ledger — see what’s coming up and tune the schedule.</p>
+  <a href="/login">Sign in with Discord</a>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <button id="burger" aria-label="Menu">☰</button>
+    <div id="guildname"></div>
+    <div id="throughwrap"><input type="date" id="through" aria-label="Show the schedule through this date"></div>
+  </header>
+  <main id="list"></main>
+  <button id="fab" aria-label="New task">＋</button>
+</div>
+
+<div id="sheet" class="hidden"></div>
+<div id="scrim" class="hidden"></div>
+<nav id="drawer" class="hidden" aria-label="Menu">
+  <div id="whoami"></div>
+  <div class="sect">Servers</div>
+  <div id="guilds"></div>
+  <a id="logout" href="/logout">Log out</a>
+</nav>
+<div id="toast" class="hidden"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const KIND_ICON = { pitchin: "🤝", doemup: "💪" };
+const AT_HINT = "in 2h · 18:00 · tomorrow 8am · 2026-07-20 14:00";
+const REPEAT_HINT = "daily · every 3 days · mon,thu · monthly on the 1st";
+
+const S = {
+  me: null, gid: null, tz: "UTC", configReady: true,
+  items: [], end: null, showLater: false, open: null,
+};
+
+/* ---- tiny DOM builder: h(tag, props, ...children) — text stays text ---- */
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (k === "class") el.className = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k in el) el[k] = v;
+    else el.setAttribute(k, v);
+  }
+  for (const kid of kids) if (kid != null) el.append(kid);
+  return el;
+}
+
+/* ---- API ---- */
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { "X-Joblin": "1", ...(opts.body ? { "Content-Type": "application/json" } : {}) },
+  });
+  if (res.status === 401) { showLogin(); throw new Error("signed out"); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data;
+}
+
+/* ---- guild-timezone date helpers ---- */
+function dayKey(iso) { // yyyy-mm-dd in the guild's timezone
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: S.tz, year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date(iso));
+}
+function dayLabel(iso) { // "Sun 7/6", plus ’27 when it's another year
+  const d = new Date(iso);
+  let label = new Intl.DateTimeFormat("en-US", {
+    timeZone: S.tz, weekday: "short", month: "numeric", day: "numeric",
+  }).format(d).replace(",", "");
+  const y = new Intl.DateTimeFormat("en-US", { timeZone: S.tz, year: "numeric" }).format(d);
+  if (y !== new Intl.DateTimeFormat("en-US", { timeZone: S.tz, year: "numeric" }).format(new Date()))
+    label += " ’" + y.slice(-2);
+  return label;
+}
+function timeLabel(iso) {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: S.tz, hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(new Date(iso));
+}
+function defaultEnd() {
+  return dayKey(new Date(Date.now() + 7 * 864e5).toISOString());
+}
+
+/* ---- toast ---- */
+let toastTimer = null;
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.remove("hidden");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.add("hidden"), 4000);
+}
+
+/* ---- boot / auth ---- */
+function showLogin() {
+  $("app").classList.add("hidden");
+  $("login").classList.remove("hidden");
+}
+async function boot() {
+  let me;
+  try { me = await api("/api/me"); } catch { showLogin(); return; }
+  S.me = me;
+  $("login").classList.add("hidden");
+  $("app").classList.remove("hidden");
+  const saved = localStorage.getItem("joblin_gid");
+  S.gid = me.guilds.some((g) => g.id === saved) ? saved : (me.guilds[0] || {}).id;
+  renderDrawer();
+  if (!S.gid) {
+    $("guildname").textContent = "Joblin";
+    $("list").replaceChildren(h("div", { class: "empty" },
+      "No server available — the bot may be offline. Pull down to retry in a bit."));
+    return;
+  }
+  await loadSchedule();
+}
+async function loadSchedule() {
+  const data = await api(`/api/guilds/${S.gid}/schedule`);
+  S.tz = data.timezone;
+  S.configReady = data.config_ready;
+  S.items = data.items;
+  if (!S.end) S.end = defaultEnd();
+  $("through").value = S.end;
+  const g = S.me.guilds.find((g) => g.id === S.gid);
+  $("guildname").textContent = g ? g.name : "Joblin";
+  render();
+}
+
+/* ---- drawer ---- */
+function renderDrawer() {
+  const u = S.me.user;
+  $("whoami").replaceChildren(
+    u.avatar ? h("img", { src: u.avatar, alt: "" }) : h("div", { class: "mark" }, "🌾"),
+    h("div", null, h("div", { class: "name" }, u.name), h("div", { class: "sub" }, "signed in with Discord")),
+  );
+  $("guilds").replaceChildren(...S.me.guilds.map((g) =>
+    h("button", {
+      class: "guildbtn" + (g.id === S.gid ? " active" : ""),
+      onclick: async () => {
+        S.gid = g.id; S.open = null; S.end = null;
+        localStorage.setItem("joblin_gid", g.id);
+        closeDrawer(); renderDrawer();
+        await loadSchedule();
+      },
+    }, g.name)
+  ));
+}
+function openDrawer() { $("drawer").classList.remove("hidden"); $("scrim").classList.remove("hidden"); }
+function closeDrawer() { $("drawer").classList.add("hidden"); $("scrim").classList.add("hidden"); }
+
+/* ---- schedule rendering ---- */
+function splitItems() {
+  const now = Date.now();
+  const nowish = [], upcoming = [], later = [];
+  for (const it of S.items) {
+    if (it.status === "pending" || it.status === "live" ||
+        (it.due_at && new Date(it.due_at).getTime() <= now)) nowish.push(it);
+    else if (it.due_at && dayKey(it.due_at) <= S.end) upcoming.push(it);
+    else later.push(it);
+  }
+  return { nowish, upcoming, later };
+}
+
+function barIcons(it) { // recurrence details show on expand, not on the bar
+  return (KIND_ICON[it.kind] || "") + (it.bounty ? "💰" : "");
+}
+
+function rows(items, { urgent = false } = {}) {
+  const out = [];
+  let prevDay = null;
+  for (const it of items) {
+    const key = it.due_at ? dayKey(it.due_at) : null;
+    const first = key !== prevDay;
+    prevDay = key;
+    const gutter = h("div", { class: "gutter" },
+      first && key ? h("span", { class: "day" }, dayLabel(it.due_at)) : null,
+      it.due_at ? h("span", { class: urgent ? "now-time" : "" }, timeLabel(it.due_at))
+                : h("span", null, "open"),
+    );
+    const icons = barIcons(it);
+    const bar = h("button", {
+      class: "bar",
+      onclick: () => { S.open = S.open === it.id ? null : it.id; render(); },
+    }, it.brief, icons ? h("span", { class: "icons" }, " " + icons) : null);
+    const row = h("div", { class: "row" + (urgent ? " urgent" : "") + (S.open === it.id ? " expanded" : "") },
+      gutter, bar);
+    if (S.open === it.id) row.append(it.editable ? editorPanel(it) : gamePanel(it));
+    out.push(row);
+  }
+  return out;
+}
+
+function render() {
+  const list = $("list");
+  const { nowish, upcoming, later } = splitItems();
+  const kids = [];
+  if (!S.configReady)
+    kids.push(h("div", { class: "banner" },
+      "Finish setup in Discord: run /joblinconfig to set the channel and timezone."));
+  if (nowish.length) {
+    kids.push(h("div", { class: "sect now" }, "Now"));
+    kids.push(...rows(nowish, { urgent: true }));
+  }
+  if (upcoming.length) {
+    kids.push(h("div", { class: "sect" }, "Coming up"));
+    kids.push(...rows(upcoming));
+  }
+  if (later.length) {
+    kids.push(h("button", { id: "laterbtn", onclick: () => { S.showLater = !S.showLater; render(); } },
+      (S.showLater ? "▾" : "▸") + ` Later (${later.length})`));
+    if (S.showLater) kids.push(...rows(later));
+  }
+  if (!S.items.length)
+    kids.push(h("div", { class: "empty" }, "Nothing scheduled yet — tap ＋ to add the first chore."));
+  list.replaceChildren(...kids);
+}
+
+/* ---- editor panels ---- */
+function field(label, el, hint) {
+  return h("div", { class: "field" }, h("label", null, label), el,
+    hint ? h("div", { class: "hint" }, hint) : null);
+}
+
+function taskForm(it) { // it = null for a new task
+  const brief = h("input", { type: "text", value: it ? it.brief : "", maxLength: 200 });
+  const at = h("input", { type: "text", value: it ? it.at_input : "" });
+  const repeat = h("input", { type: "text", value: it ? it.repeat_input : "" });
+  const desc = h("textarea", { value: it ? it.description : "", rows: 2, maxLength: 1500 });
+  const bounty = h("input", { type: "checkbox", checked: it ? it.bounty : false });
+  const err = h("div", { class: "err hidden" });
+  const form = h("div", null,
+    field("What", brief),
+    field("When", at, it ? AT_HINT : "empty = now · " + AT_HINT),
+    field("Repeat", repeat, it ? REPEAT_HINT : "empty = once · " + REPEAT_HINT),
+    field("Details", desc, "shown by the ℹ️ reaction"),
+    h("label", { class: "check" }, bounty, "Bounty — 2 puntos, someone else must do it"),
+    err,
+  );
+  form.values = () => ({ brief, at, repeat, desc, bounty });
+  form.showError = (msg) => { err.textContent = msg; err.classList.remove("hidden"); };
+  return form;
+}
+
+function editorPanel(it) {
+  const form = taskForm(it);
+  const save = h("button", { class: "btn" }, "Save");
+  save.addEventListener("click", async () => {
+    const v = form.values();
+    const changed = {};
+    if (v.brief.value.trim() !== it.brief) changed.brief = v.brief.value.trim();
+    if (v.desc.value.trim() !== it.description) changed.description = v.desc.value.trim();
+    if (v.bounty.checked !== it.bounty) changed.bounty = v.bounty.checked;
+    // `at`/`repeat` only when touched — an untouched save must never re-anchor
+    // the schedule (mirrors how /edit task treats omitted options).
+    if (v.at.value.trim() !== it.at_input && v.at.value.trim()) changed.at = v.at.value.trim();
+    if (v.repeat.value.trim() !== it.repeat_input && v.repeat.value.trim()) changed.repeat = v.repeat.value.trim();
+    if (!Object.keys(changed).length) { S.open = null; render(); return; }
+    save.disabled = true;
+    try {
+      const res = await api(`/api/guilds/${S.gid}/tasks/${it.id}`, {
+        method: "PATCH", body: JSON.stringify(changed),
+      });
+      S.open = null;
+      toast(res.note || "Saved ✏️");
+      await loadSchedule();
+    } catch (e) { form.showError(e.message); save.disabled = false; }
+  });
+  const del = h("button", { class: "btn danger" }, "Delete");
+  del.addEventListener("click", async () => {
+    if (!confirm(`Delete “${it.brief}” for good?`)) return;
+    try {
+      await api(`/api/guilds/${S.gid}/tasks/${it.id}`, { method: "DELETE" });
+      S.open = null;
+      toast("Deleted 🗑️");
+      await loadSchedule();
+    } catch (e) { form.showError(e.message); }
+  });
+  const meta = [it.schedule_label];
+  if (it.status === "pending") meta.push("posted in Discord, waiting on ✅");
+  if (it.nag_count) meta.push(`nagged ${it.nag_count}×`);
+  return h("div", { class: "panel" },
+    h("div", { class: "meta" }, meta.join(" · ")),
+    form,
+    h("div", { class: "actions" },
+      save,
+      h("button", { class: "btn quiet", onclick: () => { S.open = null; render(); } }, "Close"),
+      del),
+  );
+}
+
+function gamePanel(it) {
+  const noun = it.kind === "pitchin" ? "pitch-in" : "do-em-up";
+  const meta = [`${KIND_ICON[it.kind]} ${noun}`, it.schedule_label,
+    `+${it.points_each} punto${it.points_each === 1 ? "" : "s"} each`];
+  if (it.status === "live") meta.push("live in Discord now");
+  return h("div", { class: "panel" },
+    h("div", { class: "meta" }, meta.join(" · ")),
+    it.description ? h("div", { class: "gamenote" }, it.description) : null,
+    h("div", { class: "gamenote" },
+      `Played from Discord — tweak it there with /edit ${it.kind}, or remove it with /deletetask.`),
+    h("div", { class: "actions" },
+      h("button", { class: "btn quiet", onclick: () => { S.open = null; render(); } }, "Close")),
+  );
+}
+
+/* ---- new-task sheet ---- */
+function openSheet() {
+  const form = taskForm(null);
+  const create = h("button", { class: "btn" }, "Create");
+  create.addEventListener("click", async () => {
+    const v = form.values();
+    const body = { brief: v.brief.value.trim(), bounty: v.bounty.checked };
+    if (v.at.value.trim()) body.at = v.at.value.trim();
+    if (v.repeat.value.trim()) body.repeat = v.repeat.value.trim();
+    if (v.desc.value.trim()) body.description = v.desc.value.trim();
+    create.disabled = true;
+    try {
+      await api(`/api/guilds/${S.gid}/tasks`, { method: "POST", body: JSON.stringify(body) });
+      closeSheet();
+      toast("Created ✅");
+      await loadSchedule();
+    } catch (e) { form.showError(e.message); create.disabled = false; }
+  });
+  $("sheet").replaceChildren(
+    h("h2", null, "New task"),
+    form,
+    h("div", { class: "actions" },
+      create,
+      h("button", { class: "btn quiet", onclick: closeSheet }, "Cancel")),
+  );
+  $("sheet").classList.remove("hidden");
+  form.values().brief.focus();
+}
+function closeSheet() { $("sheet").classList.add("hidden"); $("sheet").replaceChildren(); }
+
+/* ---- wiring ---- */
+$("burger").addEventListener("click", openDrawer);
+$("scrim").addEventListener("click", closeDrawer);
+$("fab").addEventListener("click", openSheet);
+$("through").addEventListener("change", (e) => { S.end = e.target.value || defaultEnd(); render(); });
+// Refresh when the app returns to the foreground — but never mid-edit.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && S.gid && !S.open && $("sheet").classList.contains("hidden"))
+    loadSchedule().catch(() => {});
+});
+setInterval(() => {
+  if (!document.hidden && S.gid && !S.open && $("sheet").classList.contains("hidden"))
+    loadSchedule().catch(() => {});
+}, 90000);
+boot();
+</script>
+</body>
+</html>

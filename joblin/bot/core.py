@@ -55,7 +55,11 @@ class JoblinBot(commands.Bot):
         # Local imports avoid an import cycle (these modules import `bot`).
         from .scheduler import scheduler
         from .games import DoEmUpButton
+        from ..web import start_web
         scheduler.start()
+        # The web UI shares this event loop; it's a no-op unless configured
+        # and never raises (a web failure must not take the bot down).
+        await start_web()
         # Revive every do-em-up's buttons after a restart in one shot.
         self.add_dynamic_items(DoEmUpButton)
         dev_guild = os.getenv("DEV_GUILD_ID")
