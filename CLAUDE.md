@@ -60,7 +60,7 @@ Everything keys off `store["messages"][message_id] → task_id`, so reactions ke
 | `bot/listing.py` | `/listtasks` (paginated), `/listopen`, `/joblinhelp`. |
 | `bot/admin.py` | `main()` entry point, owner-only `/redeploy`, global app-command error handler, `on_ready`. |
 | `bot/helpers.py` | Small formatting/occurrence-I/O helpers (schedule labels, post rendering, safe delete, reaction setup). |
-| `web/` | The optional bundled web UI: `__init__.py` (aiohttp server on the bot's loop — Discord OAuth + signed-cookie sessions, JSON API mirroring `/newtask`, `/edit task`, `/deletetask`; started by `core.setup_hook`, always reads `core.store` so the tests' store swap holds) and `index.html` (the whole frontend: one vanilla-JS mobile-first page, no build step). View + task CRUD only — completing chores/earning puntos stays Discord-only, and games are shown read-only. |
+| `web/` | The optional bundled web UI: `__init__.py` (aiohttp server on the bot's loop — Discord OAuth + signed-cookie sessions, JSON API mirroring `/newtask`, `/edit task`, `/deletetask`, `/edit pitchin|doemup` (via the shared `apply_game_edit` engine in `bot/commands/edit.py`) and the game branch of `/deletetask`; started by `core.setup_hook`, always reads `core.store` so the tests' store swap holds) and `index.html` (the whole frontend: one vanilla-JS mobile-first page, no build step). View + task/game CRUD — completing chores/earning puntos stays Discord-only. |
 
 ## Domain concepts (vocabulary you'll meet)
 

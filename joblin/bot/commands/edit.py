@@ -1,8 +1,9 @@
 """The ``/edit`` group — one subcommand per type (task / pitchin / doemup),
 so each only ever shows its own fields: no bounty on a pitch-in, no
 max_scorers on a task. The two game subcommands share one engine
-(:func:`_apply_game_edit`); the group is registered on the tree at the bottom
-of this module, once all three subcommands are defined."""
+(:func:`apply_game_edit`, also the web UI's game-edit backend); the group is
+registered on the tree at the bottom of this module, once all three
+subcommands are defined."""
 
 from __future__ import annotations
 
@@ -167,106 +168,140 @@ def _set_game_recurrence(g: dict, rec: Optional[dict]) -> None:
                   "weekdays": [], "monthdays": [], "time_of_day": None})
 
 
-async def _apply_game_edit(
-    interaction: discord.Interaction, *, kind: str, section: str,
-    close_field: str, cap_field: str, event_text: str,
-    brief: Optional[str], at: Optional[str], repeat: Optional[str],
-    description: Optional[str], clear_description: bool,
-    close: Optional[str], puntos: Optional[int], cap: Optional[int],
-) -> None:
-    """Shared engine for /edit pitchin and /edit doemup — they differ only in the
-    close field (expires_at vs deadline) and the cap field (max_scorers vs
-    point_limit). A schedule change recomputes the next open slot for a
-    scheduled/dormant round; for a live round it applies from the next round (the
-    open post is left alone except for an explicit close-time change)."""
+# (section, close field, cap field, cap ceiling) per game kind — the only
+# structural differences between a pitch-in and a do-em-up edit.
+_GAME_SURFACE = {
+    "pitchin": ("pitchins", "expires_at", "max_scorers", 100),
+    "doemup": ("doemups", "deadline", "point_limit", 100000),
+}
+
+
+_UNSET = object()  # "no schedule change" — distinct from an explicit None
+
+
+async def apply_game_edit(
+    guild_id: int, kind: str, event_id: str, fields: dict
+) -> tuple[Optional[dict], Optional[str], Optional[str]]:
+    """Edit a pitch-in / do-em-up ("pitchin" | "doemup") by id: the engine
+    behind /edit pitchin, /edit doemup, and the web UI. Key *presence* in
+    ``fields`` is intent (brief, description — empty clears, at, repeat,
+    close, puntos, cap), mirroring the web's task edit. A schedule change
+    recomputes the next open slot for a scheduled/dormant round; for a live
+    round it applies from the next round (the open post is left alone except
+    for an explicit close-time change, and is re-rendered so any text/puntos
+    change shows immediately). Returns (updated, note, error)."""
+    section, close_field, cap_field, cap_max = _GAME_SURFACE[kind]
     noun = "pitch-in" if kind == "pitchin" else "do-em-up"
     snap = await store.snapshot()
-    event = _find_game_in(snap, interaction.guild_id, section, event_text)
-    if not event:
-        await interaction.response.send_message(
-            f"❌ {noun.capitalize()} not found. Use `/listtasks` to see ids.", ephemeral=True)
-        return
-    if (brief is None and at is None and repeat is None and description is None
-            and not clear_description and close is None and puntos is None and cap is None):
-        await interaction.response.send_message(
-            "❌ Nothing to change — set at least one field.", ephemeral=True)
-        return
+    event = snap[section].get(event_id)
+    if not event or str(event["guild_id"]) != str(guild_id):
+        return None, None, f"{noun.capitalize()} not found."
+    if not any(k in fields for k in
+               ("brief", "description", "at", "repeat", "close", "puntos", "cap")):
+        return None, None, "Nothing to change — set at least one field."
 
-    cfg = guild_config(snap, interaction.guild_id)
-    recompute = at is not None or repeat is not None or close is not None
+    puntos = cap = None
+    if fields.get("puntos") is not None:
+        try:
+            puntos = int(fields["puntos"])
+        except (TypeError, ValueError):
+            puntos = 0
+        if not 1 <= puntos <= 100:
+            return None, None, "puntos must be between 1 and 100."
+    if fields.get("cap") is not None:
+        try:
+            cap = int(fields["cap"])
+        except (TypeError, ValueError):
+            cap = 0
+        if not 1 <= cap <= cap_max:
+            return None, None, f"the cap must be between 1 and {cap_max}."
+
+    cfg = guild_config(snap, guild_id)
+    recompute = "at" in fields or "repeat" in fields or "close" in fields
     if recompute and not config_ready(cfg):
-        await interaction.response.send_message(
-            "❌ Set a timezone with `/joblinconfig` before changing the schedule.", ephemeral=True)
-        return
+        return None, None, "Set a timezone with /joblinconfig before changing the schedule."
     tz = ZoneInfo(cfg["timezone"]) if (cfg and cfg.get("timezone")) else UTC
     now = now_utc()
 
+    at = fields.get("at")
     new_rec = None
-    rec_changed = at is not None or repeat is not None
+    rec_changed = "at" in fields or "repeat" in fields
     if rec_changed:
         try:
-            if repeat is not None:
-                new_rec = _game_recurrence_from(repeat, tz, now, at)
+            if "repeat" in fields:
+                new_rec = _game_recurrence_from(fields["repeat"], tz, now, at)
             else:  # only `at` changed — keep the existing rule, move its slot
                 new_rec = recurrence_of(event) if event.get("recurring") else None
                 if new_rec is not None and at is not None:
                     new_rec = {**new_rec, "time_of_day": time_of_day_from(at, tz, now)}
         except ValueError as e:
-            await interaction.response.send_message(
-                f"❌ {e}\nSee `/joblinhelp` for the formats.", ephemeral=True)
-            return
+            return None, None, str(e)
 
     updated = None
     err = None
     async with store.txn() as data:
-        g = data[section].get(event["id"])
-        if g and str(g["guild_id"]) == str(interaction.guild_id):
+        g = data[section].get(event_id)
+        if g and str(g["guild_id"]) == str(guild_id):
             live = bool(g.get("message_id"))
-            if brief is not None:
-                g["brief"] = str(brief)
-            if clear_description:
-                g["description"] = None
-            elif description is not None:
-                g["description"] = description[:1000]
-            if puntos is not None:
-                g["points_each"] = int(puntos)
-            if cap is not None:
-                g[cap_field] = int(cap)
 
-            if rec_changed:
-                _set_game_recurrence(g, new_rec)
-                if not live:  # scheduled or dormant — recompute the next open slot
-                    if new_rec:
-                        g["next_due"] = to_iso(_game_next_round(g, tz, now))
-                    elif at is not None:
+            # Resolve every fallible instant BEFORE touching g: in-memory data
+            # is canonical during a run, so a mutation made before an error
+            # would stick (and get flushed by the next clean txn) — validate
+            # everything first, commit only when the whole edit is good.
+            new_next_due = _UNSET
+            if rec_changed and not live:  # scheduled/dormant — next open slot moves
+                if new_rec:
+                    probe = {**g}
+                    _set_game_recurrence(probe, new_rec)
+                    new_next_due = to_iso(_game_next_round(probe, tz, now))
+                elif at is not None:
+                    try:
                         start = resolve_when(at, tz, now)
                         if start <= now:
                             err = "that start time is already in the past"
                         else:
-                            g["next_due"] = to_iso(start)
+                            new_next_due = to_iso(start)
+                    except ValueError as e:
+                        err = str(e)
 
-            if err is None and close is not None:
-                base = now if live else (from_iso(g["next_due"]) if g.get("next_due") else now)
-                new_close = resolve_when(close, tz, base)
-                if new_close <= base:
-                    err = "that close time is already in the past"
-                else:
+            new_close = None
+            if err is None and fields.get("close") is not None:
+                nd_iso = new_next_due if new_next_due is not _UNSET else g.get("next_due")
+                base = now if live else (from_iso(nd_iso) if nd_iso else now)
+                try:
+                    new_close = resolve_when(str(fields["close"]), tz, base)
+                    if new_close <= base:
+                        err = "that close time is already in the past"
+                except ValueError as e:
+                    err = str(e)
+
+            if err is None:
+                if "brief" in fields:
+                    brief = str(fields["brief"] or "").strip()[:200]
+                    if brief:
+                        g["brief"] = brief
+                if "description" in fields:
+                    desc = str(fields["description"] or "").strip()
+                    g["description"] = desc[:1000] if desc else None
+                if puntos is not None:
+                    g["points_each"] = puntos
+                if cap is not None:
+                    g[cap_field] = cap
+                if rec_changed:
+                    _set_game_recurrence(g, new_rec)
+                    if new_next_due is not _UNSET:
+                        g["next_due"] = new_next_due
+                if new_close is not None:
                     if live:
                         g[close_field] = to_iso(new_close)
                     if g.get("recurring") or not live:
                         g["duration_secs"] = max(1, int((new_close - base).total_seconds()))
-
-            if err is None:
                 updated = json.loads(json.dumps(g))
 
     if err:
-        await interaction.response.send_message(
-            f"❌ {err}\nSee `/joblinhelp` for the time formats.", ephemeral=True)
-        return
+        return None, None, err
     if not updated:
-        await interaction.response.send_message(
-            f"❌ {noun.capitalize()} not found.", ephemeral=True)
-        return
+        return None, None, f"{noun.capitalize()} not found."
 
     # Re-render a live post so any text/puntos/close change shows immediately.
     live_mid = updated.get("message_id")
@@ -285,6 +320,60 @@ async def _apply_game_edit(
             except discord.HTTPException:
                 pass
 
+    note = None
+    if live_mid and rec_changed:
+        note = "A round is live in Discord now; the new schedule applies from the next round."
+    return updated, note, None
+
+
+async def _apply_game_edit(
+    interaction: discord.Interaction, *, kind: str, section: str, event_text: str,
+    brief: Optional[str], at: Optional[str], repeat: Optional[str],
+    description: Optional[str], clear_description: bool,
+    close: Optional[str], puntos: Optional[int], cap: Optional[int],
+) -> None:
+    """Interaction front-end for /edit pitchin and /edit doemup: resolve the
+    free-text event, translate the options into :func:`apply_game_edit`'s
+    presence-is-intent fields, and word the outcome for Discord."""
+    noun = "pitch-in" if kind == "pitchin" else "do-em-up"
+    snap = await store.snapshot()
+    event = _find_game_in(snap, interaction.guild_id, section, event_text)
+    if not event:
+        await interaction.response.send_message(
+            f"❌ {noun.capitalize()} not found. Use `/listtasks` to see ids.", ephemeral=True)
+        return
+
+    fields: dict = {}
+    if brief is not None:
+        fields["brief"] = str(brief)
+    if clear_description:
+        fields["description"] = ""
+    elif description is not None:
+        fields["description"] = description
+    if at is not None:
+        fields["at"] = at
+    if repeat is not None:
+        fields["repeat"] = repeat
+    if close is not None:
+        fields["close"] = close
+    if puntos is not None:
+        fields["puntos"] = int(puntos)
+    if cap is not None:
+        fields["cap"] = int(cap)
+    if not fields:
+        await interaction.response.send_message(
+            "❌ Nothing to change — set at least one field.", ephemeral=True)
+        return
+
+    updated, _note, err = await apply_game_edit(
+        interaction.guild_id, kind, event["id"], fields)
+    if err:
+        await interaction.response.send_message(
+            f"❌ {err}\nSee `/joblinhelp` for the formats.", ephemeral=True)
+        return
+
+    rec_changed = at is not None or repeat is not None
+    live_mid = updated.get("message_id")
     sched = describe_repeat(recurrence_of(updated)) if updated.get("recurring") else "one-off"
     tail = ""
     if updated.get("next_due"):
@@ -322,8 +411,7 @@ async def edit_pitchin(
     max_scorers: Optional[app_commands.Range[int, 1, 100]] = None,
 ) -> None:
     await _apply_game_edit(
-        interaction, kind="pitchin", section="pitchins",
-        close_field="expires_at", cap_field="max_scorers", event_text=event,
+        interaction, kind="pitchin", section="pitchins", event_text=event,
         brief=brief, at=at, repeat=repeat, description=description,
         clear_description=clear_description, close=expires, puntos=puntos, cap=max_scorers,
     )
@@ -354,8 +442,7 @@ async def edit_doemup(
     point_limit: Optional[app_commands.Range[int, 1, 100000]] = None,
 ) -> None:
     await _apply_game_edit(
-        interaction, kind="doemup", section="doemups",
-        close_field="deadline", cap_field="point_limit", event_text=event,
+        interaction, kind="doemup", section="doemups", event_text=event,
         brief=brief, at=at, repeat=repeat, description=description,
         clear_description=clear_description, close=deadline, puntos=puntos, cap=point_limit,
     )
@@ -381,6 +468,7 @@ bot.tree.add_command(edit)
 __all__ = [
     "_apply_game_edit",
     "_set_game_recurrence",
+    "apply_game_edit",
     "edit",
     "edit_doemup",
     "edit_pitchin",

@@ -121,10 +121,11 @@ main { padding: .25rem 1rem 0; max-width: 34rem; margin: 0 auto; }
   display: block; font-size: .68rem; font-weight: 700; letter-spacing: .1em;
   text-transform: uppercase; color: var(--muted); margin-bottom: .2rem;
 }
-.field input[type="text"], .field textarea {
+.field input[type="text"], .field input[type="number"], .field textarea {
   width: 100%; font: inherit; font-size: 16px; color: var(--ink);
   background: var(--paper); border: 0; border-radius: 8px; padding: .5rem .6rem;
 }
+.fieldrow { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
 .field textarea { resize: vertical; min-height: 2.6rem; }
 .field .hint { font-size: .72rem; color: var(--muted); margin-top: .2rem; }
 .check { display: flex; align-items: center; gap: .5rem; font-size: .9rem; margin: .2rem 0 .6rem; }
@@ -406,7 +407,7 @@ function rows(items, { urgent = false } = {}) {
     }, it.brief, icons ? h("span", { class: "icons" }, " " + icons) : null);
     const row = h("div", { class: "row" + (urgent ? " urgent" : "") + (S.open === it.id ? " expanded" : "") },
       gutter, bar);
-    if (S.open === it.id) row.append(it.editable ? editorPanel(it) : gamePanel(it));
+    if (S.open === it.id) row.append(it.kind === "task" ? editorPanel(it) : gamePanel(it));
     out.push(row);
   }
   return out;
@@ -510,18 +511,74 @@ function editorPanel(it) {
   );
 }
 
-function gamePanel(it) {
-  const noun = it.kind === "pitchin" ? "pitch-in" : "do-em-up";
+function gamePanel(it) { // the game editor — mirrors /edit pitchin | /edit doemup
+  const isPitchin = it.kind === "pitchin";
+  const noun = isPitchin ? "pitch-in" : "do-em-up";
+  const brief = h("input", { type: "text", value: it.brief, maxLength: 200 });
+  const at = h("input", { type: "text", value: it.at_input });
+  const repeat = h("input", { type: "text", value: it.repeat_input });
+  const close = h("input", { type: "text", value: "" });
+  const puntos = h("input", { type: "number", value: it.points_each, min: 1, max: 100 });
+  const cap = h("input", { type: "number", value: it.cap == null ? "" : it.cap, min: 1 });
+  const desc = h("textarea", { value: it.description, rows: 2, maxLength: 1000 });
+  const err = h("div", { class: "err hidden" });
+  const showError = (msg) => { err.textContent = msg; err.classList.remove("hidden"); };
+
+  const save = h("button", { class: "btn" }, "Save");
+  save.addEventListener("click", async () => {
+    const changed = {};
+    if (brief.value.trim() !== it.brief) changed.brief = brief.value.trim();
+    if (desc.value.trim() !== it.description) changed.description = desc.value.trim();
+    // `at`/`repeat` only when touched — an untouched save must never re-anchor
+    // the schedule; `close` only when filled in (it's an instruction, not state).
+    if (at.value.trim() !== it.at_input && at.value.trim()) changed.at = at.value.trim();
+    if (repeat.value.trim() !== it.repeat_input && repeat.value.trim()) changed.repeat = repeat.value.trim();
+    if (close.value.trim()) changed.close = close.value.trim();
+    if (puntos.value.trim() && +puntos.value !== it.points_each) changed.puntos = +puntos.value;
+    if (cap.value.trim() && +cap.value !== it.cap) changed.cap = +cap.value;
+    if (!Object.keys(changed).length) { S.open = null; render(); return; }
+    save.disabled = true;
+    try {
+      const res = await api(`/api/guilds/${S.gid}/games/${it.kind}/${it.id}`, {
+        method: "PATCH", body: JSON.stringify(changed),
+      });
+      S.open = null;
+      toast(res.note || "Saved ✏️");
+      await loadSchedule();
+    } catch (e) { showError(e.message); save.disabled = false; }
+  });
+  const del = h("button", { class: "btn danger" }, "Delete");
+  del.addEventListener("click", async () => {
+    if (!confirm(`Delete the ${noun} “${it.brief}” for good? A live round is cancelled — no puntos.`)) return;
+    try {
+      await api(`/api/guilds/${S.gid}/games/${it.kind}/${it.id}`, { method: "DELETE" });
+      S.open = null;
+      toast("Deleted 🗑️");
+      await loadSchedule();
+    } catch (e) { showError(e.message); }
+  });
+
   const meta = [`${KIND_ICON[it.kind]} ${noun}`, it.schedule_label,
     `+${it.points_each} punto${it.points_each === 1 ? "" : "s"} each`];
   if (it.status === "live") meta.push("live in Discord now");
   return h("div", { class: "panel" },
     h("div", { class: "meta" }, meta.join(" · ")),
-    it.description ? h("div", { class: "gamenote" }, it.description) : null,
-    h("div", { class: "gamenote" },
-      `Played from Discord — tweak it there with /edit ${it.kind}, or remove it with /deletetask.`),
+    field("What", brief),
+    field("When", at, "next open — 06:00 · tomorrow 8am" + (it.recurring ? " (the recurring slot)" : "")),
+    field("Repeat", repeat, REPEAT_HINT),
+    field(isPitchin ? "Closes" : "Deadline", close,
+      (it.status === "live" ? "this round — " : "each round — ") + "empty = keep · in 5m · 18:00 · tonight"),
+    h("div", { class: "fieldrow" },
+      field(isPitchin ? "Puntos each" : "Puntos per ➕", puntos),
+      field(isPitchin ? "First n score" : "Punto limit", cap, "empty = keep"),
+    ),
+    field("Details", desc, "shown on the post"),
+    err,
+    h("div", { class: "gamenote" }, "Played from Discord — the web only tunes the setup."),
     h("div", { class: "actions" },
-      h("button", { class: "btn quiet", onclick: () => { S.open = null; render(); } }, "Close")),
+      save,
+      h("button", { class: "btn quiet", onclick: () => { S.open = null; render(); } }, "Close"),
+      del),
   );
 }
 

@@ -2161,8 +2161,8 @@ def test_web_repeat_input() -> None:
 
 
 def test_web_schedule() -> None:
-    """build_schedule: guild filtering, pending/live-first ordering, form
-    prefills, and read-only games — all from a plain snapshot."""
+    """build_schedule: guild filtering, pending/live-first ordering, and form
+    prefills for tasks and games alike — all from a plain snapshot."""
     now = m.now_utc()
     base = {"weekdays": [], "monthdays": [], "pending": None}
     snap = {
@@ -2198,7 +2198,9 @@ def test_web_schedule() -> None:
     assert items["bb"]["at_input"].count(":") == 1 and "-" in items["bb"]["at_input"]
     assert items["aa"]["status"] == "scheduled"
     assert items["aa"]["repeat_input"] == "daily" and items["aa"]["at_input"] == "18:00"
-    assert items["pp"]["status"] == "live" and items["pp"]["editable"] is False
+    assert items["pp"]["status"] == "live" and items["pp"]["editable"] is True
+    assert items["pp"]["repeat_input"] == "once" and items["pp"]["at_input"] == ""
+    assert items["pp"]["cap"] is None and items["pp"]["points_each"] == 2
     # An unconfigured guild still renders (UTC) but flags config_ready=False.
     bare = webui.build_schedule({**snap, "configs": {}}, 1)
     assert bare["timezone"] == "UTC" and not bare["config_ready"]
@@ -2260,6 +2262,85 @@ async def test_web_task_crud() -> None:
         assert tid not in snap["tasks"] and "555" not in snap["messages"]
 
 
+async def test_web_game_crud() -> None:
+    """The web's game surface: apply_game_edit (the same engine as /edit
+    pitchin|doemup) driven by presence-is-intent field dicts — live-post
+    re-render, dormant retimes, atomic rejects — and delete_game mirroring
+    the game branch of /deletetask (strike-through cancel, no puntos)."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        rule = {"freq": "days", "interval_days": 1, "weekdays": [], "monthdays": [],
+                "time_of_day": "07:00"}
+
+        # Live do-em-up: brief/puntos/description edit re-renders the open post.
+        did, msg = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="Old name", description=None,
+            points_each=1, deadline=None, point_limit=None, now=m.now_utc(),
+            recurrence=None, duration_secs=None,
+        )
+        upd, note, err = await webui.apply_game_edit(
+            1, "doemup", did, {"brief": "New name", "puntos": 3, "description": "with gusto"})
+        assert err is None and upd["points_each"] == 3 and upd["description"] == "with gusto"
+        assert "New name" in ch.msgs[msg.id].content, "live post re-rendered"
+        assert ch.msgs[msg.id].view is not None, "buttons kept on re-render"
+
+        # Presence is intent: an empty description clears it.
+        upd, note, err = await webui.apply_game_edit(1, "doemup", did, {"description": ""})
+        assert err is None and upd["description"] is None
+
+        # A bad close aborts the WHOLE edit — the brief must not half-commit.
+        upd, note, err = await webui.apply_game_edit(
+            1, "doemup", did, {"brief": "Half-saved", "close": "2020-01-01 08:00"})
+        assert upd is None and err and "past" in err
+        assert (await st.snapshot())["doemups"][did]["brief"] == "New name"
+        upd, note, err = await webui.apply_game_edit(
+            1, "doemup", did, {"brief": "Half-saved", "close": "blorp o'clock"})
+        assert upd is None and err and "couldn't read" in err
+        assert (await st.snapshot())["doemups"][did]["brief"] == "New name"
+
+        # Dormant recurring pitch-in: at: moves the daily slot and next round.
+        now = m.now_utc()
+        pid, _ = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Bed o'clock", description=None,
+            expires_at=m.to_iso(now - dt.timedelta(seconds=1)), points_each=1,
+            max_scorers=None, now=now, recurrence=rule, duration_secs=300,
+        )
+        await bot.sweep_games(m.now_utc(), await st.snapshot())  # close -> dormant
+        upd, note, err = await webui.apply_game_edit(1, "pitchin", pid, {"at": "22:30"})
+        assert err is None and upd["time_of_day"] == "22:30"
+        nd = m.from_iso(upd["next_due"])
+        assert nd > m.now_utc() and nd.astimezone(tz).strftime("%H:%M") == "22:30"
+
+        # Bad puntos, wrong guild, and an empty edit are clean errors.
+        upd, note, err = await webui.apply_game_edit(1, "pitchin", pid, {"puntos": 0})
+        assert upd is None and "puntos" in err
+        upd, note, err = await webui.apply_game_edit(2, "pitchin", pid, {"brief": "x"})
+        assert upd is None and "not found" in err.lower()
+        upd, note, err = await webui.apply_game_edit(1, "pitchin", pid, {})
+        assert upd is None and "nothing to change" in err.lower()
+
+        # A schedule change to a LIVE recurring round leaves the open post
+        # running and says so via the note.
+        did2, msg2 = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="Live recurring", description=None,
+            points_each=1, deadline=m.to_iso(m.now_utc() + dt.timedelta(hours=1)),
+            point_limit=None, now=m.now_utc(), recurrence=rule, duration_secs=3600,
+        )
+        upd, note, err = await webui.apply_game_edit(1, "doemup", did2, {"at": "06:15"})
+        assert err is None and note and "next round" in note
+        assert upd["time_of_day"] == "06:15" and upd["message_id"] == msg2.id
+
+        # Delete: wrong guild is a no-op; the right one pops the row, sweeps the
+        # message routing, and strikes the live post through as cancelled.
+        assert await webui.delete_game(2, "doemup", did2) is None
+        removed = await webui.delete_game(1, "doemup", did2)
+        assert removed and removed["id"] == did2
+        snap = await st.snapshot()
+        assert did2 not in snap["doemups"] and str(msg2.id) not in snap["game_messages"]
+        assert "cancelled" in ch.msgs[msg2.id].content
+
+
 def main() -> None:
     test_emoji_key()
     test_time_parsing()
@@ -2317,6 +2398,7 @@ def main() -> None:
     test_web_repeat_input()
     test_web_schedule()
     asyncio.run(test_web_task_crud())
+    asyncio.run(test_web_game_crud())
     print("✅ all smoke tests passed")
 
 

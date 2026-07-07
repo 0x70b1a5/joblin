@@ -6,10 +6,11 @@ service or tmux pane to manage. It is enabled only when ``WEB_BASE_URL``,
 ``DISCORD_CLIENT_ID`` and ``DISCORD_CLIENT_SECRET`` are all set; without them
 the bot runs exactly as before and never opens a port.
 
-Scope: a glanceable schedule plus convenient task create/edit/delete. It
-deliberately does **not** complete chores or award puntos — the ✅ lifecycle
-(finalizing the Discord post, the ↩️ undo anchor, 👏 claps) is keyed off
-Discord message ids and stays in Discord, so the economy has one door.
+Scope: a glanceable schedule plus convenient create/edit/delete for tasks,
+pitch-ins, and do-em-ups. It deliberately does **not** complete chores or
+award puntos — the ✅ lifecycle (finalizing the Discord post, the ↩️ undo
+anchor, 👏 claps) is keyed off Discord message ids and stays in Discord, so
+the economy has one door.
 
 Auth
 ----
@@ -30,9 +31,11 @@ API
 The JSON surface mirrors the slash commands rather than inventing new
 semantics: the schedule is assembled from a plain ``store.snapshot()``, and
 task create/edit/delete reuse ``schedule_from_rule`` + the exact field
-assignments of ``/newtask``, ``/edit task`` and ``/deletetask``. Pitch-ins
-and do-em-ups appear on the schedule read-only — their edit surface is much
-wider (live-post re-rendering, close/cap fields) and stays in Discord.
+assignments of ``/newtask``, ``/edit task`` and ``/deletetask``. Pitch-in and
+do-em-up edits go through :func:`apply_game_edit` — the very engine behind
+``/edit pitchin`` / ``/edit doemup`` (including its live-post re-render) —
+and game deletes mirror the game branch of ``/deletetask``. *Playing* the
+games (✅, ➕/➖, 🏁, 👏) stays in Discord.
 The store is always read as ``core.store`` (never a module global) so the
 test suite's store swap is observed here too.
 """
@@ -68,7 +71,8 @@ from ..models import (
 )
 from ..bot import core
 from ..bot.helpers import config_ready, guild_config, schedule_label
-from ..bot.commands.tasks import schedule_from_rule
+from ..bot.commands.edit import apply_game_edit
+from ..bot.commands.tasks import _cancel_game_message, schedule_from_rule
 from ..bot.reactions import _delete_panels, _take_task_panels
 
 DISCORD_API = "https://discord.com/api/v10"
@@ -204,13 +208,22 @@ def _task_item(t: dict, tz: ZoneInfo) -> dict:
     }
 
 
-def _game_item(g: dict, kind: str) -> dict:
+def _game_item(g: dict, kind: str, tz: ZoneInfo) -> dict:
     live = bool(g.get("message_id"))
     closes = g.get("expires_at") if kind == "pitchin" else g.get("deadline")
     rule = recurrence_of(g)
     label = describe_repeat(rule) if g.get("recurring") else "one-off"
     if g.get("recurring") and rule.get("time_of_day"):
         label += f" at {rule['time_of_day']}"
+    # `at` prefill: a recurring game's slot is its wall-clock time; a deferred
+    # one-off's is the instant its round opens; a live one-off has none (the
+    # round is already running — only its close can still move).
+    if g.get("recurring"):
+        at_input = rule.get("time_of_day") or ""
+    elif not live and g.get("next_due"):
+        at_input = from_iso(g["next_due"]).astimezone(tz).strftime("%Y-%m-%d %H:%M")
+    else:
+        at_input = ""
     return {
         "kind": kind,  # "pitchin" | "doemup"
         "id": g["id"],
@@ -218,12 +231,15 @@ def _game_item(g: dict, kind: str) -> dict:
         "description": g.get("description") or "",
         "recurring": bool(g.get("recurring")),
         "schedule_label": label,
+        "repeat_input": repeat_input_of(rule),
+        "at_input": at_input,
         # live → due_at is when the round closes (may be None: open-ended);
         # dormant/deferred → due_at is when the next round posts.
         "status": "live" if live else "scheduled",
         "due_at": closes if live else g.get("next_due"),
         "points_each": g.get("points_each", 1),
-        "editable": False,
+        "cap": g.get("max_scorers") if kind == "pitchin" else g.get("point_limit"),
+        "editable": True,
     }
 
 
@@ -251,7 +267,7 @@ def build_schedule(snap: dict, guild_id: int) -> dict:
     ]
     for kind, section in (("pitchin", "pitchins"), ("doemup", "doemups")):
         items += [
-            _game_item(g, kind)
+            _game_item(g, kind, tz)
             for g in snap[section].values()
             if str(g["guild_id"]) == str(guild_id)
         ]
@@ -393,6 +409,35 @@ async def delete_task(guild_id: int, tid: str) -> Optional[dict]:
             panels = _take_task_panels(data, tid)
             removed = data["tasks"].pop(tid, None)
     await _delete_panels(panels)  # Discord I/O stays outside the txn
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# Game mutations — edits go through /edit's own engine (apply_game_edit,
+# imported above); delete mirrors the game branch of /deletetask.
+# ---------------------------------------------------------------------------
+async def delete_game(guild_id: int, kind: str, eid: str) -> Optional[dict]:
+    """Delete a pitch-in / do-em-up series exactly as ``/deletetask`` would:
+    pop the row, sweep its reaction routing and claps, and strike through a
+    live post as cancelled (delete ≠ close — no puntos are awarded). Returns
+    the removed game, or None if it wasn't found in this guild."""
+    section = "pitchins" if kind == "pitchin" else "doemups"
+    removed, live_mid = None, None
+    async with core.store.txn() as data:
+        g = data[section].get(eid)
+        if g and str(g["guild_id"]) == str(guild_id):
+            live_mid = g.get("message_id")
+            data["game_messages"].pop(str(live_mid), None)
+            for mid, rec in list(data["claps"].items()):
+                if rec.get("task_id") == eid:
+                    data["claps"].pop(mid, None)
+            removed = data[section].pop(eid, None)
+    if removed and live_mid:  # Discord I/O stays outside the txn
+        channel = (core.bot.get_channel(int(removed["channel_id"]))
+                   if removed.get("channel_id") else None)
+        if channel is not None:
+            await _cancel_game_message(
+                channel, removed["brief"], live_mid, is_doemup=(kind == "doemup"))
     return removed
 
 
@@ -635,6 +680,44 @@ async def api_task_delete(request: web.Request) -> web.Response:
     return web.json_response({"deleted": removed["id"]})
 
 
+def _game_kind(request: web.Request) -> Optional[str]:
+    kind = request.match_info["kind"]
+    return kind if kind in ("pitchin", "doemup") else None
+
+
+async def api_game_edit(request: web.Request) -> web.Response:
+    _, gid, err = _authed_guild(request)
+    if err:
+        return err
+    if not _csrf_ok(request):
+        return _jerr(403, "Bad request origin.")
+    kind = _game_kind(request)
+    if kind is None:
+        return _jerr(404, "No such game kind.")
+    fields = await _json_body(request)
+    if fields is None:
+        return _jerr(400, "Expected a JSON object.")
+    updated, note, error = await apply_game_edit(gid, kind, request.match_info["eid"], fields)
+    if error:
+        return _jerr(400, error)
+    return web.json_response({"game": updated, "note": note})
+
+
+async def api_game_delete(request: web.Request) -> web.Response:
+    _, gid, err = _authed_guild(request)
+    if err:
+        return err
+    if not _csrf_ok(request):
+        return _jerr(403, "Bad request origin.")
+    kind = _game_kind(request)
+    if kind is None:
+        return _jerr(404, "No such game kind.")
+    removed = await delete_game(gid, kind, request.match_info["eid"])
+    if not removed:
+        return _jerr(404, f"{'Pitch-in' if kind == 'pitchin' else 'Do-em-up'} not found.")
+    return web.json_response({"deleted": removed["id"]})
+
+
 # ---------------------------------------------------------------------------
 # Startup (called from JoblinBot.setup_hook — same event loop as the bot)
 # ---------------------------------------------------------------------------
@@ -655,6 +738,8 @@ def build_app(cfg: dict) -> web.Application:
         web.post("/api/guilds/{gid}/tasks", api_task_create),
         web.patch("/api/guilds/{gid}/tasks/{tid}", api_task_edit),
         web.delete("/api/guilds/{gid}/tasks/{tid}", api_task_delete),
+        web.patch("/api/guilds/{gid}/games/{kind}/{eid}", api_game_edit),
+        web.delete("/api/guilds/{gid}/games/{kind}/{eid}", api_game_delete),
     ])
     return app
 
@@ -682,10 +767,12 @@ async def start_web() -> bool:
 
 
 __all__ = [
+    "apply_game_edit",
     "apply_task_edit",
     "build_app",
     "build_schedule",
     "create_task",
+    "delete_game",
     "delete_task",
     "read_session",
     "repeat_input_of",
