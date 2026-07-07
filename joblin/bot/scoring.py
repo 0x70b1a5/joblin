@@ -192,7 +192,9 @@ def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
     months = monthly_scores(records, guild_id)
     stars = star_counts(records, guild_id, current_month)
 
-    # All-time display names so a star holder shows even when idle this month.
+    # A one-line star roll-call, shown ONLY on the empty-month variant: the
+    # ranking lines below already wear each holder's ⭐×n, so repeating them in
+    # a separate section was redundant. (All-time names so an idle holder shows.)
     names = {uid: ent["name"] for bucket in months.values() for uid, ent in bucket.items()}
     star_line = ""
     if stars:
@@ -238,8 +240,6 @@ def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
 
     zone_note = trinkets.zone_blurb(month, bar, past=month < current_month)
     msg = f"🏆 **Chore leaderboard — {month}**\n{zone_note}\n" + "\n".join(lines)
-    if star_line:
-        msg += "\n\n" + star_line
     msg += "\n\n" + footer
     return msg, False
 

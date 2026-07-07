@@ -2053,9 +2053,14 @@ def test_leaderboard_text() -> None:
     # (April is a past month, so Pat also wears its ⭐ on the line).
     assert "**3 puntos** — <@1> ⭐×1 · 👏×1" in text
     assert "**1 punto** — <@2>" in text and "<@2> · 👏" not in text
-    # A month with nothing logged → empty flag set, gentle nudge shown.
+    # The ranking lines carry each holder's ⭐×n, so the separate Stars section
+    # is gone from the ranked board…
+    assert "**Stars**" not in text
+    # A month with nothing logged → empty flag set, gentle nudge shown — and
+    # …that's the one place the star roll-call still appears (no lines to wear it).
     text2, empty2 = bot.build_leaderboard(recs, 1, cfg, "2026-03")
     assert empty2 and "No chores logged" in text2
+    assert "⭐ **Stars** — <@1> ×1" in text2
     # Another guild's records never bleed in.
     _, empty3 = bot.build_leaderboard(recs, 9, cfg, "2026-04")
     assert empty3

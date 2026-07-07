@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -31,6 +32,14 @@ def guild_config(snapshot: dict, guild_id: int) -> Optional[dict]:
 
 def config_ready(cfg: Optional[dict]) -> bool:
     return bool(cfg and cfg.get("channel_id") and cfg.get("timezone"))
+
+
+def web_base_url() -> Optional[str]:
+    """The public URL of the bundled web UI, or None when it isn't configured.
+    Read straight from the env (not joblin.web) so the bot package never needs
+    to import the web package just to mention its address."""
+    base = (os.getenv("WEB_BASE_URL") or "").strip().rstrip("/")
+    return base or None
 
 
 def schedule_label(task: dict) -> str:
@@ -167,4 +176,5 @@ __all__ = [
     "post_occurrence",
     "safe_delete",
     "schedule_label",
+    "web_base_url",
 ]

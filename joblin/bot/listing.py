@@ -22,6 +22,7 @@ from .core import (
 from .helpers import (
     guild_config,
     schedule_label,
+    web_base_url,
 )
 
 
@@ -171,14 +172,20 @@ async def listtasks(interaction: discord.Interaction) -> None:
             )
     rows.extend(row for _, row in sorted(game_rows, key=lambda x: x[0]))
 
+    # The web UI (when configured) is the comfier place to browse this list —
+    # <angle brackets> keep the repeated link from unfurling an embed each time.
+    web = web_base_url()
+    web_note = f"\n_✏️ Browse & edit any time at <{web}>_" if web else ""
+
     if not rows:
         await interaction.response.send_message(
-            "No tasks or events yet. Create one with `/newtask`, `/pitchin`, or `/doemup`.",
+            "No tasks or events yet. Create one with `/newtask`, `/pitchin`, or `/doemup`."
+            + web_note,
             ephemeral=True,
         )
         return
 
-    head = "**Farm tasks & events** — edit with `/edit`, remove with `/deletetask`\n"
+    head = f"**Farm tasks & events** — edit with `/edit`, remove with `/deletetask`{web_note}\n"
     chunks = _chunk_rows(rows)
     multi = len(chunks) > 1
     pages: list[str] = []
@@ -278,10 +285,13 @@ async def listopen(interaction: discord.Interaction) -> None:
             closes = f" — closes {discord_ts(from_iso(when), 'R')}" if when else ""
             bucket.append((sort_at, f"• {icon} {head}{closes}"))
 
+    web = web_base_url()
     total = len(chores) + len(pitch) + len(doem)
     if total == 0:
+        note = f"\n_✏️ Peek at what's ahead: <{web}>_" if web else ""
         await interaction.response.send_message(
-            "✅ Nothing's open right now — you're all caught up! 🎉", allowed_mentions=NO_PINGS
+            "✅ Nothing's open right now — you're all caught up! 🎉" + note,
+            allowed_mentions=NO_PINGS,
         )
         return
 
@@ -295,6 +305,8 @@ async def listopen(interaction: discord.Interaction) -> None:
         for title, items in sections
         if items
     ]
+    if web:  # masked links render fine inside an embed, no unfurl to suppress
+        blocks.append(f"✏️ [Browse & edit the schedule]({web})")
     await interaction.response.send_message(
         embeds=_open_embeds(blocks, total), allowed_mentions=NO_PINGS
     )

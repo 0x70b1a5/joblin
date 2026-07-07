@@ -76,6 +76,7 @@ SESSION_COOKIE = "joblin_session"
 STATE_COOKIE = "joblin_oauth_state"
 SESSION_DAYS = 14
 HTML_PATH = pathlib.Path(__file__).parent / "index.html"
+STATIC_DIR = pathlib.Path(__file__).parent / "static"
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +455,21 @@ async def _json_body(request: web.Request) -> Optional[dict]:
 # Handlers
 # ---------------------------------------------------------------------------
 async def index(request: web.Request) -> web.StreamResponse:
-    return web.FileResponse(HTML_PATH, headers={"Cache-Control": "no-store"})
+    # The OpenGraph tags need absolute URLs, so the one {{BASE}} placeholder is
+    # filled at serve time; link scrapers (Discord's unfurler included) get the
+    # same page anonymously and read the tags without signing in.
+    doc = HTML_PATH.read_text(encoding="utf-8").replace(
+        "{{BASE}}", request.app["joblin_cfg"]["base_url"])
+    return web.Response(text=doc, content_type="text/html",
+                        headers={"Cache-Control": "no-store"})
+
+
+def _asset(name: str):
+    """A handler serving one file from ``static/`` (favicons, the OG image)."""
+    async def handler(request: web.Request) -> web.StreamResponse:
+        return web.FileResponse(STATIC_DIR / name,
+                                headers={"Cache-Control": "public, max-age=86400"})
+    return handler
 
 
 async def login(request: web.Request) -> web.Response:
@@ -628,6 +643,10 @@ def build_app(cfg: dict) -> web.Application:
     app["joblin_cfg"] = cfg
     app.add_routes([
         web.get("/", index),
+        web.get("/favicon.ico", _asset("favicon.ico")),
+        web.get("/favicon.png", _asset("favicon.png")),
+        web.get("/apple-touch-icon.png", _asset("apple-touch-icon.png")),
+        web.get("/og.jpg", _asset("og.jpg")),
         web.get("/login", login),
         web.get("/oauth/callback", oauth_callback),
         web.get("/logout", logout),
