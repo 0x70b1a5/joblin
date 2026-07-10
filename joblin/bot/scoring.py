@@ -16,6 +16,8 @@ from ..models import (
     to_iso,
 )
 from .core import (
+    NIGHTLY_HOUR,
+    NIGHTLY_MINUTE,
     NO_PINGS,
     bot,
     store,
@@ -155,6 +157,113 @@ def record_bar_change(cfg: dict, new_bar: int, now: dt.datetime) -> None:
     cfg["item_bar"] = new_bar
 
 
+# ---------------------------------------------------------------------------
+# Spice — ⬆️/⬇️ rank movement and 🔥 first-place streaks, derived from the
+# log's timestamps. The frame of reference is the nightly ~23:59 posting:
+# every draw compares the live standings against how they stood at the last
+# nightly post, so the auto-post captures each full posting-to-posting day
+# and a daytime /leaderboard shows the movement brewing since the board last
+# went out. Nothing is stored — an undo redraws yesterday's picture the same
+# way it redraws the scores.
+# ---------------------------------------------------------------------------
+
+# The nightly post lands within ~a minute after 23:59:00 (the 30s scheduler
+# tick), so within this grace the frame hasn't rolled yet — the post itself
+# measures the day it is closing rather than its own final seconds.
+_POST_GRACE = dt.timedelta(minutes=2)
+
+
+def _month_events(records: list[dict], guild_id: int,
+                  month: str) -> list[tuple[dt.datetime, int, int]]:
+    """One guild-month's completions as chronological ``(instant, user_id,
+    puntos)`` — the time series behind :func:`rank_spice`. A record too old to
+    carry a parsable ``ts`` reads as the epoch: ancient, hence present in
+    every backward look, which is where it belongs."""
+    events: list[tuple[dt.datetime, int, int]] = []
+    for rec in records:
+        if rec.get("guild_id") != guild_id or _rec_month(rec) != month:
+            continue
+        try:
+            at = from_iso(rec["ts"])
+        except (KeyError, TypeError, ValueError):
+            at = from_iso(_BAR_EPOCH)
+        events.append((at, rec["user_id"], _completion_points(rec)))
+    events.sort(key=lambda ev: ev[0])
+    return events
+
+
+def _points_at(events: list[tuple[dt.datetime, int, int]],
+               cutoff: Optional[dt.datetime] = None) -> dict[int, int]:
+    """Puntos per user counting only events at or before ``cutoff`` (None = all)."""
+    pts: dict[int, int] = {}
+    for at, uid, p in events:
+        if cutoff is not None and at > cutoff:
+            break  # events are chronological
+        pts[uid] = pts.get(uid, 0) + p
+    return pts
+
+
+def _ranks(pts: dict[int, int]) -> dict[int, int]:
+    """Competition rank per user (1 = most puntos; equals share a rank), so a
+    reshuffle among tied names never reads as movement."""
+    return {uid: 1 + sum(q > p for q in pts.values()) for uid, p in pts.items()}
+
+
+def _nightly_post_at(day: dt.date, tz: ZoneInfo) -> dt.datetime:
+    """The UTC instant of ``day``'s nightly posting (guild-local 23:59)."""
+    return dt.datetime(day.year, day.month, day.day, NIGHTLY_HOUR, NIGHTLY_MINUTE,
+                       tzinfo=tz).astimezone(UTC)
+
+
+def _last_post_day(now: dt.datetime, tz: ZoneInfo) -> dt.date:
+    """The guild-local date whose nightly posting most recently passed,
+    grace-adjusted — so the post firing seconds after 23:59 still frames the
+    day it is closing, and by ~00:01 the frame has rolled to the new day."""
+    local = (now - _POST_GRACE).astimezone(tz)
+    day = local.date()
+    if (local.hour, local.minute) < (NIGHTLY_HOUR, NIGHTLY_MINUTE):
+        day -= dt.timedelta(days=1)
+    return day
+
+
+def rank_spice(records: list[dict], guild_id: int, tz: ZoneInfo,
+               now: dt.datetime) -> dict[int, str]:
+    """Emoji trim for the current month's ranking lines: whoever leads wears
+    🔥×N for their run of consecutive nightly posts on top (the still-open day
+    included; ties co-wear it, like star ties share the star), and everyone
+    else ⬆️/⬇️ when their rank moved since the last nightly post. Returns
+    ``{user_id: trim}``; a steady rank — or one with no prior post to move
+    from — stays bare. The monthly board starts fresh, so streaks and arrows
+    never reach past the 1st."""
+    month = now.astimezone(tz).strftime("%Y-%m")
+    events = _month_events(records, guild_id, month)
+    if not events:
+        return {}
+    month_start = dt.datetime(int(month[:4]), int(month[5:7]), 1, tzinfo=tz).astimezone(UTC)
+    baseline_day = _last_post_day(now, tz)
+
+    ranks = _ranks(_points_at(events))
+    prev_ranks = _ranks(_points_at(events, _nightly_post_at(baseline_day, tz)))
+
+    out: dict[int, str] = {}
+    for uid, rank in ranks.items():
+        if rank == 1:
+            streak, day = 1, baseline_day
+            while True:
+                close = _nightly_post_at(day, tz)
+                if close < month_start:  # also bounds the walk for epoch events
+                    break
+                pts = _points_at(events, close)
+                if pts.get(uid, 0) < max(pts.values(), default=1):
+                    break  # someone else (or nobody) was on top at that close
+                streak += 1
+                day -= dt.timedelta(days=1)
+            out[uid] = f"🔥×{streak}"
+        elif uid in prev_ranks and prev_ranks[uid] != rank:
+            out[uid] = "⬆️" if rank < prev_ranks[uid] else "⬇️"
+    return out
+
+
 def vitrine_for(records: list[dict], guild_id: int, user_id: int, cfg: Optional[dict],
                 current_month: str) -> list[dict]:
     """Every trinket a user has earned: one deterministic roll per *whole multiple*
@@ -184,7 +293,8 @@ def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
     Pure apart from reading the clock — shared by the ``/leaderboard`` command
     and the nightly auto-post in ``backup.py``."""
     tz = ZoneInfo(cfg["timezone"]) if cfg and cfg.get("timezone") else UTC
-    current_month = now_utc().astimezone(tz).strftime("%Y-%m")
+    now = now_utc()
+    current_month = now.astimezone(tz).strftime("%Y-%m")
     if month is None:
         month = current_month
     bar = bar_for(cfg, month)  # a past month shows the bar it closed under
@@ -210,10 +320,13 @@ def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
         return msg, True
 
     ranking = sorted(bucket.items(), key=lambda kv: (-kv[1]["points"], kv[1]["name"].lower()))
+    # Spice rides only the live month — a closed month has no "since the last
+    # nightly post" to move against.
+    spice = rank_spice(records, guild_id, tz, now) if month == current_month else {}
     medals = ["🥇", "🥈", "🥉"]
     lines = []
     for i, (uid, ent) in enumerate(ranking):
-        badge = medals[i] if i < 3 else f"`{i + 1}.`"
+        badge = (medals[i] if i < 3 else f"`{i + 1}.`") + spice.get(uid, "")
         star = f" ⭐×{stars[uid]}" if stars.get(uid) else ""
         clap = f" · 👏×{ent['claps']}" if ent.get("claps") else ""
         pts = ent["points"]
@@ -334,6 +447,7 @@ __all__ = [
     "leaderboard",
     "monthly_scores",
     "covet",
+    "rank_spice",
     "record_bar_change",
     "star_counts",
     "vitrine_for",

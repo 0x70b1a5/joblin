@@ -56,7 +56,7 @@ Everything keys off `store["messages"][message_id] → task_id`, so reactions ke
 | `bot/commands/` | The slash-command surface, a subpackage wired like `bot/` itself (children imported for decorator registration, `__all__` re-exported flat): `lookup` (free-text task/game finders + shared autocompletes), `config` (`/joblinconfig`), `tasks` (`schedule_from_rule`, `/newtask`, `/deletetask`), `games` (`/pitchin`, `/doemup` — the round engine stays in `bot/games.py`), `edit` (the `/edit` group + shared engine). |
 | `bot/games.py` | Pitch-ins & do-em-ups (ad-hoc punto events): posting, button views (`DoEmUpButton`), closing on expiry/cap/deadline/manual end. |
 | `bot/claps.py` | 👏 bonus-punto tips from non-participants on completed posts/closed games. |
-| `bot/scoring.py` | `/leaderboard` (monthly puntos + ⭐ stars) and `/vitrine`; star/score aggregation. |
+| `bot/scoring.py` | `/leaderboard` (monthly puntos + ⭐ stars) and `/vitrine`; star/score aggregation; the ⬆️/⬇️/🔥×N rank spice, replayed from log timestamps against a day frame that rolls at the nightly 23:59 post. |
 | `bot/listing.py` | `/listtasks` (paginated), `/listopen`, `/joblinhelp`. |
 | `bot/admin.py` | `main()` entry point, owner-only `/redeploy`, global app-command error handler, `on_ready`. |
 | `bot/helpers.py` | Small formatting/occurrence-I/O helpers (schedule labels, post rendering, safe delete, reaction setup). |

@@ -39,13 +39,14 @@ from zoneinfo import ZoneInfo
 import discord
 
 from ..models import _next_clock, from_iso, to_iso
-from .core import NO_PINGS, bot, log, store
+from .core import NIGHTLY_HOUR, NIGHTLY_MINUTE, NO_PINGS, bot, log, store
 from .helpers import config_ready
 from .scoring import build_leaderboard
 
-# When (guild-local wall clock) the nightly backup fires. The 30s scheduler tick
-# means it actually posts within ~30s after this minute begins.
-BACKUP_HOUR, BACKUP_MINUTE = 23, 59
+# When (guild-local wall clock) the nightly backup fires — defined in core.py
+# so scoring's day-over-day frame rolls at the same instant. The 30s scheduler
+# tick means it actually posts within ~30s after this minute begins.
+BACKUP_HOUR, BACKUP_MINUTE = NIGHTLY_HOUR, NIGHTLY_MINUTE
 
 
 # ---------------------------------------------------------------------------

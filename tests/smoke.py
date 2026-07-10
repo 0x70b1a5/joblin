@@ -2066,6 +2066,79 @@ def test_leaderboard_text() -> None:
     assert empty3
 
 
+def test_rank_spice() -> None:
+    """Leaderboard spice: the leader wears 🔥×N for consecutive nightly-post
+    days on top (ties co-wear it, the monthly reset ends it), everyone else
+    ⬆️/⬇️ when their rank moved since the last ~23:59 guild-local posting —
+    all recomputed from the log's timestamps, never stored."""
+    from joblin.bot import build_leaderboard, rank_spice
+
+    tz = ZoneInfo("Europe/Berlin")
+
+    def rec(uid, name, day, hour=9, pts=1):
+        local = dt.datetime(2026, 6, day, hour, tzinfo=tz)
+        return {"guild_id": 1, "month": "2026-06", "user_id": uid, "user_name": name,
+                "points": pts, "ts": m.to_iso(local.astimezone(UTC))}
+
+    noon5 = dt.datetime(2026, 6, 5, 14, 0, tzinfo=tz).astimezone(UTC)
+
+    # Pat led early, Sam overtook on the 3rd, Pat retakes first today (the
+    # 5th) while Kim scores for the first time: fresh leader 🔥×1, Sam ⬇️,
+    # and a newcomer with no prior post to move from stays bare.
+    recs = [rec(1, "Pat", 1, pts=2), rec(2, "Sam", 2), rec(2, "Sam", 3, pts=2),
+            rec(1, "Pat", 5, pts=2), rec(3, "Kim", 5)]
+    assert rank_spice(recs, 1, tz, noon5) == {1: "🔥×1", 2: "⬇️"}
+
+    # Pat has led since the 1st (🔥×5 on the 5th); Sam climbs past Kim today
+    # (⬆️/⬇️), and Ada slips a rank without doing anything — Sam went by her.
+    recs = [rec(1, "Pat", 1, pts=5), rec(4, "Ada", 1), rec(3, "Kim", 2, pts=2),
+            rec(2, "Sam", 2), rec(2, "Sam", 5, pts=2)]
+    assert rank_spice(recs, 1, tz, noon5) == {1: "🔥×5", 2: "⬆️", 3: "⬇️", 4: "⬇️"}
+
+    # Sam pulls level with Pat instead: a tie for first co-wears the fire,
+    # each with their own streak.
+    recs.append(rec(2, "Sam", 5, hour=10, pts=2))
+    assert rank_spice(recs, 1, tz, noon5) == {1: "🔥×5", 2: "🔥×1", 3: "⬇️", 4: "⬇️"}
+
+    # The nightly post fires seconds *after* 23:59 — the grace keeps its frame
+    # on the day it closes. On June 1's post the baseline (May 31) is out of
+    # month: streak ×1, and May dominance never bleeds into June.
+    may_king = {"guild_id": 1, "month": "2026-05", "user_id": 2, "user_name": "Sam",
+                "points": 50, "ts": m.to_iso(dt.datetime(2026, 5, 20, tzinfo=UTC))}
+    post1 = dt.datetime(2026, 6, 1, 23, 59, 30, tzinfo=tz).astimezone(UTC)
+    assert rank_spice([may_king, rec(1, "Pat", 1)], 1, tz, post1) == {1: "🔥×1"}
+    # By June 2's post the frame has rolled: Pat also led June 1's close → ×2.
+    post2 = dt.datetime(2026, 6, 2, 23, 59, 30, tzinfo=tz).astimezone(UTC)
+    assert rank_spice([may_king, rec(1, "Pat", 1)], 1, tz, post2) == {1: "🔥×2"}
+
+    # A record too old to carry a ts reads as ancient — on top at every close
+    # back to the 1st (and the month guard keeps the walk finite).
+    ancient = [{"guild_id": 1, "month": "2026-06", "user_id": 9, "user_name": "Old",
+                "points": 1}]
+    noon3 = dt.datetime(2026, 6, 3, 12, 0, tzinfo=tz).astimezone(UTC)
+    assert rank_spice(ancient, 1, tz, noon3) == {9: "🔥×3"}
+
+    # build_leaderboard placement: spice sits right after the badge on the live
+    # month; a past month stays plain. (Sam's chore is 2 days old so it's
+    # behind the last posting whatever wall-clock moment the test runs at.)
+    now = m.now_utc()
+    ym = now.astimezone(tz).strftime("%Y-%m")
+    cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "item_bar": 25}
+    live = [
+        {"guild_id": 1, "month": ym, "user_id": 1, "user_name": "Pat", "points": 2,
+         "ts": m.to_iso(now)},
+        {"guild_id": 1, "month": ym, "user_id": 2, "user_name": "Sam", "points": 1,
+         "ts": m.to_iso(now - dt.timedelta(days=2))},
+    ]
+    text, _ = build_leaderboard(live, 1, cfg)
+    assert "🥇🔥×1 **2 puntos** — <@1>" in text
+    assert "🥈⬇️ **1 punto** — <@2>" in text
+    old = [{"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+            "points": 2, "ts": m.to_iso(dt.datetime(2026, 4, 3, tzinfo=UTC))}]
+    text2, _ = build_leaderboard(old, 1, cfg, "2026-04")
+    assert "🔥" not in text2 and "⬆️" not in text2 and "⬇️" not in text2
+
+
 async def test_daily_backup() -> None:
     """Nightly backup: arms on first sight, fires once the deadline passes *and*
     the log changed (posting a zip + leaderboard), and stays quiet otherwise."""
@@ -2366,6 +2439,7 @@ def main() -> None:
     test_vitrine_frozen_bars()
     test_record_bar_change()
     test_leaderboard_text()
+    test_rank_spice()
     asyncio.run(test_daily_backup())
     asyncio.run(test_void_completion())
     asyncio.run(test_bounty())

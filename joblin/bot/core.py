@@ -25,6 +25,11 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 
 NO_PINGS = discord.AllowedMentions.none()
 
+# When (guild-local wall clock) the nightly backup + auto-leaderboard post
+# fires. Lives here — not in backup.py — because scoring's day-over-day frame
+# (rank_spice) rolls at the same instant and the two must never drift.
+NIGHTLY_HOUR, NIGHTLY_MINUTE = 23, 59
+
 # A small curated list for the /joblinconfig timezone autocomplete. Any valid
 # IANA name is accepted; this is just for convenience.
 COMMON_TZS = [
@@ -77,5 +82,5 @@ bot = JoblinBot()
 
 __all__ = [
     "bot", "JoblinBot", "store", "log", "DATA_DIR", "REPO_ROOT",
-    "NO_PINGS", "COMMON_TZS",
+    "NO_PINGS", "COMMON_TZS", "NIGHTLY_HOUR", "NIGHTLY_MINUTE",
 ]
