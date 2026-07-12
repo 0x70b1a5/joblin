@@ -194,14 +194,24 @@ def test_resolve_when() -> None:
     assert m.resolve_when("90m", tz, now) == now + dt.timedelta(minutes=90)
     t = loc("tomorrow 8am")
     assert (t.year, t.month, t.day, t.hour, t.minute) == (2026, 6, 20, 8, 0)
+    noon = loc("tomorrow noon")
+    assert (noon.year, noon.month, noon.day, noon.hour, noon.minute) == (2026, 6, 20, 12, 0)
+    midn = loc("tomorrow midnight")
+    assert (midn.day, midn.hour, midn.minute) == (20, 0, 0)
     assert (loc("18:00").hour, loc("18:00").minute) == (18, 0)
     assert (loc("6pm").hour, loc("6pm").minute) == (18, 0)
     mon = loc("mon 9:00")
     assert mon.weekday() == 0 and (mon.hour, mon.minute) == (9, 0)
+    fri_noon = loc("fri noon")
+    assert fri_noon.weekday() == 4 and (fri_noon.hour, fri_noon.minute) == (12, 0)
     iso = loc("2026-06-20 14:00")
     assert (iso.month, iso.day, iso.hour) == (6, 20, 14)
+    iso_noon = loc("2026-06-20 noon")
+    assert (iso_noon.month, iso_noon.day, iso_noon.hour) == (6, 20, 12)
     jun = loc("Jun 20")
     assert (jun.month, jun.day, jun.hour) == (6, 20, 9)
+    jun_mid = loc("Jun 20 midnight")
+    assert (jun_mid.month, jun_mid.day, jun_mid.hour) == (6, 20, 0)
     for bad in ("nonsense", "32:00", "2026-13-40 10:00"):
         try:
             m.resolve_when(bad, tz, now)
@@ -209,6 +219,60 @@ def test_resolve_when() -> None:
             pass
         else:
             raise AssertionError(f"{bad!r} should have failed")
+
+
+def test_resolve_close() -> None:
+    """expires/deadline phrase classes: relative & bare clock vs start; calendar
+    vs command-time now (so deferred 'tomorrow' + 'tomorrow' is not double-shifted)."""
+    tz = ZoneInfo("Europe/Berlin")
+    # Just after noon Friday — mirrors the real bug report scenario.
+    now = dt.datetime(2026, 6, 19, 12, 15, tzinfo=tz).astimezone(UTC)
+    start = m.resolve_when("tomorrow 12:00", tz, now)  # Sat noon
+    assert start.astimezone(tz).day == 20 and start.astimezone(tz).hour == 12
+
+    def close(s: str):
+        return m.resolve_close(s, tz, now=now, start=start)
+
+    # Absolute calendar against *now*: same calendar day as start → ~12h window.
+    exp = close("tomorrow 23:59")
+    assert exp.astimezone(tz).day == 20 and exp.astimezone(tz).hour == 23
+    assert 11.9 * 3600 < (exp - start).total_seconds() < 12.1 * 3600
+
+    # Bare clock lands on start's local day.
+    bare = close("23:59")
+    assert bare == exp
+
+    # Relative window from open.
+    rel = close("in 5 minutes")
+    assert abs((rel - start).total_seconds() - 300) < 1
+
+    # midnight after a noon open → next local midnight (Sun 00:00).
+    mid = close("midnight")
+    assert (mid.astimezone(tz).day, mid.astimezone(tz).hour) == (21, 0)
+
+    # ISO absolute.
+    iso = close("2026-06-20 18:00")
+    assert (iso.astimezone(tz).hour, iso.astimezone(tz).minute) == (18, 0)
+
+    # Close at/before open is rejected.
+    try:
+        close("tomorrow 12:00")
+    except ValueError as e:
+        assert "past" in str(e)
+    else:
+        raise AssertionError("same-instant close should fail")
+
+    assert m.format_duration(300) == "5m"
+    assert m.format_duration(12 * 3600) == "12h"
+    assert m.duration_input(300) == "in 5 minutes"
+    assert m.duration_input(12 * 3600) == "in 12 hours"
+
+    # Autocomplete labels: relative/bare clock are windows-from-open, not absolute.
+    assert "window from open" in m.describe_close_phrase("in 5 minutes", tz, now)
+    assert "on the open day" in m.describe_close_phrase("23:59", tz, now)
+    assert "on the open day" in m.describe_close_phrase("tonight", tz, now)
+    abs_lab = m.describe_close_phrase("tomorrow 23:59", tz, now)
+    assert "absolute close" in abs_lab and "23:59" in abs_lab
 
 
 def test_parse_repeat() -> None:
@@ -766,12 +830,29 @@ async def test_pitchin_at_deferred() -> None:
         assert not one["recurring"] and one["message_id"] is None
         assert one["next_due"] is not None and one["duration_secs"] == 86400
         assert "🤝 Scheduled" in inter.response.content
+        assert "opens" in inter.response.content and "closes" in inter.response.content
+        assert "open 1d" in inter.response.content  # default 24h window
+
+        # Deferred absolute window: at=tomorrow noon + expires=tomorrow 23:59
+        # must be ~12h (not a double-shifted ~36h). Echo reports both ends.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.pitchin.callback(
+            inter, brief="Noon to midnight",
+            at="tomorrow 12:00", expires="tomorrow 23:59",
+        )
+        noon = next(q for q in (await st.snapshot())["pitchins"].values()
+                    if q["brief"] == "Noon to midnight")
+        assert noon["message_id"] is None and noon["next_due"] is not None
+        assert 11.9 * 3600 < noon["duration_secs"] < 12.1 * 3600, \
+            f"expected ~12h window, got {noon['duration_secs']}s"
+        assert "opens" in inter.response.content and "closes" in inter.response.content
+        assert "open 11h" in inter.response.content or "open 12h" in inter.response.content
 
         # A past explicit `at` is rejected; nothing new is scheduled.
         inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
         await bot.pitchin.callback(inter, brief="Too late", at="2000-01-01 00:00")
         assert "past" in inter.response.content
-        assert len((await st.snapshot())["pitchins"]) == 2
+        assert len((await st.snapshot())["pitchins"]) == 3
 
 
 async def test_doemup_recurring() -> None:
@@ -2274,6 +2355,24 @@ def test_web_schedule() -> None:
     assert items["pp"]["status"] == "live" and items["pp"]["editable"] is True
     assert items["pp"]["repeat_input"] == "once" and items["pp"]["at_input"] == ""
     assert items["pp"]["cap"] is None and items["pp"]["points_each"] == 2
+    assert items["pp"]["opens_at"] is None and items["pp"]["closes_at"]
+    assert items["pp"]["close_input"]  # live close prefilled as wall time
+    # Deferred game with a stored window: schedule exposes open + projected close.
+    snap["pitchins"]["qq"] = {
+        "id": "qq", "guild_id": 1, "brief": "Tomorrow laundry",
+        "message_id": None, "channel_id": 9, "points_each": 1,
+        "expires_at": None, "recurring": False,
+        "next_due": m.to_iso(now + dt.timedelta(hours=14)),
+        "duration_secs": 12 * 3600,
+    }
+    sched2 = webui.build_schedule(snap, 1)
+    qq = next(i for i in sched2["items"] if i["id"] == "qq")
+    assert qq["status"] == "scheduled" and qq["opens_at"] and qq["closes_at"]
+    assert qq["duration_secs"] == 12 * 3600
+    assert qq["close_input"] == "in 12 hours"
+    open_ts = m.from_iso(qq["opens_at"])
+    close_ts = m.from_iso(qq["closes_at"])
+    assert abs((close_ts - open_ts).total_seconds() - 12 * 3600) < 1
     # An unconfigured guild still renders (UTC) but flags config_ready=False.
     bare = webui.build_schedule({**snap, "configs": {}}, 1)
     assert bare["timezone"] == "UTC" and not bare["config_ready"]
@@ -2419,6 +2518,7 @@ def main() -> None:
     test_time_parsing()
     test_parse_clock()
     test_resolve_when()
+    test_resolve_close()
     test_parse_repeat()
     test_describe_repeat()
     test_recurrence_dispatch()

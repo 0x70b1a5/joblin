@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime as dt
 import hashlib
 import hmac
 import html
@@ -62,6 +63,7 @@ from aiohttp import web
 from ..models import (
     _ordinal,
     describe_repeat,
+    duration_input,
     from_iso,
     new_id,
     now_utc,
@@ -210,7 +212,20 @@ def _task_item(t: dict, tz: ZoneInfo) -> dict:
 
 def _game_item(g: dict, kind: str, tz: ZoneInfo) -> dict:
     live = bool(g.get("message_id"))
-    closes = g.get("expires_at") if kind == "pitchin" else g.get("deadline")
+    closes_live = g.get("expires_at") if kind == "pitchin" else g.get("deadline")
+    duration = g.get("duration_secs")
+    opens_at = None if live else g.get("next_due")
+    # Projected close for a scheduled round: open + stored window. Live uses the
+    # concrete expires_at/deadline. Recurring with no duration runs until the
+    # next slot — we leave closes_at None rather than re-running recurrence here.
+    if live:
+        closes_at = closes_live
+    elif opens_at and duration:
+        closes_at = to_iso(
+            from_iso(opens_at) + dt.timedelta(seconds=int(duration))
+        )
+    else:
+        closes_at = None
     rule = recurrence_of(g)
     label = describe_repeat(rule) if g.get("recurring") else "one-off"
     if g.get("recurring") and rule.get("time_of_day"):
@@ -224,6 +239,15 @@ def _game_item(g: dict, kind: str, tz: ZoneInfo) -> dict:
         at_input = from_iso(g["next_due"]).astimezone(tz).strftime("%Y-%m-%d %H:%M")
     else:
         at_input = ""
+    # `close` prefill: absolute wall time while live; relative window while
+    # scheduled so an untouched save doesn't re-anchor (client only PATCHes when
+    # the value differs from this snapshot).
+    if live and closes_at:
+        close_input = from_iso(closes_at).astimezone(tz).strftime("%Y-%m-%d %H:%M")
+    elif duration:
+        close_input = duration_input(int(duration))
+    else:
+        close_input = ""
     return {
         "kind": kind,  # "pitchin" | "doemup"
         "id": g["id"],
@@ -233,10 +257,14 @@ def _game_item(g: dict, kind: str, tz: ZoneInfo) -> dict:
         "schedule_label": label,
         "repeat_input": repeat_input_of(rule),
         "at_input": at_input,
+        "close_input": close_input,
         # live → due_at is when the round closes (may be None: open-ended);
         # dormant/deferred → due_at is when the next round posts.
         "status": "live" if live else "scheduled",
-        "due_at": closes if live else g.get("next_due"),
+        "due_at": closes_at if live else opens_at,
+        "opens_at": opens_at,
+        "closes_at": closes_at,
+        "duration_secs": int(duration) if duration else None,
         "points_each": g.get("points_each", 1),
         "cap": g.get("max_scorers") if kind == "pitchin" else g.get("point_limit"),
         "editable": True,

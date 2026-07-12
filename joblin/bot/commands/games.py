@@ -17,11 +17,13 @@ from ...models import (
     describe_repeat,
     discord_ts,
     first_due,
+    format_duration,
     from_iso,
     next_due,
     now_utc,
     parse_repeat,
     pin_weekly,
+    resolve_close,
     resolve_when,
     time_of_day_from,
     to_iso,
@@ -29,7 +31,7 @@ from ...models import (
 from ..core import bot, store
 from ..games import post_doemup, post_pitchin, schedule_doemup, schedule_pitchin
 from ..helpers import config_ready, guild_config
-from .lookup import at_autocomplete, repeat_autocomplete
+from .lookup import at_autocomplete, close_autocomplete, repeat_autocomplete
 
 
 def _game_recurrence_from(
@@ -99,13 +101,13 @@ async def pitchin(
         else:
             start = now
         if expires:
-            exp = resolve_when(expires, tz, start)  # clock times land on the slot's day
+            # Phrase-class resolve: relative/bare clock vs start; calendar vs now
+            # (so "at: tomorrow noon" + "expires: tomorrow 23:59" is ~12h, not ~36h).
+            exp = resolve_close(expires, tz, now=now, start=start)
         elif recurrence:  # no window given -> the round runs until the next slot
             exp = next_due(recurrence, tz, start, start)
         else:
             exp = start + dt.timedelta(hours=24)
-        if exp <= start:
-            raise ValueError("that close time is already in the past")
         # A repeating round, or any deferred round, stores its open span as a
         # duration the scheduler reuses each time it (re)opens the post.
         if recurrence:
@@ -144,12 +146,18 @@ async def pitchin(
         )
     cap = f" · first {max_scorers} score" if max_scorers else ""
     rep = f" · 🔁 {describe_repeat(recurrence)} (`/deletetask` to stop it)" if recurrence else ""
+    win = f" · open {format_duration(int((exp - start).total_seconds()))}"
     if deferred:
-        verb, when = "Scheduled", f"first round opens {discord_ts(start, 'R')}"
+        verb = "Scheduled"
+        when = (
+            f"opens {discord_ts(start, 'R')} · closes {discord_ts(exp, 'R')}{win}"
+        )
     elif recurrence:
-        verb, when = "Posted", f"first round closes {discord_ts(exp, 'R')}"
+        verb = "Posted"
+        when = f"first round closes {discord_ts(exp, 'R')}{win}"
     else:
-        verb, when = "Posted", f"closes {discord_ts(exp, 'R')}"
+        verb = "Posted"
+        when = f"closes {discord_ts(exp, 'R')}{win}"
     await interaction.response.send_message(
         f"🤝 {verb} **{brief}** in <#{cfg['channel_id']}> — {when}{cap}{rep}.",
         ephemeral=True,
@@ -198,6 +206,7 @@ async def doemup(
     # without it, the round opens right now.
     deferred = bool(at)
     deadline_iso, duration_secs = None, None
+    dl = None  # concrete close instant when known (for the echo)
     try:
         if deferred:
             start = first_due(recurrence, tz, now) if recurrence else resolve_when(at, tz, now)
@@ -206,16 +215,16 @@ async def doemup(
         else:
             start = now
         if deadline:
-            dl = resolve_when(deadline, tz, start)  # clock times land on the slot's day
-            if dl <= start:
-                raise ValueError("that deadline is already in the past")
+            # Same phrase-class rules as /pitchin expires (see resolve_close).
+            dl = resolve_close(deadline, tz, now=now, start=start)
             deadline_iso = to_iso(dl)
             # A repeating round, or any deferred round, stores its open span as a
             # duration the scheduler reuses each time it (re)opens the post.
             if recurrence or deferred:
                 duration_secs = max(1, int((dl - start).total_seconds()))
         elif recurrence:  # recurring needs a close: run each round to the next slot
-            deadline_iso = to_iso(next_due(recurrence, tz, start, start))
+            dl = next_due(recurrence, tz, start, start)
+            deadline_iso = to_iso(dl)
         # else: a plain one-off do-em-up stays open until 🏁 (even when deferred)
     except ValueError as e:
         await interaction.response.send_message(
@@ -229,6 +238,11 @@ async def doemup(
         )
         return
 
+    win = (
+        f" · open {format_duration(int((dl - start).total_seconds()))}"
+        if dl is not None else ""
+    )
+    rep = f" · 🔁 {describe_repeat(recurrence)} (`/deletetask` to stop it)" if recurrence else ""
     if deferred:
         await schedule_doemup(
             guild_id=interaction.guild_id, creator_id=interaction.user.id,
@@ -238,10 +252,12 @@ async def doemup(
             point_limit=(int(point_limit) if point_limit else None), now=now,
             recurrence=recurrence, duration_secs=duration_secs, starts_at=start,
         )
-        opens = f" — first round opens {discord_ts(start, 'R')}"
-        rep = f" · 🔁 {describe_repeat(recurrence)} (`/deletetask` to stop it)" if recurrence else ""
+        if dl is not None:
+            when = f"opens {discord_ts(start, 'R')} · closes {discord_ts(dl, 'R')}{win}"
+        else:
+            when = f"opens {discord_ts(start, 'R')} · open until 🏁"
         await interaction.response.send_message(
-            f"💪 Scheduled **{brief}** in <#{cfg['channel_id']}>{opens}{rep}.",
+            f"💪 Scheduled **{brief}** in <#{cfg['channel_id']}> — {when}{rep}.",
             ephemeral=True,
         )
         return
@@ -253,13 +269,11 @@ async def doemup(
         point_limit=(int(point_limit) if point_limit else None), now=now,
         recurrence=recurrence, duration_secs=duration_secs,
     )
-    if recurrence:
-        closes = (
-            f" — first round closes {discord_ts(from_iso(deadline_iso), 'R')}"
-            f" · 🔁 {describe_repeat(recurrence)} (`/deletetask` to stop it)"
-        )
+    if dl is not None:
+        label = "first round closes" if recurrence else "closes"
+        closes = f" — {label} {discord_ts(dl, 'R')}{win}{rep}"
     else:
-        closes = f" — closes {discord_ts(from_iso(deadline_iso), 'R')}" if deadline_iso else ""
+        closes = rep if rep else ""
     await interaction.response.send_message(
         f"💪 Posted **{brief}** in <#{cfg['channel_id']}> — tap ➕ as you go{closes}.",
         ephemeral=True,
@@ -269,10 +283,10 @@ async def doemup(
 # The friendly "when"/"repeat" autocompletes (live previews of the resolved
 # instant / rule) are the same ones /newtask uses for `at` and `repeat`.
 pitchin.autocomplete("at")(at_autocomplete)
-pitchin.autocomplete("expires")(at_autocomplete)
+pitchin.autocomplete("expires")(close_autocomplete)
 pitchin.autocomplete("repeat")(repeat_autocomplete)
 doemup.autocomplete("at")(at_autocomplete)
-doemup.autocomplete("deadline")(at_autocomplete)
+doemup.autocomplete("deadline")(close_autocomplete)
 doemup.autocomplete("repeat")(repeat_autocomplete)
 
 

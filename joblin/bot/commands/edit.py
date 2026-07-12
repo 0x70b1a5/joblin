@@ -7,6 +7,7 @@ subcommands are defined."""
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -20,12 +21,14 @@ from ...models import (
     UTC,
     describe_repeat,
     discord_ts,
+    format_duration,
     from_iso,
     now_utc,
     parse_repeat,
     recurrence_of,
     render_doemup,
     render_pitchin,
+    resolve_close,
     resolve_when,
     time_of_day_from,
     to_iso,
@@ -39,6 +42,7 @@ from .lookup import (
     _find_task,
     _game_event_autocomplete,
     at_autocomplete,
+    close_autocomplete,
     repeat_autocomplete,
     task_autocomplete,
 )
@@ -267,11 +271,13 @@ async def apply_game_edit(
             new_close = None
             if err is None and fields.get("close") is not None:
                 nd_iso = new_next_due if new_next_due is not _UNSET else g.get("next_due")
+                # Live rounds treat "now" as the open base; scheduled/dormant use
+                # the next open slot so bare clocks land on that day.
                 base = now if live else (from_iso(nd_iso) if nd_iso else now)
                 try:
-                    new_close = resolve_when(str(fields["close"]), tz, base)
-                    if new_close <= base:
-                        err = "that close time is already in the past"
+                    new_close = resolve_close(
+                        str(fields["close"]), tz, now=now, start=base
+                    )
                 except ValueError as e:
                     err = str(e)
 
@@ -379,8 +385,25 @@ async def _apply_game_edit(
     if updated.get("next_due"):
         nd = from_iso(updated["next_due"])
         tail = f" · next round {discord_ts(nd, 'F')} ({discord_ts(nd, 'R')})"
-    elif live_mid and rec_changed:
-        tail = " · live now — the new schedule applies from the next round"
+        dur = updated.get("duration_secs")
+        if dur:
+            close_at = nd + dt.timedelta(seconds=int(dur))
+            tail += (
+                f" · closes {discord_ts(close_at, 'R')}"
+                f" · open {format_duration(int(dur))}"
+            )
+    elif live_mid:
+        close_key = "expires_at" if kind == "pitchin" else "deadline"
+        close_iso = updated.get(close_key)
+        if close_iso:
+            cl = from_iso(close_iso)
+            tail = f" · closes {discord_ts(cl, 'R')}"
+            if close is not None:
+                # Echo the new window when they just retimed the close.
+                left = max(0, int((cl - now_utc()).total_seconds()))
+                tail += f" · open {format_duration(left)}"
+        if rec_changed:
+            tail += " · live now — the new schedule applies from the next round"
     await interaction.response.send_message(
         f"✏️ Updated **{updated['brief']}** ({sched}){tail}.",
         ephemeral=True, allowed_mentions=NO_PINGS)
@@ -454,11 +477,11 @@ edit_task.autocomplete("at")(at_autocomplete)
 edit_task.autocomplete("repeat")(repeat_autocomplete)
 edit_pitchin.autocomplete("event")(_game_event_autocomplete("pitchins", EMOJI_HANDSHAKE))
 edit_pitchin.autocomplete("at")(at_autocomplete)
-edit_pitchin.autocomplete("expires")(at_autocomplete)
+edit_pitchin.autocomplete("expires")(close_autocomplete)
 edit_pitchin.autocomplete("repeat")(repeat_autocomplete)
 edit_doemup.autocomplete("event")(_game_event_autocomplete("doemups", EMOJI_FLEX))
 edit_doemup.autocomplete("at")(at_autocomplete)
-edit_doemup.autocomplete("deadline")(at_autocomplete)
+edit_doemup.autocomplete("deadline")(close_autocomplete)
 edit_doemup.autocomplete("repeat")(repeat_autocomplete)
 
 # All three subcommands are defined — register the group on the tree.

@@ -33,7 +33,7 @@
   --danger: #9C3B22;
   --blurple: #5865F2;
   --shadow: 0 1px 2px rgba(38, 48, 31, .10);
-  --gutter: 4.8rem;
+  --gutter: 5.4rem;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
   --display: "Iowan Old Style", Palatino, Georgia, serif;
@@ -99,6 +99,7 @@ main { padding: .25rem 1rem 0; max-width: 34rem; margin: 0 auto; }
   display: block; color: var(--moss); font-weight: 700;
   text-transform: uppercase; letter-spacing: .05em; white-space: nowrap;
 }
+.gutter .range { display: block; font-size: .68rem; opacity: .85; white-space: nowrap; }
 .row.urgent .gutter, .row.urgent .gutter .day, .now-time { color: var(--hay); }
 .bar {
   display: block; width: 100%; text-align: left;
@@ -388,17 +389,56 @@ function barIcons(it) { // recurrence details show on expand, not on the bar
   return (KIND_ICON[it.kind] || "") + (it.bounty ? "💰" : "");
 }
 
+function gutterBits(it, { urgent = false } = {}) {
+  // Tasks: single due instant. Games: open (+ projected close) when scheduled;
+  // close time when live (open-ended → "open").
+  const isGame = it.kind === "pitchin" || it.kind === "doemup";
+  if (isGame) {
+    if (it.status === "live") {
+      if (it.closes_at) {
+        return {
+          dayIso: it.closes_at,
+          main: h("span", { class: urgent ? "now-time" : "", title: "closes" },
+            timeLabel(it.closes_at)),
+          sub: null,
+        };
+      }
+      return { dayIso: null, main: h("span", null, "open"), sub: null };
+    }
+    if (it.opens_at) {
+      const sub = it.closes_at
+        ? h("span", { class: "range", title: "closes " + timeLabel(it.closes_at) },
+            "→" + timeLabel(it.closes_at))
+        : null;
+      return {
+        dayIso: it.opens_at,
+        main: h("span", { class: urgent ? "now-time" : "" }, timeLabel(it.opens_at)),
+        sub,
+      };
+    }
+  }
+  if (it.due_at) {
+    return {
+      dayIso: it.due_at,
+      main: h("span", { class: urgent ? "now-time" : "" }, timeLabel(it.due_at)),
+      sub: null,
+    };
+  }
+  return { dayIso: null, main: h("span", null, "open"), sub: null };
+}
+
 function rows(items, { urgent = false } = {}) {
   const out = [];
   let prevDay = null;
   for (const it of items) {
-    const key = it.due_at ? dayKey(it.due_at) : null;
+    const bits = gutterBits(it, { urgent });
+    const key = bits.dayIso ? dayKey(bits.dayIso) : null;
     const first = key !== prevDay;
     prevDay = key;
     const gutter = h("div", { class: "gutter" },
-      first && key ? h("span", { class: "day" }, dayLabel(it.due_at)) : null,
-      it.due_at ? h("span", { class: urgent ? "now-time" : "" }, timeLabel(it.due_at))
-                : h("span", null, "open"),
+      first && key ? h("span", { class: "day" }, dayLabel(bits.dayIso)) : null,
+      bits.main,
+      bits.sub,
     );
     const icons = barIcons(it);
     const bar = h("button", {
@@ -511,13 +551,26 @@ function editorPanel(it) {
   );
 }
 
+function fmtDuration(secs) {
+  if (secs == null || secs < 0) return "";
+  if (secs < 60) return secs + "s";
+  if (secs < 3600) return Math.floor(secs / 60) + "m";
+  if (secs < 86400) {
+    const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+    return m ? h + "h " + m + "m" : h + "h";
+  }
+  const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600);
+  return h ? d + "d " + h + "h" : d + "d";
+}
+
 function gamePanel(it) { // the game editor — mirrors /edit pitchin | /edit doemup
   const isPitchin = it.kind === "pitchin";
   const noun = isPitchin ? "pitch-in" : "do-em-up";
   const brief = h("input", { type: "text", value: it.brief, maxLength: 200 });
   const at = h("input", { type: "text", value: it.at_input });
   const repeat = h("input", { type: "text", value: it.repeat_input });
-  const close = h("input", { type: "text", value: "" });
+  const closeInput = it.close_input || "";
+  const close = h("input", { type: "text", value: closeInput });
   const puntos = h("input", { type: "number", value: it.points_each, min: 1, max: 100 });
   const cap = h("input", { type: "number", value: it.cap == null ? "" : it.cap, min: 1 });
   const desc = h("textarea", { value: it.description, rows: 2, maxLength: 1000 });
@@ -529,11 +582,11 @@ function gamePanel(it) { // the game editor — mirrors /edit pitchin | /edit do
     const changed = {};
     if (brief.value.trim() !== it.brief) changed.brief = brief.value.trim();
     if (desc.value.trim() !== it.description) changed.description = desc.value.trim();
-    // `at`/`repeat` only when touched — an untouched save must never re-anchor
-    // the schedule; `close` only when filled in (it's an instruction, not state).
+    // `at`/`repeat`/`close` only when touched — an untouched save must never
+    // re-anchor the schedule (mirrors /edit pitchin|doemup omitted options).
     if (at.value.trim() !== it.at_input && at.value.trim()) changed.at = at.value.trim();
     if (repeat.value.trim() !== it.repeat_input && repeat.value.trim()) changed.repeat = repeat.value.trim();
-    if (close.value.trim()) changed.close = close.value.trim();
+    if (close.value.trim() !== closeInput && close.value.trim()) changed.close = close.value.trim();
     if (puntos.value.trim() && +puntos.value !== it.points_each) changed.puntos = +puntos.value;
     if (cap.value.trim() && +cap.value !== it.cap) changed.cap = +cap.value;
     if (!Object.keys(changed).length) { S.open = null; render(); return; }
@@ -561,13 +614,22 @@ function gamePanel(it) { // the game editor — mirrors /edit pitchin | /edit do
   const meta = [`${KIND_ICON[it.kind]} ${noun}`, it.schedule_label,
     `+${it.points_each} punto${it.points_each === 1 ? "" : "s"} each`];
   if (it.status === "live") meta.push("live in Discord now");
+  if (it.opens_at && it.closes_at)
+    meta.push(`opens ${timeLabel(it.opens_at)} · closes ${timeLabel(it.closes_at)}`);
+  else if (it.status === "live" && it.closes_at)
+    meta.push(`closes ${timeLabel(it.closes_at)}`);
+  else if (it.duration_secs)
+    meta.push(`open ${fmtDuration(it.duration_secs)} each round`);
+  else if (it.status === "live" && !it.closes_at)
+    meta.push("open until 🏁");
   return h("div", { class: "panel" },
     h("div", { class: "meta" }, meta.join(" · ")),
     field("What", brief),
     field("When", at, "next open — 06:00 · tomorrow 8am" + (it.recurring ? " (the recurring slot)" : "")),
     field("Repeat", repeat, REPEAT_HINT),
     field(isPitchin ? "Closes" : "Deadline", close,
-      (it.status === "live" ? "this round — " : "each round — ") + "empty = keep · in 5m · 18:00 · tonight"),
+      (it.status === "live" ? "this round — " : "each round — ")
+      + "unchanged keeps · in 5m · 18:00 · tomorrow 23:59"),
     h("div", { class: "fieldrow" },
       field(isPitchin ? "Puntos each" : "Puntos per ➕", puntos),
       field(isPitchin ? "First n score" : "Punto limit", cap, "empty = keep"),

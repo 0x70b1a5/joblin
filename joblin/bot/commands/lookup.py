@@ -21,6 +21,7 @@ from discord import app_commands
 
 from ...models import (
     UTC,
+    describe_close_phrase,
     describe_repeat,
     now_utc,
     parse_repeat,
@@ -159,9 +160,10 @@ async def at_autocomplete(interaction: discord.Interaction, current: str):
                 name=_when_label(resolve_when(cur, tz, now), tz, now)[:100], value=cur[:100]))
         except ValueError:
             choices.append(app_commands.Choice(
-                name="⚠️ e.g. now · in 2h · 18:00 · tomorrow 8am · Jun 20 14:00", value=cur[:100]))
+                name="⚠️ e.g. now · in 2h · 18:00 · tomorrow 8am · tomorrow noon · Jun 20 14:00",
+                value=cur[:100]))
     for text in ("now", "in 1 hour", "in 30 minutes", "tonight", "tomorrow 08:00",
-                 "this saturday 09:00", "next monday 18:00"):
+                 "tomorrow noon", "this saturday 09:00", "next monday 18:00"):
         if cur and cur.lower() not in text.lower():
             continue
         try:
@@ -170,6 +172,35 @@ async def at_autocomplete(interaction: discord.Interaction, current: str):
             continue
         choices.append(app_commands.Choice(
             name=f"{text}  →  {_when_label(due, tz, now, head=False)}"[:100], value=text))
+    return _dedup(choices)
+
+
+async def close_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete for ``expires`` / ``deadline``: labels phrase class so bare
+    clocks and relatives are not mistaken for absolute-from-now (we can't see a
+    deferred sibling ``at``)."""
+    tz, now = await _guild_tz(interaction), now_utc()
+    cur = current.strip()
+    choices: list[app_commands.Choice] = []
+    if cur:
+        try:
+            label = describe_close_phrase(cur, tz, now)
+            choices.append(app_commands.Choice(
+                name=f"{cur}  →  {label}"[:100], value=cur[:100]))
+        except ValueError:
+            choices.append(app_commands.Choice(
+                name="⚠️ e.g. in 5m · 23:59 · tonight · tomorrow 23:59 · tomorrow midnight",
+                value=cur[:100]))
+    for text in ("in 30 minutes", "in 1 hour", "in 12 hours", "tonight", "23:59",
+                 "tomorrow 23:59", "tomorrow midnight"):
+        if cur and cur.lower() not in text.lower():
+            continue
+        try:
+            label = describe_close_phrase(text, tz, now)
+        except ValueError:
+            continue
+        choices.append(app_commands.Choice(
+            name=f"{text}  →  {label}"[:100], value=text))
     return _dedup(choices)
 
 
@@ -263,6 +294,7 @@ __all__ = [
     "_repeat_label",
     "_when_label",
     "at_autocomplete",
+    "close_autocomplete",
     "delete_autocomplete",
     "repeat_autocomplete",
     "task_autocomplete",

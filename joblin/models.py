@@ -262,6 +262,22 @@ def parse_clock(s: str) -> tuple[int, int]:
     return h, mi
 
 
+def _wall_hm(text: Optional[str], *, default: tuple[int, int] = (9, 0)) -> tuple[int, int]:
+    """Hour/minute from a trailing time fragment: bare clock, or the keywords
+    ``noon`` / ``midnight`` / ``tonight`` (and ``this evening``). Empty →
+    ``default``. Used so ``tomorrow noon`` and ``fri midnight`` parse cleanly."""
+    s = (text or "").strip().lower().removeprefix("at ").strip()
+    if not s:
+        return default
+    if s in ("tonight", "this evening"):
+        return 20, 0
+    if s == "noon":
+        return 12, 0
+    if s == "midnight":
+        return 0, 0
+    return parse_clock(s)
+
+
 def _local(y: int, mo: int, d: int, h: int, mi: int, tz: ZoneInfo) -> dt.datetime:
     return dt.datetime(y, mo, d, h, mi, tzinfo=tz).astimezone(UTC)
 
@@ -308,7 +324,7 @@ def resolve_when(text: Optional[str], tz: ZoneInfo, now: dt.datetime) -> dt.date
     iso = _ISO.match(s)
     if iso:
         y, mo, d = int(iso.group(1)), int(iso.group(2)), int(iso.group(3))
-        h, mi = parse_clock(iso.group(4)) if iso.group(4) else (9, 0)
+        h, mi = _wall_hm(iso.group(4))
         try:
             return _local(y, mo, d, h, mi, tz)
         except ValueError as e:
@@ -317,14 +333,14 @@ def resolve_when(text: Optional[str], tz: ZoneInfo, now: dt.datetime) -> dt.date
     parts = s.split()
     if parts[0] in ("today", "tomorrow"):
         base = now.astimezone(tz).date() + dt.timedelta(days=1 if parts[0] == "tomorrow" else 0)
-        h, mi = parse_clock(" ".join(parts[1:]).removeprefix("at ").strip()) if len(parts) > 1 else (9, 0)
+        h, mi = _wall_hm(" ".join(parts[1:]))
         return _local(base.year, base.month, base.day, h, mi, tz)
 
     idx, forced_next = (1, True) if parts[0] in ("next", "this") else (0, False)
     if idx < len(parts) and parts[idx] in _WEEKDAYS:
         wd = _WEEKDAYS[parts[idx]]
-        rest = " ".join(parts[idx + 1:]).removeprefix("at ").strip()
-        h, mi = parse_clock(rest) if rest else (9, 0)
+        rest = " ".join(parts[idx + 1:])
+        h, mi = _wall_hm(rest)
         local_now = now.astimezone(tz)
         ahead = (wd - local_now.weekday()) % 7
         if forced_next and ahead == 0:
@@ -347,7 +363,7 @@ def resolve_when(text: Optional[str], tz: ZoneInfo, now: dt.datetime) -> dt.date
             continue
         mo = _MONTHS[mon_name]
         year = int(m.group(3)) if m.group(3) else now.astimezone(tz).year
-        h, mi = parse_clock(m.group(4)) if m.group(4) else (9, 0)
+        h, mi = _wall_hm(m.group(4))
         try:
             cand = _local(year, mo, day, h, mi, tz)
         except ValueError as e:
@@ -358,6 +374,142 @@ def resolve_when(text: Optional[str], tz: ZoneInfo, now: dt.datetime) -> dt.date
 
     h, mi = parse_clock(s)  # bare time → the next time it's locally h:mi
     return _next_clock(now, tz, h, mi)
+
+
+def _close_clock_hm(s: str) -> Optional[tuple[int, int]]:
+    """Hour/minute for a bare-clock / keyword close phrase, or None if not one."""
+    if s in ("tonight", "this evening"):
+        return 20, 0
+    if s == "noon":
+        return 12, 0
+    if s == "midnight":
+        return 0, 0
+    try:
+        return parse_clock(s)
+    except ValueError:
+        return None
+
+
+def _close_is_relative(s: str) -> bool:
+    return s in ("", "now") or bool(_REL.match(s))
+
+
+def _close_is_absolute(s: str) -> bool:
+    """Calendar-ish phrases that must resolve against command-time ``now`` so a
+    deferred ``at: tomorrow …`` does not double-shift ``expires: tomorrow …``."""
+    if _ISO.match(s):
+        return True
+    parts = s.split()
+    if not parts:
+        return False
+    if parts[0] in ("today", "tomorrow"):
+        return True
+    idx = 1 if parts[0] in ("next", "this") else 0
+    if idx < len(parts) and parts[idx] in _WEEKDAYS:
+        return True
+    return any(rx.match(s) for rx in (_MONTH_DAY, _DAY_MONTH))
+
+
+def _clock_on_start_day(
+    h: int, mi: int, start: dt.datetime, tz: ZoneInfo
+) -> dt.datetime:
+    """Wall-clock ``h:mi`` on the local day ``start`` falls on; if that instant
+    is not after ``start``, roll forward one day (so midnight after a noon open
+    is the upcoming midnight, not the one already past)."""
+    local = start.astimezone(tz)
+    cand = local.replace(hour=h, minute=mi, second=0, microsecond=0)
+    if cand.astimezone(UTC) <= start:
+        cand += dt.timedelta(days=1)
+    return cand.astimezone(UTC)
+
+
+def resolve_close(
+    text: str, tz: ZoneInfo, *, now: dt.datetime, start: dt.datetime
+) -> dt.datetime:
+    """Resolve an ``expires`` / ``deadline`` string for a round that opens at
+    ``start``.
+
+    Phrase classes:
+      * relative (``in 5m``, ``+2h``, empty/``now``) — anchored at ``start``
+        (the open window length);
+      * bare clock / ``tonight`` / ``noon`` / ``midnight`` — land on
+        ``start``'s local day (roll +1 day if not after open);
+      * calendar-ish (``tomorrow …``, weekdays, month/ISO dates) — absolute
+        against command-time ``now``, so ``at: tomorrow noon`` +
+        ``expires: tomorrow 23:59`` is a same-day ~12h window, not a
+        double-shifted ~36h one.
+
+    Raises ``ValueError`` if the resolved close is not after ``start``.
+    """
+    s = (text or "").strip().lower()
+    if _close_is_relative(s):
+        exp = resolve_when(s, tz, start)
+    elif (hm := _close_clock_hm(s)) is not None and not _close_is_absolute(s):
+        # Bare clock / keyword — not e.g. "tomorrow noon" (that's absolute).
+        exp = _clock_on_start_day(hm[0], hm[1], start, tz)
+    else:
+        # Absolute calendar (and any leftover phrase resolve_when understands).
+        exp = resolve_when(s, tz, now)
+    if exp <= start:
+        raise ValueError("that close time is already in the past")
+    return exp
+
+
+def format_duration(secs: int) -> str:
+    """Compact human span for ephemeral echoes (``5m``, ``12h``, ``1d 2h``)."""
+    secs = max(0, int(secs))
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        h, rem = divmod(secs, 3600)
+        mi = rem // 60
+        return f"{h}h {mi}m" if mi else f"{h}h"
+    d, rem = divmod(secs, 86400)
+    h = rem // 3600
+    return f"{d}d {h}h" if h else f"{d}d"
+
+
+def duration_input(secs: int) -> str:
+    """A free-form ``expires``/``close`` string that round-trips through
+    :func:`resolve_close` as a relative window (``in 5 minutes``)."""
+    secs = max(1, int(secs))
+    if secs % 86400 == 0:
+        n = secs // 86400
+        return f"in {n} day" + ("s" if n != 1 else "")
+    if secs % 3600 == 0:
+        n = secs // 3600
+        return f"in {n} hour" + ("s" if n != 1 else "")
+    if secs % 60 == 0:
+        n = secs // 60
+        return f"in {n} minute" + ("s" if n != 1 else "")
+    return f"in {max(1, secs // 60)} minutes"
+
+
+def describe_close_phrase(text: str, tz: ZoneInfo, now: dt.datetime) -> str:
+    """Autocomplete label for an ``expires`` / ``deadline`` string.
+
+    Discord doesn't surface sibling options, so we can't re-resolve against a
+    deferred ``at``. Instead we label the phrase class honestly:
+      * relative → window length from open;
+      * bare clock / tonight / noon / midnight → clock on the open day;
+      * calendar-ish → absolute close from command-time now.
+    """
+    s = (text or "").strip().lower()
+    if not s:
+        raise ValueError("empty close phrase")
+    if _close_is_relative(s):
+        # Same offset from any anchor — use ``now`` only to measure the span.
+        end = resolve_when(s, tz, now)
+        dur = format_duration(max(0, int((end - now).total_seconds())))
+        return f"⏱ {dur} window from open"
+    if (hm := _close_clock_hm(s)) is not None and not _close_is_absolute(s):
+        h, mi = hm
+        return f"🕐 {h:02d}:{mi:02d} on the open day"
+    due = resolve_when(text, tz, now)
+    local = due.astimezone(tz)
+    return f"📅 {local:%a %b %d · %H:%M} (absolute close)"
 
 
 def time_of_day_from(text: Optional[str], tz: ZoneInfo, now: dt.datetime) -> str:
