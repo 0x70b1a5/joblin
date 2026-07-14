@@ -27,6 +27,10 @@ Task dict schema
     "nag_count":    int,            # lifetime count of reminders ever posted for
                                     #   this chore (never reset; shown in /listtasks).
                                     #   Absent on tasks created before it existed.
+    "no_nag":       bool,           # 🤫: suppress the hourly reminders for this
+                                    #   chore (it still fires on schedule). Toggled
+                                    #   by reacting 🤫 on a live occurrence post.
+                                    #   Absent means False.
 }
 
 Recurrence (``freq``)
@@ -75,6 +79,7 @@ EMOJI_DELETE = "❌"  # one-off: delete the task; also cancels the snooze panel
 EMOJI_UNDO = "↩️"  # appears after a ✅/⏩/⏭️/❌ action so it can be reverted
 EMOJI_REQUEUE = "🔄"  # appears on a ✅-completed post to re-fire the chore now
 EMOJI_CLAP = "👏"  # appears on a ✅-completed post; an outsider's tap tips its doer a bonus punto
+EMOJI_SHUSH = "🤫"  # appears on a nag; toggles the task's no-nag flag (stop/resume hourly reminders)
 EMOJI_END = "🏁"  # creator-only "end now" on a pitch-in (✅) or do-em-up post
 EMOJI_HANDSHAKE = "🤝"  # header icon on a pitch-in post
 EMOJI_FLEX = "💪"  # header icon on a do-em-up post

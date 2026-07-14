@@ -43,7 +43,7 @@ async def scheduler() -> None:
         try:
             pending = task.get("pending")
             if pending:
-                if now >= from_iso(pending["remind_at"]):
+                if not task.get("no_nag") and now >= from_iso(pending["remind_at"]):
                     await send_reminder(tid, channel, cfg)
             elif task.get("next_due") and now >= from_iso(task["next_due"]):
                 await fire_task(tid, channel, cfg)
@@ -93,8 +93,8 @@ async def send_reminder(tid: str, channel: discord.abc.Messageable, cfg: dict) -
     snap = await store.snapshot()
     task = snap["tasks"].get(tid)
     pending = task.get("pending") if task else None
-    if not pending or now_utc() < from_iso(pending["remind_at"]):
-        return
+    if not pending or task.get("no_nag") or now_utc() < from_iso(pending["remind_at"]):
+        return  # nothing pending, shushed (🤫), or not yet time
 
     message = await post_occurrence(channel, task, cfg, reminder=True)
 

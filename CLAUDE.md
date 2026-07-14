@@ -34,8 +34,8 @@ uv sync                           # install/sync deps into .venv
 
 **Occurrence lifecycle (the heart of the system).** The scheduler (`@tasks.loop(seconds=30)`) compares `now` against persisted `next_due`/`remind_at`/game deadlines, which makes the whole thing **naturally restart-safe** — no in-memory timers to lose.
 1. `now >= next_due` → **fire**: post the brief, self-react ✅ ⏩ ℹ️ ❌. Task flips to `pending` (`remind_at = due + 1h`); `next_due` cleared so it can't re-fire.
-2. While pending, each tick checks `remind_at` → posts a fresh **nag** (optionally pinging a role), resets `remind_at = now + 1h`, bumps `nag_count`.
-3. **Reactions** resolve/defer it (`reactions.py`): ✅ complete (logs it; recurring rolls to next slot, one-off is deleted), ⏩ snooze (opens a number-pad panel, doubling backoff), ℹ️ info, ❌ skip, ↩️ undo, 🔄 requeue, 👏 clap.
+2. While pending, each tick checks `remind_at` → posts a fresh **nag** (optionally pinging a role, self-reacting an extra 🤫), resets `remind_at = now + 1h`, bumps `nag_count`. A task with `no_nag` set is never nagged (it still fires — only the reminders stop).
+3. **Reactions** resolve/defer it (`reactions.py`): ✅ complete (logs it; recurring rolls to next slot, one-off is deleted), ⏩ snooze (opens a number-pad panel, doubling backoff), ℹ️ info, ❌ skip, ↩️ undo, 🔄 requeue, 👏 clap, 🤫 shush (toggles the lifetime `no_nag` flag).
 
 Everything keys off `store["messages"][message_id] → task_id`, so reactions keep working across restarts. **Undo** stashes a deep copy of the task *before* each mutating action in `store["undo"]` and self-reacts ↩️; it restores that snapshot (after `can_undo` confirms the occurrence hasn't moved on) and voids the matching completion-log entry.
 

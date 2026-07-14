@@ -16,6 +16,7 @@ from ..models import (
     EMOJI_FFWD,
     EMOJI_INFO,
     EMOJI_REQUEUE,
+    EMOJI_SHUSH,
     EMOJI_SKIP,
     EMOJI_SNOOZE_DAYS,
     EMOJI_SNOOZE_HOURS,
@@ -123,6 +124,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         await _handle_done(tid, task, cfg, tz, channel, payload, mention, display)
     elif key in (emoji_key(EMOJI_SKIP), emoji_key(EMOJI_DELETE)):
         await _handle_skip_or_delete(tid, task, tz, channel, mention)
+    elif key == emoji_key(EMOJI_SHUSH):
+        await _handle_shush(tid, task, channel, reacted, payload, mention)
 
 
 @bot.event
@@ -293,6 +296,39 @@ async def _handle_snooze_panel(
         except discord.HTTPException:
             pass
         await _arm_undo("snooze", tid, before, anchor_id, channel)
+
+
+async def _handle_shush(tid, task, channel, reacted, payload, mention) -> None:
+    """🤫 toggles the task's lifetime no-nag flag: the chore still fires on
+    schedule, but the hourly reminders stop until someone taps 🤫 again on a
+    live post. The nag posts self-react 🤫; a manual 🤫 on the original post
+    works too (any message of a live occurrence routes here)."""
+    shushed = None
+    async with store.txn() as data:
+        live = data["tasks"].get(tid)
+        if live is not None:
+            shushed = not live.get("no_nag", False)
+            live["no_nag"] = shushed
+            p = live.get("pending")
+            if not shushed and p:
+                # Un-shushing: remind_at is stale (often long past), so restart
+                # the hourly cadence fresh instead of nagging on the next tick.
+                p["remind_at"] = to_iso(now_utc() + dt.timedelta(hours=1))
+    await _remove_user_reaction(reacted, payload)
+    if shushed is None:
+        return  # task vanished under us — nothing to toggle
+    if shushed:
+        note = (
+            f"🤫 Shushed by {mention} — **{task['brief']}** won't post reminders "
+            "anymore (it still fires on schedule; tap 🤫 on a live post to turn "
+            "nags back on)."
+        )
+    else:
+        note = f"🔔 Un-shushed by {mention} — reminders for **{task['brief']}** are back on."
+    try:
+        await channel.send(note, reference=reacted, allowed_mentions=NO_PINGS)
+    except discord.HTTPException:
+        pass
 
 
 async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -> None:
@@ -698,6 +734,7 @@ __all__ = [
     "_handle_ffwd",
     "_handle_info",
     "_handle_requeue",
+    "_handle_shush",
     "_handle_skip_or_delete",
     "_handle_snooze_panel",
     "_handle_undo",

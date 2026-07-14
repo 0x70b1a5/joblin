@@ -541,6 +541,7 @@ function editorPanel(it) {
   const meta = [it.schedule_label];
   if (it.status === "pending") meta.push("posted in Discord, waiting on ✅");
   if (it.nag_count) meta.push(`nagged ${it.nag_count}×`);
+  if (it.no_nag) meta.push("🤫 shushed — no reminders");
   return h("div", { class: "panel" },
     h("div", { class: "meta" }, meta.join(" · ")),
     form,

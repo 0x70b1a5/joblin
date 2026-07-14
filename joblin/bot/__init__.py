@@ -9,6 +9,8 @@ Lifecycle of a task occurrence
    with ``remind_at = due + 1h``; ``next_due`` is cleared so it can't re-fire.
 2. While pending, every tick checks ``remind_at``. When it passes, the bot
    posts a fresh nag (optionally pinging a role) and sets ``remind_at = now+1h``.
+   Nags additionally self-react 🤫; a task whose ``no_nag`` flag is set is
+   never nagged (it still fires — only the reminders stop).
 3. Reactions resolve or defer the occurrence:
      ✅  complete  -> log the completer; recurring tasks roll to the next slot,
                       one-offs are removed.
@@ -21,6 +23,9 @@ Lifecycle of a task occurrence
                       bot adds this button right after one of those actions.
      🔄  requeue   -> appears on a ✅-completed post; re-fires the chore right
                       now (a fresh occurrence) without waiting for its next slot.
+     🤫  shush     -> toggles the task's lifetime ``no_nag`` flag: stop (or
+                      resume) the hourly reminders while occurrences keep
+                      firing on schedule.
 
 Everything is keyed off ``store["messages"][message_id] -> task_id`` so that
 reactions keep working across restarts, and the persisted ``remind_at`` means

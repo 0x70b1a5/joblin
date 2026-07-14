@@ -206,6 +206,7 @@ def _task_item(t: dict, tz: ZoneInfo) -> dict:
         "status": "pending" if pending else "scheduled",
         "due_at": due,
         "nag_count": t.get("nag_count", 0),
+        "no_nag": bool(t.get("no_nag")),
         "editable": True,
     }
 

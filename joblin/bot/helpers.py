@@ -11,6 +11,7 @@ from ..models import (
     EMOJI_DONE,
     EMOJI_FFWD,
     EMOJI_INFO,
+    EMOJI_SHUSH,
     EMOJI_SKIP,
     UTC,
     describe_repeat,
@@ -64,13 +65,17 @@ def post_content(task: dict, *, reminder: bool, cfg: dict) -> str:
     return f"{prefix}⏰ Still pending: **{brief}**{tag}"
 
 
-async def add_task_reactions(message: discord.Message, task: dict) -> None:
+async def add_task_reactions(
+    message: discord.Message, task: dict, *, reminder: bool = False
+) -> None:
     await message.add_reaction(EMOJI_DONE)
     await message.add_reaction(EMOJI_FFWD)
     if task.get("description"):
         await message.add_reaction(EMOJI_INFO)
     # Recurring chores skip just this occurrence (⏭️); one-offs are deleted (❌).
     await message.add_reaction(EMOJI_SKIP if task.get("recurring") else EMOJI_DELETE)
+    if reminder:  # nags grow a 🤫 so the hourly reminders can be shushed
+        await message.add_reaction(EMOJI_SHUSH)
 
 
 async def post_occurrence(
@@ -84,7 +89,7 @@ async def post_occurrence(
     msg = await channel.send(
         post_content(task, reminder=reminder, cfg=cfg), allowed_mentions=allowed
     )
-    await add_task_reactions(msg, task)
+    await add_task_reactions(msg, task, reminder=reminder)
     return msg
 
 
@@ -100,7 +105,9 @@ async def safe_delete(message: Optional[discord.Message]) -> None:
 # The functional reactions the bot itself puts on a posted chore. When an
 # occurrence resolves we strip exactly these — never a 😄 / 🎉 a family member
 # piled on for fun — see _clear_bot_reactions.
-TASK_FUNCTIONAL_EMOJIS = (EMOJI_DONE, EMOJI_FFWD, EMOJI_INFO, EMOJI_SKIP, EMOJI_DELETE)
+TASK_FUNCTIONAL_EMOJIS = (
+    EMOJI_DONE, EMOJI_FFWD, EMOJI_INFO, EMOJI_SKIP, EMOJI_DELETE, EMOJI_SHUSH
+)
 
 
 async def _clear_bot_reactions(

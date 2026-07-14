@@ -1944,6 +1944,90 @@ async def test_nag_tally() -> None:
         assert "🔔×3" in inter.response.content, "/listtasks shows the lifetime nag count"
 
 
+async def test_shush() -> None:
+    """🤫 on a live post toggles the lifetime no_nag flag: nags self-react 🤫,
+    a shushed task never nags (even across occurrences) but still fires, and
+    un-shushing restarts the hourly cadence fresh."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        tid = "hens"
+        async with st.txn() as data:
+            data["tasks"][tid] = {
+                "id": tid, "guild_id": 1, "brief": "Shut the hens in", "description": None,
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+
+        # Fire, then nag once: the original post carries no 🤫, the nag does.
+        await bot.fire_task(tid, ch, cfg)
+        snap = await st.snapshot()
+        first = snap["tasks"][tid]["pending"]["message_ids"][0]
+        assert m.EMOJI_SHUSH not in ch.msgs[first].reactions, "no 🤫 on the original post"
+        async with st.txn() as data:
+            data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
+        await bot.send_reminder(tid, ch, cfg)
+        snap = await st.snapshot()
+        nag = snap["tasks"][tid]["pending"]["message_ids"][-1]
+        assert nag != first and m.EMOJI_SHUSH in ch.msgs[nag].reactions, "nags grow a 🤫"
+
+        # 🤫 the nag: flag set, confirmation posted, and no further reminders
+        # even with remind_at long past.
+        await bot.on_raw_reaction_add(
+            FakePayload(nag, m.EMOJI_SHUSH, member=FakeMember(42, "Pat"))
+        )
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["no_nag"] is True
+        assert any("Shushed" in (msg.content or "") for msg in ch.msgs.values())
+        async with st.txn() as data:
+            data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
+        posted_before = len(ch.msgs)
+        await bot.send_reminder(tid, ch, cfg)
+        snap = await st.snapshot()
+        assert len(ch.msgs) == posted_before, "a shushed task must not nag"
+        assert snap["tasks"][tid]["pending"]["message_ids"][-1] == nag
+
+        # The flag outlives the occurrence: complete it, re-fire, still no nag.
+        await bot.on_raw_reaction_add(FakePayload(first, "✅", member=FakeMember(42, "Pat")))
+        async with st.txn() as data:
+            data["tasks"][tid]["next_due"] = m.to_iso(now - dt.timedelta(seconds=1))
+        await bot.fire_task(tid, ch, cfg)
+        async with st.txn() as data:
+            data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
+        posted_before = len(ch.msgs)
+        await bot.send_reminder(tid, ch, cfg)
+        assert len(ch.msgs) == posted_before, "no_nag persists across occurrences"
+
+        # /listtasks marks the shushed chore.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.listtasks.callback(inter)
+        assert "🤫" in inter.response.content, "/listtasks shows the 🤫 marker"
+
+        # 🤫 again on the (new) live post un-shushes and restarts the cadence
+        # fresh — remind_at moves ~1h out instead of staying in the past.
+        anchor = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][0]
+        await bot.on_raw_reaction_add(
+            FakePayload(anchor, m.EMOJI_SHUSH, member=FakeMember(42, "Pat"))
+        )
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["no_nag"] is False
+        remind = m.from_iso(snap["tasks"][tid]["pending"]["remind_at"])
+        assert (remind - m.now_utc()).total_seconds() > 3500, "cadence restarted ~1h out"
+        assert any("Un-shushed" in (msg.content or "") for msg in ch.msgs.values())
+
+        # Nags flow again once that fresh hour elapses.
+        async with st.txn() as data:
+            data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
+        posted_before = len(ch.msgs)
+        await bot.send_reminder(tid, ch, cfg)
+        assert len(ch.msgs) == posted_before + 1, "un-shushed task nags again"
+
+
 async def test_listopen() -> None:
     """/listopen lists open chores + live games, each linking to the ORIGINAL post
     (never a nag), posts publicly, and says so when nothing is open."""
@@ -2546,6 +2630,7 @@ def main() -> None:
     asyncio.run(test_store())
     asyncio.run(test_finalize_keeps_fun_reactions())
     asyncio.run(test_nag_tally())
+    asyncio.run(test_shush())
     asyncio.run(test_listopen())
     asyncio.run(test_listtasks_pagination())
     asyncio.run(test_lifecycle_and_snooze())

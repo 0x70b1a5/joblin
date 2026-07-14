@@ -141,10 +141,11 @@ async def listtasks(interaction: discord.Interaction) -> None:
             state = "—"
         info = " ℹ️" if t.get("description") else ""
         flag = " 💰" if t.get("bounty") else ""
+        shush = " 🤫" if t.get("no_nag") else ""
         nags = t.get("nag_count", 0)
         nag = f" · 🔔×{nags}" if nags else ""
         rows.append(
-            f"• `{t['id']}` **{t['brief']}**{info}{flag} — {schedule_label(t)} · {state}{nag}"
+            f"• `{t['id']}` **{t['brief']}**{info}{flag}{shush} — {schedule_label(t)} · {state}{nag}"
         )
 
     # Pitch-ins and do-em-ups list alongside tasks now (each with its id) so they
@@ -363,6 +364,9 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "ℹ️ **Info** — shows the longer description, if any\n"
             "⏭️ **Skip** — recurring chore: skips just this time\n"
             "❌ **Delete** — one-off chore: cancels it\n"
+            "🤫 **Shush** — appears on a reminder: mutes the hourly nags for that "
+            "chore for good (it still posts when due); tap 🤫 on a live post to "
+            "turn them back on\n"
             "↩️ **Undo** — appears after ✅/⏩/⏭️/❌ to reverse it\n"
             "🔄 **Requeue** — appears on a completed chore; re-posts it right now\n"
             "👏 **Clap** — on a finished chore, pitch-in, or do-em-up; anyone who "
