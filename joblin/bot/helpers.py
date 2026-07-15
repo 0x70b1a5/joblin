@@ -13,6 +13,7 @@ from ..models import (
     EMOJI_INFO,
     EMOJI_SHUSH,
     EMOJI_SKIP,
+    EMOJI_UNSHUSH,
     UTC,
     describe_repeat,
     recurrence_of,
@@ -76,6 +77,8 @@ async def add_task_reactions(
     await message.add_reaction(EMOJI_SKIP if task.get("recurring") else EMOJI_DELETE)
     if reminder:  # nags grow a 🤫 so the hourly reminders can be shushed
         await message.add_reaction(EMOJI_SHUSH)
+    elif task.get("no_nag"):  # a shushed chore's post offers 🔊 to un-shush
+        await message.add_reaction(EMOJI_UNSHUSH)
 
 
 async def post_occurrence(
@@ -106,7 +109,8 @@ async def safe_delete(message: Optional[discord.Message]) -> None:
 # occurrence resolves we strip exactly these — never a 😄 / 🎉 a family member
 # piled on for fun — see _clear_bot_reactions.
 TASK_FUNCTIONAL_EMOJIS = (
-    EMOJI_DONE, EMOJI_FFWD, EMOJI_INFO, EMOJI_SKIP, EMOJI_DELETE, EMOJI_SHUSH
+    EMOJI_DONE, EMOJI_FFWD, EMOJI_INFO, EMOJI_SKIP, EMOJI_DELETE,
+    EMOJI_SHUSH, EMOJI_UNSHUSH,
 )
 
 

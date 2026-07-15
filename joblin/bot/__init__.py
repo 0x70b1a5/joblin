@@ -23,9 +23,11 @@ Lifecycle of a task occurrence
                       bot adds this button right after one of those actions.
      🔄  requeue   -> appears on a ✅-completed post; re-fires the chore right
                       now (a fresh occurrence) without waiting for its next slot.
-     🤫  shush     -> toggles the task's lifetime ``no_nag`` flag: stop (or
-                      resume) the hourly reminders while occurrences keep
-                      firing on schedule.
+     🤫  shush     -> sets the task's lifetime ``no_nag`` flag: stop the hourly
+                      reminders while occurrences keep firing on schedule. A
+                      shushed chore's posts self-react 🔊 instead.
+     🔊  un-shush  -> clears ``no_nag``: the hourly reminders resume (with a
+                      fresh cadence).
 
 Everything is keyed off ``store["messages"][message_id] -> task_id`` so that
 reactions keep working across restarts, and the persisted ``remind_at`` means

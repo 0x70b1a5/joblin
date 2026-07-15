@@ -1945,9 +1945,11 @@ async def test_nag_tally() -> None:
 
 
 async def test_shush() -> None:
-    """🤫 on a live post toggles the lifetime no_nag flag: nags self-react 🤫,
-    a shushed task never nags (even across occurrences) but still fires, and
-    un-shushing restarts the hourly cadence fresh."""
+    """🤫 on a live post sets the lifetime no_nag flag and 🔊 clears it: nags
+    self-react 🤫, a shush flips the button to 🔊, a shushed task never nags
+    (even across occurrences) but still fires with a 🔊 button on its posts,
+    a same-direction tap is a no-op, and un-shushing (🔊) restarts the hourly
+    cadence fresh."""
     with tempfile.TemporaryDirectory() as d:
         bot, st, ch = await _game_setup(d)
         tz = ZoneInfo("Europe/Berlin")
@@ -1976,14 +1978,25 @@ async def test_shush() -> None:
         nag = snap["tasks"][tid]["pending"]["message_ids"][-1]
         assert nag != first and m.EMOJI_SHUSH in ch.msgs[nag].reactions, "nags grow a 🤫"
 
-        # 🤫 the nag: flag set, confirmation posted, and no further reminders
-        # even with remind_at long past.
+        # 🤫 the nag: flag set, confirmation posted, the bot's button flips to
+        # 🔊, and no further reminders even with remind_at long past.
         await bot.on_raw_reaction_add(
             FakePayload(nag, m.EMOJI_SHUSH, member=FakeMember(42, "Pat"))
         )
         snap = await st.snapshot()
         assert snap["tasks"][tid]["no_nag"] is True
         assert any("Shushed" in (msg.content or "") for msg in ch.msgs.values())
+        assert m.EMOJI_UNSHUSH in ch.msgs[nag].reactions, "shush flips the button to 🔊"
+        assert m.EMOJI_SHUSH not in ch.msgs[nag].reactions, "the 🤫 face is retired"
+
+        # A second 🤫 on an already-shushed chore is a no-op (no toggle-back).
+        posted_before = len(ch.msgs)
+        await bot.on_raw_reaction_add(
+            FakePayload(nag, m.EMOJI_SHUSH, member=FakeMember(42, "Pat"))
+        )
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["no_nag"] is True, "🤫 never un-shushes"
+        assert len(ch.msgs) == posted_before, "a same-direction tap posts nothing"
         async with st.txn() as data:
             data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
         posted_before = len(ch.msgs)
@@ -1992,11 +2005,15 @@ async def test_shush() -> None:
         assert len(ch.msgs) == posted_before, "a shushed task must not nag"
         assert snap["tasks"][tid]["pending"]["message_ids"][-1] == nag
 
-        # The flag outlives the occurrence: complete it, re-fire, still no nag.
+        # The flag outlives the occurrence: complete it, re-fire, still no nag —
+        # and the fresh post carries a 🔊 so un-shushing stays one tap away.
         await bot.on_raw_reaction_add(FakePayload(first, "✅", member=FakeMember(42, "Pat")))
         async with st.txn() as data:
             data["tasks"][tid]["next_due"] = m.to_iso(now - dt.timedelta(seconds=1))
         await bot.fire_task(tid, ch, cfg)
+        snap = await st.snapshot()
+        fresh = snap["tasks"][tid]["pending"]["message_ids"][0]
+        assert m.EMOJI_UNSHUSH in ch.msgs[fresh].reactions, "shushed chore's post offers 🔊"
         async with st.txn() as data:
             data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
         posted_before = len(ch.msgs)
@@ -2008,17 +2025,19 @@ async def test_shush() -> None:
         await bot.listtasks.callback(inter)
         assert "🤫" in inter.response.content, "/listtasks shows the 🤫 marker"
 
-        # 🤫 again on the (new) live post un-shushes and restarts the cadence
-        # fresh — remind_at moves ~1h out instead of staying in the past.
-        anchor = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][0]
+        # 🔊 on the (new) live post un-shushes and restarts the cadence fresh —
+        # remind_at moves ~1h out instead of staying in the past — and the
+        # button flips back to 🤫.
         await bot.on_raw_reaction_add(
-            FakePayload(anchor, m.EMOJI_SHUSH, member=FakeMember(42, "Pat"))
+            FakePayload(fresh, m.EMOJI_UNSHUSH, member=FakeMember(42, "Pat"))
         )
         snap = await st.snapshot()
         assert snap["tasks"][tid]["no_nag"] is False
         remind = m.from_iso(snap["tasks"][tid]["pending"]["remind_at"])
         assert (remind - m.now_utc()).total_seconds() > 3500, "cadence restarted ~1h out"
         assert any("Un-shushed" in (msg.content or "") for msg in ch.msgs.values())
+        assert m.EMOJI_SHUSH in ch.msgs[fresh].reactions, "un-shush flips the button to 🤫"
+        assert m.EMOJI_UNSHUSH not in ch.msgs[fresh].reactions, "the 🔊 face is retired"
 
         # Nags flow again once that fresh hour elapses.
         async with st.txn() as data:

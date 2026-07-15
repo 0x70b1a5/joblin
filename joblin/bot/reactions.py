@@ -21,6 +21,7 @@ from ..models import (
     EMOJI_SNOOZE_DAYS,
     EMOJI_SNOOZE_HOURS,
     EMOJI_UNDO,
+    EMOJI_UNSHUSH,
     SNOOZE_CHOICES,
     discord_ts,
     emoji_key,
@@ -124,8 +125,11 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         await _handle_done(tid, task, cfg, tz, channel, payload, mention, display)
     elif key in (emoji_key(EMOJI_SKIP), emoji_key(EMOJI_DELETE)):
         await _handle_skip_or_delete(tid, task, tz, channel, mention)
-    elif key == emoji_key(EMOJI_SHUSH):
-        await _handle_shush(tid, task, channel, reacted, payload, mention)
+    elif key in (emoji_key(EMOJI_SHUSH), emoji_key(EMOJI_UNSHUSH)):
+        await _handle_shush(
+            tid, task, channel, reacted, payload, mention,
+            shush=key == emoji_key(EMOJI_SHUSH),
+        )
 
 
 @bot.event
@@ -298,33 +302,47 @@ async def _handle_snooze_panel(
         await _arm_undo("snooze", tid, before, anchor_id, channel)
 
 
-async def _handle_shush(tid, task, channel, reacted, payload, mention) -> None:
-    """🤫 toggles the task's lifetime no-nag flag: the chore still fires on
-    schedule, but the hourly reminders stop until someone taps 🤫 again on a
-    live post. The nag posts self-react 🤫; a manual 🤫 on the original post
-    works too (any message of a live occurrence routes here)."""
-    shushed = None
+async def _handle_shush(tid, task, channel, reacted, payload, mention, *, shush: bool) -> None:
+    """🤫 sets the task's lifetime no-nag flag, 🔊 clears it: a shushed chore
+    still fires on schedule, but the hourly reminders stop until someone taps
+    🔊 on a live post. Nag posts self-react 🤫 and a shushed chore's posts
+    self-react 🔊; either emoji added manually on any message of a live
+    occurrence routes here too. A tap that matches the current state (🤫 on an
+    already-shushed chore, or vice versa) is a no-op."""
+    changed = False
     async with store.txn() as data:
         live = data["tasks"].get(tid)
-        if live is not None:
-            shushed = not live.get("no_nag", False)
-            live["no_nag"] = shushed
+        if live is not None and bool(live.get("no_nag", False)) != shush:
+            changed = True
+            live["no_nag"] = shush
             p = live.get("pending")
-            if not shushed and p:
+            if not shush and p:
                 # Un-shushing: remind_at is stale (often long past), so restart
                 # the hourly cadence fresh instead of nagging on the next tick.
                 p["remind_at"] = to_iso(now_utc() + dt.timedelta(hours=1))
     await _remove_user_reaction(reacted, payload)
-    if shushed is None:
-        return  # task vanished under us — nothing to toggle
-    if shushed:
+    if not changed:
+        return  # task vanished under us, or already in the asked-for state
+    # Flip our button on the tapped post so it always shows the *next* action
+    # (🤫 to shush, 🔊 to un-shush) — the two directions never share a face.
+    old, new = (EMOJI_SHUSH, EMOJI_UNSHUSH) if shush else (EMOJI_UNSHUSH, EMOJI_SHUSH)
+    if bot.user:
+        try:
+            await reacted.remove_reaction(old, bot.user)
+        except discord.HTTPException:
+            pass
+    try:
+        await reacted.add_reaction(new)
+    except discord.HTTPException:
+        pass
+    if shush:
         note = (
             f"🤫 Shushed by {mention} — **{task['brief']}** won't post reminders "
-            "anymore (it still fires on schedule; tap 🤫 on a live post to turn "
+            "anymore (it still fires on schedule; tap 🔊 on a live post to turn "
             "nags back on)."
         )
     else:
-        note = f"🔔 Un-shushed by {mention} — reminders for **{task['brief']}** are back on."
+        note = f"🔊 Un-shushed by {mention} — reminders for **{task['brief']}** are back on."
     try:
         await channel.send(note, reference=reacted, allowed_mentions=NO_PINGS)
     except discord.HTTPException:
