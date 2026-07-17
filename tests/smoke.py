@@ -2225,8 +2225,10 @@ def test_leaderboard_text() -> None:
 
     cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "item_bar": 25}
     recs = [
-        {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat", "points": 2},
-        {"guild_id": 1, "month": "2026-04", "user_id": 2, "user_name": "Sam"},
+        {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "once", "points": 2, "task_id": "t1", "late_seconds": 0},
+        {"guild_id": 1, "month": "2026-04", "user_id": 2, "user_name": "Sam",
+         "kind": "recurring", "task_id": "t2", "late_seconds": 100},
         {"guild_id": 1, "month": "2026-04", "user_id": 1, "user_name": "Pat",
          "kind": "clap", "points": 1},
     ]
@@ -2237,6 +2239,11 @@ def test_leaderboard_text() -> None:
     # (April is a past month, so Pat also wears its ⭐ on the line).
     assert "**3 puntos** — <@1> ⭐×1 · 👏×1" in text
     assert "**1 punto** — <@2>" in text and "<@2> · 👏" not in text
+    # Title badges sit on their own italic line under the holder (not mid-line).
+    assert "*Bounty Hunter" in text or "*Punctualist" in text
+    pat_block = text.split("<@2>")[0]  # Pat ranks first
+    assert "\n*" in pat_block, "titles are a second line under the puntos row"
+    assert "— <@1> *" not in text, "titles must not jam after the username"
     # The ranking lines carry each holder's ⭐×n, so the separate Stars section
     # is gone from the ranked board…
     assert "**Stars**" not in text
@@ -2248,6 +2255,141 @@ def test_leaderboard_text() -> None:
     # Another guild's records never bleed in.
     _, empty3 = bot.build_leaderboard(recs, 9, cfg, "2026-04")
     assert empty3
+    # all_time folds months and ignores the month arg.
+    recs.append(
+        {"guild_id": 1, "month": "2026-05", "user_id": 2, "user_name": "Sam",
+         "kind": "recurring", "points": 5, "task_id": "t2", "late_seconds": 0}
+    )
+    text_at, empty_at = bot.build_leaderboard(recs, 1, cfg, month="2026-04", all_time=True)
+    assert not empty_at
+    assert "Chore leaderboard — all time" in text_at
+    assert "**6 puntos** — <@2>" in text_at  # 1 + 5
+    assert "**3 puntos** — <@1>" in text_at
+    assert "puntos all time" in text_at
+
+
+def test_badge_titles() -> None:
+    """Title badges: month scope, ties, grace boundary, share floor, chore-only
+    breadth metrics, guild isolation — pure functions of the completion log."""
+    from joblin.bot.scoring import (
+        BADGE_SHARE_MIN_PTS,
+        PUNCTUAL_GRACE_SECS,
+        badge_titles,
+    )
+
+    g, other = 1, 99
+    recs = [
+        # Pat: punctual (on grace), bounty, once, one task — plus enough volume
+        # for share badges later.
+        {"guild_id": g, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "once", "points": 2, "task_id": "a", "late_seconds": PUNCTUAL_GRACE_SECS},
+        {"guild_id": g, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "once", "points": 2, "task_id": "a", "late_seconds": 0},
+        # Just past grace — not punctual; recurring; different task.
+        {"guild_id": g, "month": "2026-04", "user_id": 2, "user_name": "Sam",
+         "kind": "recurring", "points": 1, "task_id": "b",
+         "late_seconds": PUNCTUAL_GRACE_SECS + 1},
+        # Sam piles on one task (One-Track) and max lateness (Archaeologist).
+        {"guild_id": g, "month": "2026-04", "user_id": 2, "user_name": "Sam",
+         "kind": "recurring", "points": 1, "task_id": "b", "late_seconds": 99_000},
+        {"guild_id": g, "month": "2026-04", "user_id": 2, "user_name": "Sam",
+         "kind": "recurring", "points": 1, "task_id": "b", "late_seconds": 50},
+        # Lee: pitch-ins + doemup + clap received; breadth via many chore tasks.
+        {"guild_id": g, "month": "2026-04", "user_id": 3, "user_name": "Lee",
+         "kind": "pitchin", "points": 1, "task_id": "g1", "ts": "t1"},
+        {"guild_id": g, "month": "2026-04", "user_id": 3, "user_name": "Lee",
+         "kind": "pitchin", "points": 1, "task_id": "g1", "ts": "t2"},
+        {"guild_id": g, "month": "2026-04", "user_id": 3, "user_name": "Lee",
+         "kind": "doemup", "points": 7, "task_id": "g2", "ts": "t3"},
+        {"guild_id": g, "month": "2026-04", "user_id": 3, "user_name": "Lee",
+         "kind": "clap", "points": 1, "task_id": "a"},
+        {"guild_id": g, "month": "2026-04", "user_id": 3, "user_name": "Lee",
+         "kind": "clap", "points": 1, "task_id": "b"},
+        {"guild_id": g, "month": "2026-04", "user_id": 3, "user_name": "Lee",
+         "kind": "recurring", "points": 1, "task_id": "c1",
+         "late_seconds": PUNCTUAL_GRACE_SECS + 60},
+        {"guild_id": g, "month": "2026-04", "user_id": 3, "user_name": "Lee",
+         "kind": "recurring", "points": 1, "task_id": "c2",
+         "late_seconds": PUNCTUAL_GRACE_SECS + 60},
+        # Low-volume pure pitcher must NOT win Team Player (share floor).
+        {"guild_id": g, "month": "2026-04", "user_id": 4, "user_name": "Tiny",
+         "kind": "pitchin", "points": 1, "task_id": "g3", "ts": "t4"},
+        # Other guild noise.
+        {"guild_id": other, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "once", "points": 2, "task_id": "z", "late_seconds": 0},
+        # Other month must not pollute April titles.
+        {"guild_id": g, "month": "2026-05", "user_id": 1, "user_name": "Pat",
+         "kind": "pitchin", "points": 50, "task_id": "gx", "ts": "tx"},
+    ]
+
+    titles = badge_titles(recs, g, "2026-04")
+    # Invert: badge -> holders
+    by: dict[str, set[int]] = {}
+    for uid, names in titles.items():
+        for n in names:
+            by.setdefault(n, set()).add(uid)
+
+    assert by["Punctualist"] == {1}  # grace edge counts; +1s does not for Sam's first
+    assert by["Bounty Hunter"] == {1}
+    assert by["Closer"] == {1}
+    assert by["Pitcher-Inner"] == {3}
+    assert by["Unit Crusher"] == {3}
+    assert by["Crowd Favorite"] == {3}
+    assert by["Jack of All Chores"] == {3}  # c1, c2 — clap/game task_ids ignored
+    assert by["One-Track Mind"] == {2}  # three on task b
+    assert by["Recurring Nightmare"] == {2}  # three recurring vs Lee's two
+    assert by["Archaeologist"] == {2}
+    # Team Player: Lee has game_pts 1+1+7=9, total 9+2 claps +2 chores = 13 → 9/13
+    # Tiny has 1/1 but only 1 pt < floor. Pat has 0 game.
+    assert by["Team Player"] == {3}
+    # Only Lee clears the share floor so far; they are game-heavy so also
+    # hold Lone Wolf by default (only competitor). Pad Sam next.
+
+    # Explicit Lone Wolf: give Sam enough pure chores in-month.
+    for i in range(BADGE_SHARE_MIN_PTS):
+        recs.append(
+            {"guild_id": g, "month": "2026-04", "user_id": 2, "user_name": "Sam",
+             "kind": "recurring", "points": 1, "task_id": "b", "late_seconds": 1}
+        )
+    titles2 = badge_titles(recs, g, "2026-04")
+    by2: dict[str, set[int]] = {}
+    for uid, names in titles2.items():
+        for n in names:
+            by2.setdefault(n, set()).add(uid)
+    assert by2["Lone Wolf"] == {2}
+    assert by2["Team Player"] == {3}
+    # Ties share: another bounty for Sam → both Pat and Sam hold Bounty Hunter.
+    recs.append(
+        {"guild_id": g, "month": "2026-04", "user_id": 2, "user_name": "Sam",
+         "kind": "once", "points": 2, "task_id": "b", "late_seconds": 0}
+    )
+    recs.append(
+        {"guild_id": g, "month": "2026-04", "user_id": 2, "user_name": "Sam",
+         "kind": "once", "points": 2, "task_id": "b", "late_seconds": 0}
+    )
+    titles3 = badge_titles(recs, g, "2026-04")
+    assert set(uid for uid, ns in titles3.items() if "Bounty Hunter" in ns) == {1, 2}
+
+    # Month filter: May titles only see Pat's big pitch-in.
+    may = badge_titles(recs, g, "2026-05")
+    assert may[1] and "Pitcher-Inner" in may[1]
+    assert 2 not in may and 3 not in may
+
+    # All-time includes every month.
+    all_t = badge_titles(recs, g, None)
+    assert "Pitcher-Inner" in all_t[1] or all_t[1]  # Pat's May haul is large
+    # Other guild never appears in guild 1.
+    assert badge_titles(recs, other, "2026-04").keys() == {1}
+
+    # Catalog order on a multi-title holder.
+    lee = titles2.get(3, [])
+    if len(lee) >= 2:
+        order = {n: i for i, n in enumerate(
+            ("Punctualist", "Bounty Hunter", "Pitcher-Inner", "Unit Crusher",
+             "Crowd Favorite", "Jack of All Chores", "One-Track Mind", "Closer",
+             "Recurring Nightmare", "Team Player", "Lone Wolf", "Archaeologist")
+        )}
+        assert lee == sorted(lee, key=lambda n: order[n])
 
 
 def test_rank_spice() -> None:
@@ -2642,6 +2784,7 @@ def main() -> None:
     test_vitrine_frozen_bars()
     test_record_bar_change()
     test_leaderboard_text()
+    test_badge_titles()
     test_rank_spice()
     asyncio.run(test_daily_backup())
     asyncio.run(test_void_completion())

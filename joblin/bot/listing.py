@@ -333,7 +333,7 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "• `/listopen` — post what's open right now, each a tap-through link to its post\n"
             "• `/edit` — change a task, pitch-in, or do-em-up (`/edit task|pitchin|doemup`)\n"
             "• `/deletetask` — remove a chore for good\n"
-            "• `/leaderboard` — monthly puntos ranking & ⭐ stars 🏆\n"
+            "• `/leaderboard` — monthly (or all-time) puntos, title badges & ⭐ stars 🏆\n"
             "• `/covet` — your cabinet of month's-end trinkets 🖼️\n"
             "• `/joblinconfig` — channel, timezone, reminder role, trinket bar *(Manage Server)*\n"
             "• `/joblinhelp` — this message"
@@ -381,7 +381,9 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "Mark a chore you can't do yourself with `bounty:true`: it's worth "
             "**2 puntos** and only **someone else** can tap ✅ on it. Every completed "
             "chore is a punto (bounties two); whoever leads the month's `/leaderboard` "
-            "earns a permanent **⭐ star** shown there for keeps."
+            "earns a permanent **⭐ star** shown there for keeps. Title badges "
+            "(Punctualist, Bounty Hunter, …) are derived from the log for the same "
+            "scope and sit under each name; pass `all_time:true` for the lifetime board."
         ),
         inline=False,
     )

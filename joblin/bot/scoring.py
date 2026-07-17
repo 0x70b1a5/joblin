@@ -284,45 +284,240 @@ def vitrine_for(records: list[dict], guild_id: int, user_id: int, cfg: Optional[
     return out
 
 
-def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
-                      month: Optional[str] = None) -> tuple[str, bool]:
-    """Render the leaderboard message for ``guild_id`` and ``month``.
+# ---------------------------------------------------------------------------
+# Title badges — pure titles derived from the completion log (same spirit as
+# ⭐ stars: recomputed every draw, never stored). Scope follows the board:
+# one month, or all-time when the all-time flag is set.
+# ---------------------------------------------------------------------------
+PUNCTUAL_GRACE_SECS = 59 * 60  # "within 59 minutes of due" still counts
+BADGE_SHARE_MIN_PTS = 10  # Team Player / Lone Wolf need enough volume to compete
 
-    Returns ``(text, is_empty)`` where ``is_empty`` is True when no chores were
-    logged for the month (the slash command shows that variant ephemerally).
+# Fixed display order when one person holds several titles.
+BADGE_ORDER = (
+    "Punctualist",
+    "Bounty Hunter",
+    "Pitcher-Inner",
+    "Unit Crusher",
+    "Crowd Favorite",
+    "Jack of All Chores",
+    "One-Track Mind",
+    "Closer",
+    "Recurring Nightmare",
+    "Team Player",
+    "Lone Wolf",
+    "Archaeologist",
+)
+
+
+def _is_chore(rec: dict) -> bool:
+    """A solo chore row (not a pitch-in, do-em-up, or clap bonus)."""
+    return rec.get("kind") not in ("pitchin", "doemup", "clap")
+
+
+def _empty_badge_stats() -> dict:
+    return {
+        "punctual": 0,
+        "bounty": 0,
+        "pitchin": 0,
+        "doemup_pts": 0,
+        "claps": 0,
+        "once": 0,
+        "recurring": 0,
+        "task_counts": {},  # task_id -> n (chores only)
+        "game_pts": 0,
+        "chore_pts": 0,
+        "total_pts": 0,
+        "max_late": 0,
+        "name": "?",
+    }
+
+
+def badge_stats(records: list[dict], guild_id: int,
+                month: Optional[str] = None) -> dict[int, dict]:
+    """Per-user counters for title badges over ``guild_id``.
+
+    ``month=None`` means all-time; otherwise only rows in that local-tz month
+    count. Pure scan of the log — no store side effects."""
+    out: dict[int, dict] = {}
+    for rec in records:
+        if rec.get("guild_id") != guild_id:
+            continue
+        if month is not None and _rec_month(rec) != month:
+            continue
+        uid = rec["user_id"]
+        ent = out.get(uid)
+        if ent is None:
+            ent = out[uid] = _empty_badge_stats()
+        ent["name"] = rec.get("user_name", ent["name"])
+        pts = _completion_points(rec)
+        ent["total_pts"] += pts
+        kind = rec.get("kind")
+
+        if kind == "clap":
+            ent["claps"] += 1
+            continue
+        if kind == "pitchin":
+            ent["pitchin"] += 1
+            ent["game_pts"] += pts
+            continue
+        if kind == "doemup":
+            ent["doemup_pts"] += pts
+            ent["game_pts"] += pts
+            continue
+
+        # Solo chore (including legacy rows with no kind).
+        ent["chore_pts"] += pts
+        if kind == "once":
+            ent["once"] += 1
+        else:
+            # "recurring", missing kind, or any other non-game row.
+            ent["recurring"] += 1
+        if pts == 2:
+            ent["bounty"] += 1
+        late = rec.get("late_seconds")
+        if isinstance(late, (int, float)):
+            late_i = int(late)
+            if late_i <= PUNCTUAL_GRACE_SECS:
+                ent["punctual"] += 1
+            if late_i > ent["max_late"]:
+                ent["max_late"] = late_i
+        tid = rec.get("task_id")
+        if tid:
+            counts = ent["task_counts"]
+            counts[tid] = counts.get(tid, 0) + 1
+    return out
+
+
+def _leaders(stats: dict[int, dict], score_of, min_score: float = 1) -> list[int]:
+    """User ids tied for the highest score, if that score is at least ``min_score``."""
+    if not stats:
+        return []
+    scores = {uid: score_of(ent) for uid, ent in stats.items()}
+    top = max(scores.values())
+    if top < min_score:
+        return []
+    return [uid for uid, s in scores.items() if s == top]
+
+
+def badge_titles(records: list[dict], guild_id: int,
+                 month: Optional[str] = None) -> dict[int, list[str]]:
+    """Title badges held in ``guild_id`` for ``month`` (or all-time if None).
+
+    Ties share a title. Only awarded when the winning metric is positive (and
+    Team Player / Lone Wolf also need :data:`BADGE_SHARE_MIN_PTS` total puntos
+    in-scope). Returns ``{user_id: [title, …]}`` in :data:`BADGE_ORDER`."""
+    stats = badge_stats(records, guild_id, month)
+    held: dict[int, list[str]] = {uid: [] for uid in stats}
+
+    def award(name: str, uids: list[int]) -> None:
+        for uid in uids:
+            held.setdefault(uid, []).append(name)
+
+    award("Punctualist", _leaders(stats, lambda e: e["punctual"]))
+    award("Bounty Hunter", _leaders(stats, lambda e: e["bounty"]))
+    award("Pitcher-Inner", _leaders(stats, lambda e: e["pitchin"]))
+    award("Unit Crusher", _leaders(stats, lambda e: e["doemup_pts"]))
+    award("Crowd Favorite", _leaders(stats, lambda e: e["claps"]))
+    award("Jack of All Chores", _leaders(stats, lambda e: len(e["task_counts"])))
+    award("One-Track Mind", _leaders(
+        stats, lambda e: max(e["task_counts"].values()) if e["task_counts"] else 0
+    ))
+    award("Closer", _leaders(stats, lambda e: e["once"]))
+    award("Recurring Nightmare", _leaders(stats, lambda e: e["recurring"]))
+    # Share badges: non-competitors score -1 so they never win; min_score 0
+    # rejects the all-ineligible case (top == -1).
+    award("Team Player", _leaders(
+        stats,
+        lambda e: (e["game_pts"] / e["total_pts"])
+        if e["total_pts"] >= BADGE_SHARE_MIN_PTS and e["game_pts"] > 0 else -1.0,
+        min_score=0.0,
+    ))
+    award("Lone Wolf", _leaders(
+        stats,
+        lambda e: (e["chore_pts"] / e["total_pts"])
+        if e["total_pts"] >= BADGE_SHARE_MIN_PTS and e["chore_pts"] > 0 else -1.0,
+        min_score=0.0,
+    ))
+    award("Archaeologist", _leaders(stats, lambda e: e["max_late"]))
+
+    # Drop empties; preserve BADGE_ORDER (awards already walk that order).
+    return {uid: titles for uid, titles in held.items() if titles}
+
+
+def _all_time_scores(records: list[dict], guild_id: int) -> dict[int, dict]:
+    """Collapse every month into one ``{user_id: {points, chores, claps, name}}``."""
+    bucket: dict[int, dict] = {}
+    for month_bucket in monthly_scores(records, guild_id).values():
+        for uid, ent in month_bucket.items():
+            live = bucket.setdefault(
+                uid, {"points": 0, "chores": 0, "claps": 0, "name": ent["name"]}
+            )
+            live["points"] += ent["points"]
+            live["chores"] += ent["chores"]
+            live["claps"] += ent["claps"]
+            live["name"] = ent["name"]
+    return bucket
+
+
+def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
+                      month: Optional[str] = None,
+                      all_time: bool = False) -> tuple[str, bool]:
+    """Render the leaderboard message for ``guild_id``.
+
+    Default is the current (or given) month. ``all_time=True`` ranks lifetime
+    puntos and derives titles from the full log (``month`` is ignored).
+
+    Returns ``(text, is_empty)`` where ``is_empty`` is True when nothing was
+    logged in scope (the slash command shows that variant ephemerally).
     Pure apart from reading the clock — shared by the ``/leaderboard`` command
     and the nightly auto-post in ``backup.py``."""
     tz = ZoneInfo(cfg["timezone"]) if cfg and cfg.get("timezone") else UTC
     now = now_utc()
     current_month = now.astimezone(tz).strftime("%Y-%m")
-    if month is None:
+    if not all_time and month is None:
         month = current_month
-    bar = bar_for(cfg, month)  # a past month shows the bar it closed under
 
     months = monthly_scores(records, guild_id)
     stars = star_counts(records, guild_id, current_month)
 
-    # A one-line star roll-call, shown ONLY on the empty-month variant: the
-    # ranking lines below already wear each holder's ⭐×n, so repeating them in
-    # a separate section was redundant. (All-time names so an idle holder shows.)
+    # A one-line star roll-call, shown ONLY on the empty variant: the ranking
+    # lines below already wear each holder's ⭐×n, so repeating them in a
+    # separate section was redundant. (All-time names so an idle holder shows.)
     names = {uid: ent["name"] for bucket in months.values() for uid, ent in bucket.items()}
     star_line = ""
     if stars:
         holders = sorted(stars.items(), key=lambda kv: (-kv[1], names.get(kv[0], "").lower()))
         star_line = "⭐ **Stars** — " + " · ".join(f"<@{uid}> ×{n}" for uid, n in holders)
 
-    bucket = months.get(month, {})
+    if all_time:
+        bucket = _all_time_scores(records, guild_id)
+        title_scope: Optional[str] = None  # all-time badges
+        scope_label = "all time"
+    else:
+        bucket = months.get(month or current_month, {})
+        title_scope = month or current_month
+        scope_label = title_scope
+
     if not bucket:
-        msg = (f"No chores logged for **{month}** yet. Get to work! 🚜\n"
-               + trinkets.zone_blurb(month, bar, past=month < current_month))
+        if all_time:
+            msg = "No chores logged yet. Get to work! 🚜"
+        else:
+            bar = bar_for(cfg, scope_label)
+            msg = (f"No chores logged for **{scope_label}** yet. Get to work! 🚜\n"
+                   + trinkets.zone_blurb(scope_label, bar,
+                                         past=scope_label < current_month))
         if star_line:
             msg += "\n\n" + star_line
         return msg, True
 
+    titles = badge_titles(records, guild_id, title_scope)
     ranking = sorted(bucket.items(), key=lambda kv: (-kv[1]["points"], kv[1]["name"].lower()))
-    # Spice rides only the live month — a closed month has no "since the last
-    # nightly post" to move against.
-    spice = rank_spice(records, guild_id, tz, now) if month == current_month else {}
+    # Spice rides only the live month — closed months and all-time have no
+    # "since the last nightly post" to move against.
+    spice = (
+        rank_spice(records, guild_id, tz, now)
+        if not all_time and scope_label == current_month else {}
+    )
     medals = ["🥇", "🥈", "🥉"]
     lines = []
     for i, (uid, ent) in enumerate(ranking):
@@ -331,6 +526,9 @@ def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
         clap = f" · 👏×{ent['claps']}" if ent.get("claps") else ""
         pts = ent["points"]
         lines.append(f"{badge} **{pts} punto{'' if pts == 1 else 's'}** — <@{uid}>{star}{clap}")
+        held = titles.get(uid) or []
+        if held:
+            lines.append(f"*{' · '.join(held)}*")
 
     total_pts = sum(ent["points"] for ent in bucket.values())
     # A game round is one chore shared by all its scorers, not one per payout
@@ -339,31 +537,48 @@ def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
     game_rounds = {
         (rec.get("kind"), rec.get("task_id"), rec.get("ts"))
         for rec in records
-        if rec.get("guild_id") == guild_id and _rec_month(rec) == month
+        if rec.get("guild_id") == guild_id
+        and (all_time or _rec_month(rec) == scope_label)
         and rec.get("kind") in ("pitchin", "doemup")
     }
     total_chores = sum(ent["chores"] for ent in bucket.values()) + len(game_rounds)
-    when = "this month" if month == current_month else f"in {month}"
+    if all_time:
+        when = "all time"
+    elif scope_label == current_month:
+        when = "this month"
+    else:
+        when = f"in {scope_label}"
     footer = (
         f"_{total_chores} chore{'' if total_chores == 1 else 's'} · "
         f"{total_pts} punto{'' if total_pts == 1 else 's'} {when}._"
     )
-    if month == current_month:
+    if not all_time and scope_label == current_month:
         footer += "\n⭐ Whoever tops the board when the month ends earns a star."
 
-    zone_note = trinkets.zone_blurb(month, bar, past=month < current_month)
-    msg = f"🏆 **Chore leaderboard — {month}**\n{zone_note}\n" + "\n".join(lines)
+    if all_time:
+        header = "🏆 **Chore leaderboard — all time**\n"
+    else:
+        bar = bar_for(cfg, scope_label)
+        zone_note = trinkets.zone_blurb(scope_label, bar, past=scope_label < current_month)
+        header = f"🏆 **Chore leaderboard — {scope_label}**\n{zone_note}\n"
+    msg = header + "\n".join(lines)
     msg += "\n\n" + footer
     return msg, False
 
 
-@bot.tree.command(name="leaderboard", description="Monthly chore puntos & ⭐ stars")
-@app_commands.describe(month="Month as YYYY-MM (defaults to the current month)")
-async def leaderboard(interaction: discord.Interaction, month: Optional[str] = None) -> None:
+@bot.tree.command(name="leaderboard", description="Monthly chore puntos, titles & ⭐ stars")
+@app_commands.describe(
+    month="Month as YYYY-MM (defaults to the current month)",
+    all_time="Show all-time puntos & titles instead of a single month",
+)
+async def leaderboard(interaction: discord.Interaction, month: Optional[str] = None,
+                      all_time: bool = False) -> None:
     snap = await store.snapshot()
     cfg = guild_config(snap, interaction.guild_id)
     records = store.read_completions()
-    msg, empty = build_leaderboard(records, interaction.guild_id, cfg, month)
+    msg, empty = build_leaderboard(
+        records, interaction.guild_id, cfg, month, all_time=all_time
+    )
     await interaction.response.send_message(msg, ephemeral=empty, allowed_mentions=NO_PINGS)
 
 
@@ -439,9 +654,14 @@ async def covet(interaction: discord.Interaction, user: Optional[discord.Member]
 
 
 __all__ = [
+    "BADGE_ORDER",
+    "BADGE_SHARE_MIN_PTS",
+    "PUNCTUAL_GRACE_SECS",
     "_completion_points",
     "_guild_bar",
     "_rec_month",
+    "badge_stats",
+    "badge_titles",
     "bar_for",
     "build_leaderboard",
     "leaderboard",
