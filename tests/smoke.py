@@ -2671,7 +2671,26 @@ async def test_web_task_crud() -> None:
         assert err is None and note and "next cycle" in note
         assert upd["freq"] == "days" and upd["next_due"] is None and upd["pending"]
 
-        # Wrong guild can't delete; the right one sweeps the routing rows too.
+        # 🤫/🔊 via the web: no_nag is a lifetime flag (same as the reactions);
+        # shushing is a no-op when already set; un-shushing a pending task
+        # restarts the hourly remind_at cadence instead of nagging immediately.
+        upd, note, err = await webui.apply_task_edit(1, tid, {"no_nag": True})
+        assert err is None and upd["no_nag"] is True
+        assert note and "Shushed" in note
+        stale = upd["pending"]["remind_at"]
+        # Same-direction again: flag stays, no new note about state change.
+        upd, note, err = await webui.apply_task_edit(1, tid, {"no_nag": True})
+        assert err is None and upd["no_nag"] is True
+        assert upd["pending"]["remind_at"] == stale
+        # Un-shush restarts the hour from *now*.
+        before = m.now_utc()
+        upd, note, err = await webui.apply_task_edit(1, tid, {"no_nag": False})
+        assert err is None and upd["no_nag"] is False
+        assert note and "Un-shushed" in note
+        restarted = m.from_iso(upd["pending"]["remind_at"])
+        assert before + dt.timedelta(minutes=55) < restarted < before + dt.timedelta(hours=1, minutes=5)
+
+        # Wrong guild can't delete; the right one sweeps the reaction-routing rows too.
         assert await webui.delete_task(2, tid) is None
         removed = await webui.delete_task(1, tid)
         assert removed and removed["id"] == tid

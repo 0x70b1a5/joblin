@@ -7,10 +7,11 @@ service or tmux pane to manage. It is enabled only when ``WEB_BASE_URL``,
 the bot runs exactly as before and never opens a port.
 
 Scope: a glanceable schedule plus convenient create/edit/delete for tasks,
-pitch-ins, and do-em-ups. It deliberately does **not** complete chores or
-award puntos — the ✅ lifecycle (finalizing the Discord post, the ↩️ undo
-anchor, 👏 claps) is keyed off Discord message ids and stays in Discord, so
-the economy has one door.
+pitch-ins, and do-em-ups (including 🤫/🔊 shush of a chore's hourly
+reminders). It deliberately does **not** complete chores or award puntos —
+the ✅ lifecycle (finalizing the Discord post, the ↩️ undo anchor, 👏
+claps) is keyed off Discord message ids and stays in Discord, so the
+economy has one door.
 
 Auth
 ----
@@ -31,7 +32,10 @@ API
 The JSON surface mirrors the slash commands rather than inventing new
 semantics: the schedule is assembled from a plain ``store.snapshot()``, and
 task create/edit/delete reuse ``schedule_from_rule`` + the exact field
-assignments of ``/newtask``, ``/edit task`` and ``/deletetask``. Pitch-in and
+assignments of ``/newtask``, ``/edit task`` and ``/deletetask``. The one
+web-only task field is ``no_nag`` (Discord's 🤫/🔊 reaction pair has no
+slash-command surface); un-shushing a pending task restarts the hourly
+``remind_at`` cadence the same way the reaction handler does. Pitch-in and
 do-em-up edits go through :func:`apply_game_edit` — the very engine behind
 ``/edit pitchin`` / ``/edit doemup`` (including its live-post re-render) —
 and game deletes mirror the game branch of ``/deletetask``. *Playing* the
@@ -399,6 +403,26 @@ async def apply_task_edit(
                 t["description"] = desc[:1500] if desc else None
             if "bounty" in fields:
                 t["bounty"] = bool(fields["bounty"])
+            if "no_nag" in fields:
+                # Mirrors the 🤫/🔊 reaction pair: a lifetime flag that stops
+                # hourly nags without cancelling the schedule. Un-shushing a
+                # pending occurrence restarts remind_at so the next nag is a
+                # full hour out (not "immediately, because it's stale").
+                want = bool(fields["no_nag"])
+                was = bool(t.get("no_nag", False))
+                if want != was:
+                    t["no_nag"] = want
+                    if not want and t.get("pending"):
+                        t["pending"]["remind_at"] = to_iso(
+                            now_utc() + dt.timedelta(hours=1)
+                        )
+                    if note is None:
+                        note = (
+                            "Shushed — no more hourly reminders "
+                            "(still fires on schedule)."
+                            if want else
+                            "Un-shushed — hourly reminders are back on."
+                        )
             if sched is not None:
                 t["recurring"] = sched["recurring"]
                 t["freq"] = sched["freq"]
