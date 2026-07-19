@@ -335,16 +335,18 @@ async def _handle_shush(tid, task, channel, reacted, payload, mention, *, shush:
         await reacted.add_reaction(new)
     except discord.HTTPException:
         pass
+    # No separate confirmation post: stamp the tapped post itself with who
+    # flipped the switch, replacing any earlier stamp so repeated toggles on
+    # one post never stack up.
     if shush:
-        note = (
-            f"🤫 Shushed by {mention} — **{task['brief']}** won't post reminders "
-            "anymore (it still fires on schedule; tap 🔊 on a live post to turn "
-            "nags back on)."
-        )
+        line = f"{EMOJI_SHUSH} Shushed by {mention} — reminders off."
     else:
-        note = f"🔊 Un-shushed by {mention} — reminders for **{task['brief']}** are back on."
+        line = f"{EMOJI_UNSHUSH} Un-shushed by {mention} — reminders back on."
+    stamps = (f"{EMOJI_SHUSH} Shushed by ", f"{EMOJI_UNSHUSH} Un-shushed by ")
     try:
-        await channel.send(note, reference=reacted, allowed_mentions=NO_PINGS)
+        content = (await reacted.fetch()).content or ""
+        kept = [ln for ln in content.split("\n") if ln and not ln.startswith(stamps)]
+        await reacted.edit(content="\n".join(kept + [line]), allowed_mentions=NO_PINGS)
     except discord.HTTPException:
         pass
 

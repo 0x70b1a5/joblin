@@ -448,6 +448,9 @@ class FakeMessage:
         self.channel.cleared.append(self.id)
         self.reactions.clear()
 
+    async def fetch(self) -> "FakeMessage":
+        return self
+
     async def edit(self, content=None, **kw) -> None:  # absorbs view=/allowed_mentions=
         self.content = content
         if "view" in kw:
@@ -1978,14 +1981,17 @@ async def test_shush() -> None:
         nag = snap["tasks"][tid]["pending"]["message_ids"][-1]
         assert nag != first and m.EMOJI_SHUSH in ch.msgs[nag].reactions, "nags grow a 🤫"
 
-        # 🤫 the nag: flag set, confirmation posted, the bot's button flips to
-        # 🔊, and no further reminders even with remind_at long past.
+        # 🤫 the nag: flag set, the tapped post is stamped with who shushed
+        # (no separate confirmation post), the bot's button flips to 🔊, and
+        # no further reminders even with remind_at long past.
+        posted_before = len(ch.msgs)
         await bot.on_raw_reaction_add(
             FakePayload(nag, m.EMOJI_SHUSH, member=FakeMember(42, "Pat"))
         )
         snap = await st.snapshot()
         assert snap["tasks"][tid]["no_nag"] is True
-        assert any("Shushed" in (msg.content or "") for msg in ch.msgs.values())
+        assert len(ch.msgs) == posted_before, "the stamp is an edit, not a new post"
+        assert "Shushed by <@42>" in (ch.msgs[nag].content or ""), "tapped post is stamped"
         assert m.EMOJI_UNSHUSH in ch.msgs[nag].reactions, "shush flips the button to 🔊"
         assert m.EMOJI_SHUSH not in ch.msgs[nag].reactions, "the 🤫 face is retired"
 
@@ -2028,6 +2034,7 @@ async def test_shush() -> None:
         # 🔊 on the (new) live post un-shushes and restarts the cadence fresh —
         # remind_at moves ~1h out instead of staying in the past — and the
         # button flips back to 🤫.
+        posted_before = len(ch.msgs)
         await bot.on_raw_reaction_add(
             FakePayload(fresh, m.EMOJI_UNSHUSH, member=FakeMember(42, "Pat"))
         )
@@ -2035,7 +2042,8 @@ async def test_shush() -> None:
         assert snap["tasks"][tid]["no_nag"] is False
         remind = m.from_iso(snap["tasks"][tid]["pending"]["remind_at"])
         assert (remind - m.now_utc()).total_seconds() > 3500, "cadence restarted ~1h out"
-        assert any("Un-shushed" in (msg.content or "") for msg in ch.msgs.values())
+        assert len(ch.msgs) == posted_before, "un-shush stamps the post, no new message"
+        assert "Un-shushed by <@42>" in (ch.msgs[fresh].content or "")
         assert m.EMOJI_SHUSH in ch.msgs[fresh].reactions, "un-shush flips the button to 🤫"
         assert m.EMOJI_UNSHUSH not in ch.msgs[fresh].reactions, "the 🔊 face is retired"
 
@@ -2045,6 +2053,15 @@ async def test_shush() -> None:
         posted_before = len(ch.msgs)
         await bot.send_reminder(tid, ch, cfg)
         assert len(ch.msgs) == posted_before + 1, "un-shushed task nags again"
+
+        # Re-toggling on the same post REPLACES its stamp instead of stacking:
+        # after 🔊 then 🤫 on `fresh`, only the latest stamp line remains.
+        await bot.on_raw_reaction_add(
+            FakePayload(fresh, m.EMOJI_SHUSH, member=FakeMember(7, "Sam"))
+        )
+        body = ch.msgs[fresh].content or ""
+        assert "Shushed by <@7>" in body and "Un-shushed" not in body
+        assert body.count("Shushed by") == 1, "one stamp line, not a pile"
 
 
 async def test_listopen() -> None:
