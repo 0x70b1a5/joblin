@@ -1331,13 +1331,18 @@ async def test_requeue() -> None:
         assert len(st.read_completions()) == 1
 
         # 🔄 re-fires it now as a fresh occurrence; the spent record is dropped.
-        await bot.on_raw_reaction_add(FakePayload(posted, "🔄", member=FakeMember(7, "Sam")))
+        await bot.on_raw_reaction_add(FakePayload(posted, "🔄", user_id=7, member=FakeMember(7, "Sam")))
         snap = await st.snapshot()
         assert str(posted) not in snap["requeue"], "the spent requeue record is dropped"
         p = snap["tasks"][tid]["pending"]
         assert p is not None, "requeue fires a fresh, live occurrence"
         fresh = p["message_ids"][-1]
         assert fresh != posted, "a brand-new post, not the completed one"
+        # The tap left a zero-punto marker row — The Reanimator's raw material.
+        markers = [r for r in st.read_completions() if r["kind"] == "requeue"]
+        assert len(markers) == 1
+        assert markers[0]["user_id"] == 7 and markers[0]["points"] == 0
+        assert markers[0]["brief"] == "Water the animals"
 
         # Finishing the re-run rolls the daily recurrence on to tomorrow's slot
         # (re-pinned to its time-of-day, so no drift) and counts again.
@@ -1346,7 +1351,8 @@ async def test_requeue() -> None:
         assert snap["tasks"][tid]["pending"] is None
         nd = m.from_iso(snap["tasks"][tid]["next_due"]).astimezone(tz)
         assert nd.strftime("%H:%M") == tod and m.from_iso(snap["tasks"][tid]["next_due"]) > now
-        assert len(st.read_completions()) == 2, "the re-run also counts on the leaderboard"
+        done = [r for r in st.read_completions() if r["kind"] != "requeue"]
+        assert len(done) == 2, "the re-run also counts on the leaderboard"
 
         # With another occurrence live, 🔄 on the re-run's completed post declines
         # rather than double-firing.
@@ -1360,6 +1366,8 @@ async def test_requeue() -> None:
         assert snap["tasks"][tid]["pending"]["message_ids"][-1] == live_mid, "no double-fire while busy"
         assert str(fresh_post) in snap["requeue"], "the button stays for later"
         assert any("already queued" in (msg.content or "") for msg in ch.msgs.values())
+        assert len([r for r in st.read_completions() if r["kind"] == "requeue"]) == 1, \
+            "a declined 🔄 logs no marker"
 
 
 async def test_claps() -> None:
@@ -1546,6 +1554,9 @@ async def test_requeue_oneoff() -> None:
         assert tid in snap["tasks"], "requeue rebuilt the one-off"
         assert snap["tasks"][tid]["pending"] is not None, "and re-fired it"
         assert snap["tasks"][tid]["recurring"] is False
+        markers = [r for r in st.read_completions() if r["kind"] == "requeue"]
+        assert len(markers) == 1 and markers[0]["brief"] == "Move the sheep", \
+            "the rebuilt-from-snapshot path logs the marker too"
 
 
 def test_points_and_stars() -> None:
@@ -2402,11 +2413,136 @@ def test_badge_titles() -> None:
     lee = titles2.get(3, [])
     if len(lee) >= 2:
         order = {n: i for i, n in enumerate(
-            ("Punctualist", "Bounty Hunter", "Pitcher-Inner", "Unit Crusher",
-             "Crowd Favorite", "Jack of All Chores", "One-Track Mind", "Closer",
-             "Recurring Nightmare", "Team Player", "Lone Wolf", "Archaeologist")
+            ("Punctualist", "Early Bird", "Night Owl", "Bounty Hunter",
+             "Pitcher-Inner", "Unit Crusher", "Crowd Favorite",
+             "Jack of All Chores", "One-Track Mind", "Closer",
+             "Recurring Nightmare", "The Reanimator", "Team Player", "Lone Wolf",
+             "Archaeologist")
         )}
         assert lee == sorted(lee, key=lambda n: order[n])
+
+
+def test_reanimator() -> None:
+    """The Reanimator: 🔄 marker rows crown the top requeuer (ties share, month
+    scope holds) — and a marker never mints a punto anywhere in the economy."""
+    from joblin.bot.scoring import (
+        _completion_points,
+        badge_titles,
+        build_leaderboard,
+        monthly_scores,
+        star_counts,
+    )
+
+    g = 1
+
+    def rq(uid, name, month="2026-04"):
+        return {"guild_id": g, "month": month, "user_id": uid, "user_name": name,
+                "kind": "requeue", "points": 0, "task_id": "a",
+                "ts": f"{month}-02T12:00:00+00:00"}
+
+    # Worth 0 — even a mangled marker with no points field never falls back to 1.
+    assert _completion_points(rq(1, "Pat")) == 0
+    assert _completion_points({"kind": "requeue"}) == 0
+
+    recs = [
+        {"guild_id": g, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "recurring", "points": 1, "task_id": "a", "late_seconds": 0},
+        rq(2, "Sam"), rq(2, "Sam"), rq(1, "Pat"),
+        # Ghost only ever requeues — never completes a thing.
+        rq(3, "Ghost"),
+        rq(3, "Ghost", month="2026-05"), rq(3, "Ghost", month="2026-05"),
+    ]
+
+    def holders(month):
+        by: dict[str, set[int]] = {}
+        for uid, names in badge_titles(recs, g, month).items():
+            for n in names:
+                by.setdefault(n, set()).add(uid)
+        return by
+
+    assert holders("2026-04")["The Reanimator"] == {2}, "Sam's two April taps beat one"
+    assert badge_titles(recs, g, "2026-05") == {3: ["The Reanimator"]}
+    assert holders(None)["The Reanimator"] == {3}, "all-time: Ghost's 3 lead"
+
+    # The economy is untouched: markers score nothing, seed nobody, star nobody.
+    months = monthly_scores(recs, g)
+    assert set(months["2026-04"]) == {1}, "requeue-only users never reach the board"
+    assert months["2026-04"][1] == {"points": 1, "chores": 1, "claps": 0, "name": "Pat"}
+    assert "2026-05" not in months, "a month of nothing but markers scores nothing"
+    assert star_counts(recs, g, current_month="2026-06") == {1: 1}
+
+    # Ties share; a board-listed holder wears the title on the rendered board.
+    recs.append(rq(1, "Pat"))
+    assert holders("2026-04")["The Reanimator"] == {1, 2}
+    text, empty = build_leaderboard(recs, g, None, month="2026-04")
+    assert not empty and "The Reanimator" in text
+
+    # A month of only markers still renders the empty board.
+    text, empty = build_leaderboard([rq(3, "Ghost", month="2026-03")], g, None,
+                                    month="2026-03")
+    assert empty
+
+
+def test_early_bird_night_owl() -> None:
+    """Early Bird / Night Owl: disjoint guild-local clock windows over when a
+    solo chore's ✅ landed — the owl's night wraps midnight, window edges land
+    exactly, the hour is read in the guild's tz, and game payouts / ts-less
+    relics never compete."""
+    from joblin.bot.scoring import (
+        EARLY_BIRD_WINDOW,
+        NIGHT_OWL_WINDOW,
+        _in_window,
+        badge_titles,
+    )
+
+    # Window geometry: [start, end), the owl wrapping past midnight.
+    assert [h for h in range(24) if _in_window(h, EARLY_BIRD_WINDOW)] == [4, 5, 6, 7, 8]
+    assert [h for h in range(24) if _in_window(h, NIGHT_OWL_WINDOW)] == [0, 1, 2, 3, 21, 22, 23]
+
+    g = 1
+    tz = ZoneInfo("Europe/Berlin")  # CEST in April: UTC+2
+
+    def chore(uid, name, ts):
+        return {"guild_id": g, "month": "2026-04", "user_id": uid,
+                "user_name": name, "kind": "recurring", "points": 1,
+                "task_id": "a", "ts": ts}
+
+    recs = [
+        # Pat: 04:00 and 08:59 Berlin — both edges land inside Early Bird…
+        chore(1, "Pat", "2026-04-10T02:00:00+00:00"),
+        chore(1, "Pat", "2026-04-10T06:59:00+00:00"),
+        # …while 09:00 and 20:59 are honest daylight work, in neither window.
+        chore(1, "Pat", "2026-04-10T07:00:00+00:00"),
+        chore(1, "Pat", "2026-04-12T18:59:00+00:00"),
+        # Sam: one early (05:30), then 21:00 (owl edge) and 01:30 (the wrap).
+        chore(2, "Sam", "2026-04-11T03:30:00+00:00"),
+        chore(2, "Sam", "2026-04-11T19:00:00+00:00"),
+        chore(2, "Sam", "2026-04-11T23:30:00+00:00"),
+        # Two small-hours pitch-in payouts for Pat: they stamp the round's
+        # close, not Pat's own tap — if games counted, Pat would tie Sam's owl.
+        {"guild_id": g, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "pitchin", "points": 1, "task_id": "g1", "ts": "2026-04-12T23:00:00+00:00"},
+        {"guild_id": g, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "pitchin", "points": 1, "task_id": "g2", "ts": "2026-04-13T23:00:00+00:00"},
+        # A relic with no ts has no clock to read (and must not crash the scan).
+        {"guild_id": g, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "recurring", "points": 1, "task_id": "a"},
+    ]
+
+    by: dict[str, set[int]] = {}
+    for uid, names in badge_titles(recs, g, "2026-04", tz).items():
+        for n in names:
+            by.setdefault(n, set()).add(uid)
+    assert by["Early Bird"] == {1}, "Pat's two dawn chores beat Sam's one"
+    assert by["Night Owl"] == {2}, "Sam's 21:00 edge + wrapped 01:30; games ignored"
+
+    # The window is guild-local: the same instant flips badges when read in a
+    # different zone. 02:00Z is 04:00 Berlin (early) but plain owl-time in UTC.
+    solo = [chore(1, "Pat", "2026-04-10T02:00:00+00:00")]
+    berlin = badge_titles(solo, g, "2026-04", tz)[1]
+    utc = badge_titles(solo, g, "2026-04")[1]
+    assert "Early Bird" in berlin and "Night Owl" not in berlin
+    assert "Night Owl" in utc and "Early Bird" not in utc
 
 
 def test_rank_spice() -> None:
@@ -2821,6 +2957,8 @@ def main() -> None:
     test_record_bar_change()
     test_leaderboard_text()
     test_badge_titles()
+    test_reanimator()
+    test_early_bird_night_owl()
     test_rank_spice()
     asyncio.run(test_daily_backup())
     asyncio.run(test_void_completion())

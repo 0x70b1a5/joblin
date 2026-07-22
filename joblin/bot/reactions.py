@@ -629,6 +629,12 @@ async def _handle_undo(
 # normal next slot exactly as usual (the schedule re-pins to time_of_day, so it
 # doesn't drift). Like ↩️, only the most recent completed post per task carries a
 # live 🔄, and the table survives restarts.
+#
+# A fired 🔄 also appends a zero-punto marker row (kind "requeue", points 0) to
+# the completion log — worth nothing anywhere in the economy, but it's what the
+# "The Reanimator" title badge is derived from, same recompute-from-log spirit
+# as every other badge. Markers are never voided: undoing the fresh occurrence
+# doesn't un-happen the tap.
 async def _arm_requeue(
     tid: str,
     before: Optional[dict],
@@ -673,9 +679,10 @@ async def _handle_requeue(
 
     member = payload.member
     mention = member.mention if member else f"<@{payload.user_id}>"
+    display = member.display_name if member else str(payload.user_id)
 
     outcome = None  # "fired" | "busy" | "gone"
-    tid = cfg = None
+    tid = cfg = brief = None
     async with store.txn() as data:
         rec = data["requeue"].get(str(payload.message_id))
         if not rec:
@@ -689,6 +696,7 @@ async def _handle_requeue(
             outcome = "busy"  # an occurrence is already live — finish that one
         elif live is not None:
             live["next_due"] = to_iso(now_utc())  # fire on the spot below
+            brief = live.get("brief")
             outcome = "fired"
         elif rec.get("before") is not None:
             # The task is gone (a completed one-off, or it was deleted): rebuild
@@ -697,6 +705,7 @@ async def _handle_requeue(
             restored["pending"] = None
             restored["next_due"] = to_iso(now_utc())
             data["tasks"][tid] = restored
+            brief = restored.get("brief")
             outcome = "fired"
         else:
             outcome = "gone"
@@ -707,6 +716,23 @@ async def _handle_requeue(
 
     pm = channel.get_partial_message(payload.message_id)
     if outcome == "fired":
+        # The tap itself is on the record: a zero-punto marker row, outside the
+        # txn (log_completion takes the same lock). Scoring skips these rows
+        # everywhere except The Reanimator tally.
+        fired_at = now_utc()
+        tz = ZoneInfo(cfg["timezone"])
+        await store.log_completion({
+            "id": new_id(),
+            "ts": to_iso(fired_at),
+            "month": fired_at.astimezone(tz).strftime("%Y-%m"),  # local-tz bucket
+            "guild_id": rec["guild_id"],
+            "task_id": tid,
+            "brief": brief,
+            "user_id": payload.user_id,
+            "user_name": display,
+            "kind": "requeue",
+            "points": 0,
+        })
         await fire_task(tid, channel, cfg)
         # Tidy the spent 🔄 off the old completed post (both ours and theirs) and
         # confirm right where they tapped — the fresh post may be far down.

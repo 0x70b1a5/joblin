@@ -24,7 +24,7 @@ uv sync                           # install/sync deps into .venv
 
 **Single asyncio event loop, no threads.** This is the load-bearing assumption everywhere. There's no OS-thread parallelism to guard against — only coroutine interleaving across `await`.
 
-**Persistence (`store.py`).** Two files: `store.json` (a single dict: configs, tasks, live games, and reaction-routing tables) and `completions.jsonl` (append-only ledger of every punto-earning event — the source of truth for all stats). The in-memory `store.data` is canonical during a run; every change is flushed atomically (temp file → `fsync` → `os.replace`). Two access patterns, and using the right one matters:
+**Persistence (`store.py`).** Two files: `store.json` (a single dict: configs, tasks, live games, and reaction-routing tables) and `completions.jsonl` (append-only ledger of every punto-earning event, plus zero-punto 🔄-requeue marker rows — the source of truth for all stats and title badges). The in-memory `store.data` is canonical during a run; every change is flushed atomically (temp file → `fsync` → `os.replace`). Two access patterns, and using the right one matters:
 - `async with store.txn() as data:` — mutate under the lock, flush on clean exit. **Keep network/Discord `await`s OUT of the txn body.** The pattern across the codebase is: snapshot → do Discord I/O → re-enter a tiny txn to commit the result.
 - `await store.snapshot()` — a deep copy you can read freely without holding the lock.
 

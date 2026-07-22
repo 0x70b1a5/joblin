@@ -31,7 +31,11 @@ from .helpers import guild_config
 # ---------------------------------------------------------------------------
 def _completion_points(rec: dict) -> int:
     """Puntos a logged completion is worth. Bounties record ``points: 2``; older
-    records predate the field and count as the normal 1 punto."""
+    records predate the field and count as the normal 1 punto. Requeue marker
+    rows (``kind: "requeue"``) record an *action*, not a completion — they are
+    worth 0 everywhere, so a 🔄 can never mint a punto."""
+    if rec.get("kind") == "requeue":
+        return 0
     p = rec.get("points")
     return int(p) if isinstance(p, (int, float)) and p > 0 else 1
 
@@ -54,6 +58,8 @@ def monthly_scores(records: list[dict], guild_id: int) -> dict[str, dict[int, di
     for rec in records:
         if rec.get("guild_id") != guild_id:
             continue
+        if rec.get("kind") == "requeue":
+            continue  # zero-punto 🔄 markers feed titles only — never the board
         bucket = months.setdefault(_rec_month(rec), {})
         ent = bucket.setdefault(
             rec["user_id"], {"points": 0, "chores": 0, "claps": 0, "name": str(rec["user_id"])}
@@ -183,6 +189,8 @@ def _month_events(records: list[dict], guild_id: int,
     for rec in records:
         if rec.get("guild_id") != guild_id or _rec_month(rec) != month:
             continue
+        if rec.get("kind") == "requeue":
+            continue  # 0-punto markers would still seed users into the ranking
         try:
             at = from_iso(rec["ts"])
         except (KeyError, TypeError, ValueError):
@@ -292,9 +300,17 @@ def vitrine_for(records: list[dict], guild_id: int, user_id: int, cfg: Optional[
 PUNCTUAL_GRACE_SECS = 59 * 60  # "within 59 minutes of due" still counts
 BADGE_SHARE_MIN_PTS = 10  # Team Player / Lone Wolf need enough volume to compete
 
+# Early Bird / Night Owl: guild-local clock windows over when a ✅ landed, as
+# ``[start, end)`` hours with the owl's night wrapping past midnight. They are
+# deliberately disjoint — a 01:00 ✅ reads as staying up late, not rising early.
+EARLY_BIRD_WINDOW = (4, 9)  # 04:00–08:59
+NIGHT_OWL_WINDOW = (21, 4)  # 21:00–03:59
+
 # Fixed display order when one person holds several titles.
 BADGE_ORDER = (
     "Punctualist",
+    "Early Bird",
+    "Night Owl",
     "Bounty Hunter",
     "Pitcher-Inner",
     "Unit Crusher",
@@ -303,6 +319,7 @@ BADGE_ORDER = (
     "One-Track Mind",
     "Closer",
     "Recurring Nightmare",
+    "The Reanimator",
     "Team Player",
     "Lone Wolf",
     "Archaeologist",
@@ -310,8 +327,15 @@ BADGE_ORDER = (
 
 
 def _is_chore(rec: dict) -> bool:
-    """A solo chore row (not a pitch-in, do-em-up, or clap bonus)."""
-    return rec.get("kind") not in ("pitchin", "doemup", "clap")
+    """A solo chore row (not a pitch-in, do-em-up, clap bonus, or 🔄 marker)."""
+    return rec.get("kind") not in ("pitchin", "doemup", "clap", "requeue")
+
+
+def _in_window(hour: int, window: tuple[int, int]) -> bool:
+    """Is ``hour`` inside the ``[start, end)`` clock window (wrapping past
+    midnight when ``start > end``)?"""
+    start, end = window
+    return start <= hour < end if start < end else hour >= start or hour < end
 
 
 def _empty_badge_stats() -> dict:
@@ -323,6 +347,9 @@ def _empty_badge_stats() -> dict:
         "claps": 0,
         "once": 0,
         "recurring": 0,
+        "requeue": 0,
+        "early": 0,
+        "night": 0,
         "task_counts": {},  # task_id -> n (chores only)
         "game_pts": 0,
         "chore_pts": 0,
@@ -333,11 +360,13 @@ def _empty_badge_stats() -> dict:
 
 
 def badge_stats(records: list[dict], guild_id: int,
-                month: Optional[str] = None) -> dict[int, dict]:
+                month: Optional[str] = None,
+                tz: dt.tzinfo = UTC) -> dict[int, dict]:
     """Per-user counters for title badges over ``guild_id``.
 
     ``month=None`` means all-time; otherwise only rows in that local-tz month
-    count. Pure scan of the log — no store side effects."""
+    count. ``tz`` is the guild's zone, used to read each ✅'s wall-clock hour
+    for Early Bird / Night Owl. Pure scan of the log — no store side effects."""
     out: dict[int, dict] = {}
     for rec in records:
         if rec.get("guild_id") != guild_id:
@@ -353,6 +382,11 @@ def badge_stats(records: list[dict], guild_id: int,
         ent["total_pts"] += pts
         kind = rec.get("kind")
 
+        if kind == "requeue":
+            # A 🔄 marker: pts is 0 by definition, so the total_pts add above
+            # was a no-op — it counts toward The Reanimator and nothing else.
+            ent["requeue"] += 1
+            continue
         if kind == "clap":
             ent["claps"] += 1
             continue
@@ -381,6 +415,16 @@ def badge_stats(records: list[dict], guild_id: int,
                 ent["punctual"] += 1
             if late_i > ent["max_late"]:
                 ent["max_late"] = late_i
+        # Early Bird / Night Owl read the ✅'s guild-local wall-clock hour. Only
+        # solo chores compete: a game payout row stamps the round's close (and a
+        # clap its clapper's tap), not the member's own work.
+        try:
+            hour = from_iso(rec["ts"]).astimezone(tz).hour
+        except (KeyError, TypeError, ValueError):
+            pass  # a relic too old to carry a parsable ts has no clock to read
+        else:
+            ent["early"] += _in_window(hour, EARLY_BIRD_WINDOW)
+            ent["night"] += _in_window(hour, NIGHT_OWL_WINDOW)
         tid = rec.get("task_id")
         if tid:
             counts = ent["task_counts"]
@@ -400,13 +444,15 @@ def _leaders(stats: dict[int, dict], score_of, min_score: float = 1) -> list[int
 
 
 def badge_titles(records: list[dict], guild_id: int,
-                 month: Optional[str] = None) -> dict[int, list[str]]:
+                 month: Optional[str] = None,
+                 tz: dt.tzinfo = UTC) -> dict[int, list[str]]:
     """Title badges held in ``guild_id`` for ``month`` (or all-time if None).
 
     Ties share a title. Only awarded when the winning metric is positive (and
     Team Player / Lone Wolf also need :data:`BADGE_SHARE_MIN_PTS` total puntos
-    in-scope). Returns ``{user_id: [title, …]}`` in :data:`BADGE_ORDER`."""
-    stats = badge_stats(records, guild_id, month)
+    in-scope). ``tz`` feeds the clock-window badges (see :func:`badge_stats`).
+    Returns ``{user_id: [title, …]}`` in :data:`BADGE_ORDER`."""
+    stats = badge_stats(records, guild_id, month, tz)
     held: dict[int, list[str]] = {uid: [] for uid in stats}
 
     def award(name: str, uids: list[int]) -> None:
@@ -414,6 +460,8 @@ def badge_titles(records: list[dict], guild_id: int,
             held.setdefault(uid, []).append(name)
 
     award("Punctualist", _leaders(stats, lambda e: e["punctual"]))
+    award("Early Bird", _leaders(stats, lambda e: e["early"]))
+    award("Night Owl", _leaders(stats, lambda e: e["night"]))
     award("Bounty Hunter", _leaders(stats, lambda e: e["bounty"]))
     award("Pitcher-Inner", _leaders(stats, lambda e: e["pitchin"]))
     award("Unit Crusher", _leaders(stats, lambda e: e["doemup_pts"]))
@@ -424,6 +472,7 @@ def badge_titles(records: list[dict], guild_id: int,
     ))
     award("Closer", _leaders(stats, lambda e: e["once"]))
     award("Recurring Nightmare", _leaders(stats, lambda e: e["recurring"]))
+    award("The Reanimator", _leaders(stats, lambda e: e["requeue"]))
     # Share badges: non-competitors score -1 so they never win; min_score 0
     # rejects the all-ineligible case (top == -1).
     award("Team Player", _leaders(
@@ -510,7 +559,7 @@ def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
             msg += "\n\n" + star_line
         return msg, True
 
-    titles = badge_titles(records, guild_id, title_scope)
+    titles = badge_titles(records, guild_id, title_scope, tz)
     ranking = sorted(bucket.items(), key=lambda kv: (-kv[1]["points"], kv[1]["name"].lower()))
     # Spice rides only the live month — closed months and all-time have no
     # "since the last nightly post" to move against.
@@ -656,6 +705,8 @@ async def covet(interaction: discord.Interaction, user: Optional[discord.Member]
 __all__ = [
     "BADGE_ORDER",
     "BADGE_SHARE_MIN_PTS",
+    "EARLY_BIRD_WINDOW",
+    "NIGHT_OWL_WINDOW",
     "PUNCTUAL_GRACE_SECS",
     "_completion_points",
     "_guild_bar",
