@@ -426,6 +426,8 @@ class FakeMessage:
         self.id = mid
         self.channel = channel
         self.content = None
+        self.embed = None
+        self.embeds = None
         self.view = None
         # The live set of reactions on this message (emoji string -> present),
         # so a test can verify a member's fun reaction survives a close while our
@@ -475,6 +477,12 @@ class FakeChannel:
         self._next += 1
         msg = FakeMessage(self._next, self)
         msg.content = content
+        if kw.get("embed") is not None:
+            msg.embed = kw["embed"]
+        if kw.get("embeds") is not None:
+            msg.embeds = kw["embeds"]
+            if msg.embed is None and kw["embeds"]:
+                msg.embed = kw["embeds"][0]
         if kw.get("file") is not None:
             self.files.append(kw["file"])
         self.msgs[msg.id] = msg
@@ -2678,6 +2686,102 @@ async def test_daily_backup() -> None:
         assert len(ch.files) == 2, "second backup posted after fresh activity"
 
 
+def test_month_close_embeds() -> None:
+    """Pure builder: stars + trinkets for a closed month, quiet when empty."""
+    import joblin.bot as bot
+
+    cfg = {"timezone": "UTC", "item_bar": 10}
+    # Empty month → no announcement.
+    assert bot.build_month_close_embeds([], 1, cfg, "2026-01") == []
+
+    recs = [
+        {"guild_id": 1, "month": "2026-01", "user_id": 5, "user_name": "Pat",
+         "points": 25},  # 2 trinkets at bar 10
+        {"guild_id": 1, "month": "2026-01", "user_id": 7, "user_name": "Sam",
+         "points": 10},  # 1 trinket
+        {"guild_id": 1, "month": "2026-01", "user_id": 9, "user_name": "Lee",
+         "points": 3},   # below the bar — standings only
+    ]
+    embeds = bot.build_month_close_embeds(recs, 1, cfg, "2026-01")
+    assert len(embeds) >= 1
+    emb = embeds[0]
+    assert emb.title == "🖼️ Month closed — 2026-01"
+    body = emb.description or ""
+    assert "Star of the month" in body and "<@5>" in body, "Pat led and earns the star"
+    assert "🖼️×2" in body and "🖼️×1" in body
+    assert "Trinkets awarded" in body
+    assert "**Pat**" in body and "**Sam**" in body
+    assert "**Lee**" not in body.split("Trinkets awarded", 1)[1], \
+        "below-bar workers appear in standings only"
+    # Deterministic rolls match /covet's roll_for.
+    from joblin import trinkets as T
+    for line in (T.render_line(T.roll_for(1, 5, "2026-01", 0)),
+                 T.render_line(T.roll_for(1, 5, "2026-01", 1)),
+                 T.render_line(T.roll_for(1, 7, "2026-01", 0))):
+        assert line in body, f"missing trinket line: {line}"
+
+    # Nobody cleared the bar → still announce (star + standings), note the wait.
+    low = bot.build_month_close_embeds(
+        [{"guild_id": 1, "month": "2026-02", "user_id": 5, "user_name": "Pat",
+          "points": 3}],
+        1, {"timezone": "UTC", "item_bar": 25}, "2026-02",
+    )
+    assert low and "vitrine waits" in (low[0].description or "")
+
+
+async def test_month_close_announce() -> None:
+    """Scheduler arm → announce on month roll → no double-post; empty months stay quiet."""
+    import joblin.bot as bot
+
+    with tempfile.TemporaryDirectory() as d:
+        _, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        current = now.astimezone(tz).strftime("%Y-%m")
+        closed = bot._prev_month(current)
+
+        # 1) First tick only arms the watermark — no post, even if history exists.
+        async with st.txn() as data:
+            data["configs"]["1"]["item_bar"] = 5
+        await st.log_completion(
+            {"id": "mc1", "guild_id": 1, "month": closed, "user_id": 42,
+             "user_name": "Pat", "points": 12}
+        )
+        await bot.run_month_closes(now, await st.snapshot())
+        armed = (await st.snapshot())["configs"]["1"]["last_month_close_announced"]
+        assert armed == closed, "arms at previous month so current's close is next"
+        assert not ch.msgs, "arming must not dump history into the channel"
+
+        # 2) Rewind the watermark so the closed month is pending → ceremony fires.
+        async with st.txn() as data:
+            data["configs"]["1"]["last_month_close_announced"] = bot._prev_month(closed)
+        await bot.run_month_closes(now, await st.snapshot())
+        assert len(ch.msgs) == 1, "one embed announcement for the closed month"
+        emb = next(iter(ch.msgs.values())).embed
+        assert emb is not None and emb.title == f"🖼️ Month closed — {closed}"
+        body = emb.description or ""
+        assert "Star of the month" in body and "<@42>" in body
+        assert "Trinkets awarded" in body and "**Pat**" in body
+        assert (await st.snapshot())["configs"]["1"]["last_month_close_announced"] == closed
+
+        # 3) Due again with the watermark caught up → quiet.
+        n = len(ch.msgs)
+        await bot.run_month_closes(now, await st.snapshot())
+        assert len(ch.msgs) == n, "no double-announce"
+
+        # 4) An empty closed month advances the watermark without posting.
+        async with st.txn() as data:
+            # Pretend two months are pending; only the one with activity posts.
+            older = bot._prev_month(closed)
+            data["configs"]["1"]["last_month_close_announced"] = bot._prev_month(older)
+        # Wipe the channel's view of prior posts so we only count new ones.
+        before = len(ch.msgs)
+        await bot.run_month_closes(now, await st.snapshot())
+        # older has no completions → silent advance; closed has Pat → one post.
+        assert len(ch.msgs) == before + 1
+        assert (await st.snapshot())["configs"]["1"]["last_month_close_announced"] == closed
+
+
 # ---------------------------------------------------------------------------
 # Web UI: session signing, schedule assembly, and the task CRUD mirrors
 # ---------------------------------------------------------------------------
@@ -2961,6 +3065,8 @@ def main() -> None:
     test_early_bird_night_owl()
     test_rank_spice()
     asyncio.run(test_daily_backup())
+    test_month_close_embeds()
+    asyncio.run(test_month_close_announce())
     asyncio.run(test_void_completion())
     asyncio.run(test_bounty())
     asyncio.run(test_store())

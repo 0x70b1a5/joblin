@@ -23,6 +23,7 @@ from .helpers import (
 )
 from .games import sweep_games
 from .backup import run_daily_backups
+from .month_close import run_month_closes
 
 
 
@@ -52,6 +53,7 @@ async def scheduler() -> None:
 
     await sweep_games(now, snap)
     await run_daily_backups(now, snap)
+    await run_month_closes(now, snap)
 
 
 @scheduler.before_loop
