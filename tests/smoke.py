@@ -2782,6 +2782,34 @@ async def test_month_close_announce() -> None:
         assert (await st.snapshot())["configs"]["1"]["last_month_close_announced"] == closed
 
 
+def test_month_close_batching() -> None:
+    """A huge month paginates, and no single send breaches Discord's 6000-char
+    combined-embed cap (each message's embeds stay under _MSG_BUDGET)."""
+    import joblin.bot as bot
+    from joblin.bot import month_close as mc
+
+    cfg = {"timezone": "UTC", "item_bar": 5}
+    recs = [
+        {"guild_id": 1, "month": "2026-03", "user_id": 100 + i,
+         "user_name": f"Worker {i:03d}", "points": 5 + (i % 11)}
+        for i in range(150)
+    ]
+    embeds = bot.build_month_close_embeds(recs, 1, cfg, "2026-03")
+    assert len(embeds) > 1, "a big month must paginate"
+    assert all(len(e.description or "") <= 4096 for e in embeds)
+
+    batches = mc._batch_embeds(embeds)
+    assert len(batches) > 1, "an over-cap stack must split across messages"
+    assert [e for b in batches for e in b] == embeds, \
+        "batching must keep every embed, in order"
+    for b in batches:
+        assert sum(mc._embed_size(e) for e in b) <= mc._MSG_BUDGET
+
+    # A small month still goes out as a single message.
+    small = bot.build_month_close_embeds(recs[:3], 1, cfg, "2026-03")
+    assert len(mc._batch_embeds(small)) == 1
+
+
 # ---------------------------------------------------------------------------
 # Web UI: session signing, schedule assembly, and the task CRUD mirrors
 # ---------------------------------------------------------------------------
@@ -3067,6 +3095,7 @@ def main() -> None:
     asyncio.run(test_daily_backup())
     test_month_close_embeds()
     asyncio.run(test_month_close_announce())
+    test_month_close_batching()
     asyncio.run(test_void_completion())
     asyncio.run(test_bounty())
     asyncio.run(test_store())

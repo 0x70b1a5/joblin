@@ -8,14 +8,19 @@ rolled 🖼️ trinkets named out loud, and the ⭐ star winner(s) are crowned.
 Restart-safe like the nightly backup: a persisted ``last_month_close_announced``
 (YYYY-MM) is compared against the guild's current local month each scheduler
 tick. Months strictly after that watermark and strictly before the current
-month are announced (oldest first), then the watermark advances — so a crash
-mid-post simply retries the remaining months, and a long downtime only ever
-announces the months it missed (never re-announces). First sight of a ready
-guild *arms* the watermark at the previous month without posting, so installing
-the bot mid-year never dumps years of history into the channel.
+month are announced (oldest first), the watermark advancing after each month
+posts — so a crash mid-batch resumes at the first unposted month, and a long
+downtime only announces the months it missed. Unlike the backup (which rolls
+its deadline forward *first*), the advance lands after the send: a crash in
+that narrow window repeats one month's ceremony, which beats silently losing
+it. First sight of a ready guild *arms* the watermark at the previous month
+without posting, so installing the bot mid-year never dumps years of history
+into the channel.
 
 The announcement is an embed (or a short stack of them) so a big family with
-stacked trinkets isn't capped by Discord's 2000-char plain-message limit.
+stacked trinkets isn't capped by Discord's 2000-char plain-message limit; a
+stack is split across messages so no single send exceeds Discord's 6000-char
+combined-embed cap.
 """
 from __future__ import annotations
 
@@ -32,6 +37,9 @@ from .scoring import bar_for, monthly_scores
 
 # Embed packing budget (leave headroom under Discord's 4096 description cap).
 _DESC_BUDGET = 3900
+# Per-message budget (headroom under the 6000-char cap Discord enforces on the
+# combined title/description/footer of ALL embeds in one send).
+_MSG_BUDGET = 5900
 _MAX_EMBEDS = 10
 _COLOR = 0xC9A227  # warm gold — end-of-month ceremony
 
@@ -175,6 +183,33 @@ def _pack_lines(lines: list[str]) -> list[str]:
     return pages
 
 
+def _embed_size(e: discord.Embed) -> int:
+    """The characters Discord counts against the per-message embed cap."""
+    return (
+        len(e.title or "")
+        + len(e.description or "")
+        + len(e.footer.text or "")
+    )
+
+
+def _batch_embeds(embeds: list[discord.Embed]) -> list[list[discord.Embed]]:
+    """Greedy-split a stack of embeds into per-message groups under the
+    combined-size cap (each embed already fits on its own; order preserved)."""
+    batches: list[list[discord.Embed]] = []
+    cur: list[discord.Embed] = []
+    size = 0
+    for e in embeds:
+        s = _embed_size(e)
+        if cur and size + s > _MSG_BUDGET:
+            batches.append(cur)
+            cur, size = [], 0
+        cur.append(e)
+        size += s
+    if cur:
+        batches.append(cur)
+    return batches
+
+
 # ---------------------------------------------------------------------------
 # Scheduler entry point
 # ---------------------------------------------------------------------------
@@ -228,8 +263,8 @@ async def _announce(
     records = store.read_completions()
     for ym in months:
         embeds = build_month_close_embeds(records, guild_id, cfg, ym)
-        if embeds:
-            await channel.send(embeds=embeds, allowed_mentions=NO_PINGS)
+        for batch in _batch_embeds(embeds):
+            await channel.send(embeds=batch, allowed_mentions=NO_PINGS)
         # Advance after each month so a crash mid-batch doesn't re-announce
         # the ones that already posted. An empty month still advances (quiet).
         async with store.txn() as data:
