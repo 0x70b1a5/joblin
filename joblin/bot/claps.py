@@ -32,12 +32,13 @@ from .helpers import (
 # punto — capped at one clap per outsider. The same button rides a ✅-completed
 # chore (participant = the completer) and a closed pitch-in / do-em-up round
 # (participants = its scorers / talliers), so one clap can tip several people at
-# once. Each landed clap is announced with a fresh message in the channel
-# ("BAM! @doer got clapped by @outsider!"). Bonuses are written to the same
-# completion log as chores (kind "clap", points 1), so /leaderboard totals them
-# like any other punto, and undoing a chore's ✅ retracts them (games have no
-# undo). Like ↩️/🔄, the table is keyed by the finished post's id, survives
-# restarts, and only the most recent finished post per task/game carries a live 👏.
+# once. Each landed clap shows up twice: the finished post's tally line is
+# updated in place (👏 ×n), and a fresh shout-out lands in the channel ("BAM!
+# @doer got clapped by @outsider!"). Bonuses are written to the same completion
+# log as chores (kind "clap", points 1), so /leaderboard totals them like any
+# other punto, and undoing a chore's ✅ retracts them (games have no undo). Like
+# ↩️/🔄, the table is keyed by the finished post's id, survives restarts, and
+# only the most recent finished post per task/game carries a live 👏.
 def _clap_record(rec: dict, participant: dict, tz: ZoneInfo, now: dt.datetime) -> dict:
     """A completion-log row for one clap bonus: +1 to a finished task's
     participant, shaped like a chore completion so /leaderboard reads it the
@@ -56,6 +57,19 @@ def _clap_record(rec: dict, participant: dict, tz: ZoneInfo, now: dt.datetime) -
         "due_at": to_iso(now),
         "late_seconds": 0,
     }
+
+
+def clap_status(rec: dict) -> str:
+    """The finished-post text with its running clap tally appended (the bare
+    status until the first clap lands). With several participants the bonus is
+    +n *each*, since every clap tips all of them."""
+    n = len(rec.get("clappers", []))
+    if n == 0:
+        return rec["status"]
+    parts = rec["participants"]
+    names = ", ".join(p["user_name"] for p in parts)
+    each = " each" if len(parts) > 1 else ""
+    return f"{rec['status']}\n👏 ×{n} · +{n} punto{each} to {names}"
 
 
 CLAP_OPENERS = [
@@ -93,6 +107,7 @@ async def _arm_clap(
     channel: discord.abc.Messageable,
     guild_id: int,
     brief: str,
+    status: str,
     participants: list[dict],
 ) -> None:
     """Add the 👏 button to a just-completed post and remember who may be tipped,
@@ -109,6 +124,7 @@ async def _arm_clap(
             "guild_id": guild_id,
             "channel_id": getattr(channel, "id", None),
             "brief": brief,
+            "status": status,
             "participants": participants,
             "clappers": [],  # outsider ids who've already clapped (the per-outsider cap)
             "log_ids": [],  # completion ids the claps logged (so an undo can void them)
@@ -126,7 +142,7 @@ async def _arm_clap(
 
 
 async def _arm_game_clap(
-    event: dict, kind: str, channel: discord.abc.Messageable
+    event: dict, kind: str, status: str, channel: discord.abc.Messageable
 ) -> None:
     """Arm a 👏 on a just-finalized pitch-in / do-em-up round so an outsider can
     tip its scorers a bonus punto each. No-op when the round closed with nobody in
@@ -137,7 +153,7 @@ async def _arm_game_clap(
     if not participants or mid is None:
         return
     await _arm_clap(
-        event["id"], mid, channel, event["guild_id"], event["brief"], participants
+        event["id"], mid, channel, event["guild_id"], event["brief"], status, participants
     )
 
 
@@ -145,8 +161,9 @@ async def _handle_clap(
     payload: discord.RawReactionActionEvent, channel: discord.abc.Messageable
 ) -> None:
     """A 👏 on a ✅-completed post. From a non-participant it awards every
-    participant a +1 bonus punto (once per outsider) and announces it with a
-    fresh message; a participant clapping their own finish is ignored."""
+    participant a +1 bonus punto (once per outsider), bumps the tally on the
+    post, and announces it with a fresh message; a participant clapping their
+    own finish is ignored."""
     snap = await store.snapshot()
     rec0 = snap["claps"].get(str(payload.message_id))
     if not rec0:
@@ -159,7 +176,7 @@ async def _handle_clap(
 
     tz, now = _game_tz(snap, rec0["guild_id"]), now_utc()
     new_records: list[dict] = []
-    body = None
+    body = announce = None
     async with store.txn() as data:
         rec = data["claps"].get(str(payload.message_id))
         if not rec:
@@ -173,12 +190,18 @@ async def _handle_clap(
             r = _clap_record(rec, p, tz, now)
             rec.setdefault("log_ids", []).append(r["id"])
             new_records.append(r)
-        body = clap_announcement(rec["participants"], payload.user_id)
+        body = clap_status(rec)
+        announce = clap_announcement(rec["participants"], payload.user_id)
     for r in new_records:
         await store.log_completion(r)
     if body is not None:
         try:
-            await channel.send(body, allowed_mentions=NO_PINGS)
+            await reacted.edit(content=body, allowed_mentions=NO_PINGS)
+        except discord.HTTPException:
+            pass
+    if announce is not None:
+        try:
+            await channel.send(announce, allowed_mentions=NO_PINGS)
         except discord.HTTPException:
             pass
 
@@ -190,4 +213,5 @@ __all__ = [
     "_game_participants",
     "_handle_clap",
     "clap_announcement",
+    "clap_status",
 ]

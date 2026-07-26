@@ -1418,18 +1418,19 @@ async def test_claps() -> None:
         assert [p["user_id"] for p in snap["claps"][str(posted)]["participants"]] == [42]
         assert len(st.read_completions()) == 1, "just the completion so far"
 
-        # An outsider (Sam) claps -> Pat earns a +1 bonus, announced as a NEW message.
+        # An outsider (Sam) claps -> Pat earns a +1 bonus; the tally bumps on the
+        # post AND a fresh shout-out message lands.
         await bot.on_raw_reaction_add(FakePayload(posted, "👏", user_id=7, member=FakeMember(7, "Sam")))
         recs = st.read_completions()
         claps = [r for r in recs if r["kind"] == "clap"]
         assert len(claps) == 1 and claps[0]["user_id"] == 42 and claps[0]["points"] == 1
+        assert "👏 ×1" in (ch.msgs[posted].content or "")
         shouts = [msg.content for msg in ch.msgs.values()
                   if msg.content and "got clapped by" in msg.content]
         assert len(shouts) == 1 and "<@42> got clapped by <@7>" in shouts[0]
         from joblin.bot.claps import CLAP_ENDINGS, CLAP_OPENERS
         assert any(shouts[0].startswith(o + " ") for o in CLAP_OPENERS)
         assert any(shouts[0].endswith(e) for e in CLAP_ENDINGS)
-        assert "👏" not in (ch.msgs[posted].content or ""), "the finished post itself is untouched"
 
         # Sam clapping again is a no-op (one per outsider).
         await bot.on_raw_reaction_add(FakePayload(posted, "👏", user_id=7, member=FakeMember(7, "Sam")))
@@ -1442,6 +1443,7 @@ async def test_claps() -> None:
 
         # A second outsider (Lee) stacks another bonus -> Pat now has the chore + 2 claps.
         await bot.on_raw_reaction_add(FakePayload(posted, "👏", user_id=9, member=FakeMember(9, "Lee")))
+        assert "👏 ×2" in (ch.msgs[posted].content or "")
         shouts = [msg.content for msg in ch.msgs.values()
                   if msg.content and "got clapped by" in msg.content]
         assert len(shouts) == 2 and any("<@42> got clapped by <@9>" in s for s in shouts)
@@ -1489,10 +1491,12 @@ async def test_game_claps() -> None:
         assert (mid, "👏") in ch.added
         assert len(st.read_completions()) == 2, "Pat + Sam each scored 1"
 
-        # An outsider (Lee) claps -> +1 to BOTH scorers, announced in ONE new message.
+        # An outsider (Lee) claps -> +1 to BOTH scorers; the tally shows "each"
+        # and ONE new shout-out names them both.
         await bot.on_raw_reaction_add(FakePayload(mid, "👏", user_id=9, member=FakeMember(9, "Lee")))
         claps = [r for r in st.read_completions() if r["kind"] == "clap"]
         assert sorted(r["user_id"] for r in claps) == [7, 42], "one clap tips every scorer"
+        assert "👏 ×1" in (ch.msgs[mid].content or "") and "each" in (ch.msgs[mid].content or "")
         shouts = [msg.content for msg in ch.msgs.values()
                   if msg.content and "got clapped by" in msg.content]
         assert len(shouts) == 1 and "<@42> and <@7> got clapped by <@9>" in shouts[0]

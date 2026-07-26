@@ -171,7 +171,7 @@ async def finalize_pitchin(pid: str, channel: discord.abc.Messageable) -> bool:
     # Take down only our ✅/🏁 buttons — a member's fun reaction (a 😄, a 🎉) stays.
     await _clear_bot_reactions(pm, (EMOJI_DONE, EMOJI_END))
     # Our buttons are gone, so add the 👏 (which _arm_clap does) afterwards.
-    await _arm_game_clap(event, "pitchin", channel)
+    await _arm_game_clap(event, "pitchin", body, channel)
     return True
 
 
@@ -210,7 +210,7 @@ async def finalize_doemup(did: str, channel: discord.abc.Messageable) -> bool:
         )
     except discord.HTTPException:
         pass
-    await _arm_game_clap(event, "doemup", channel)
+    await _arm_game_clap(event, "doemup", body, channel)
     return True
 
 
