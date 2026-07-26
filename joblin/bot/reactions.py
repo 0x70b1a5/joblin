@@ -421,7 +421,7 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
             # them a bonus punto on the finished post.
             participants = [{"user_id": payload.user_id, "user_name": display}]
             await _arm_clap(
-                tid, message_ids[-1], channel, task["guild_id"], task["brief"], status, participants
+                tid, message_ids[-1], channel, task["guild_id"], task["brief"], participants
             )
 
 
