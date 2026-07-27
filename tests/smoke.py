@@ -2289,8 +2289,9 @@ def test_leaderboard_text() -> None:
     # (April is a past month, so Pat also wears its ⭐ on the line).
     assert "**3 puntos** — <@1> ⭐×1 · 👏×1" in text
     assert "**1 punto** — <@2>" in text and "<@2> · 👏" not in text
-    # Title badges sit on their own italic line under the holder (not mid-line).
-    assert "*Bounty Hunter" in text or "*Punctualist" in text
+    # Title badges sit on their own italic line under the holder (not mid-line),
+    # each wearing its catalog emoji.
+    assert "*🥷 Bounty Hunter" in text or "*⏰ Punctualist" in text
     pat_block = text.split("<@2>")[0]  # Pat ranks first
     assert "\n*" in pat_block, "titles are a second line under the puntos row"
     assert "— <@1> *" not in text, "titles must not jam after the username"

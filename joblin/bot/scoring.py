@@ -306,24 +306,27 @@ BADGE_SHARE_MIN_PTS = 10  # Team Player / Lone Wolf need enough volume to compet
 EARLY_BIRD_WINDOW = (4, 9)  # 04:00–08:59
 NIGHT_OWL_WINDOW = (21, 4)  # 21:00–03:59
 
-# Fixed display order when one person holds several titles.
-BADGE_ORDER = (
-    "Punctualist",
-    "Early Bird",
-    "Night Owl",
-    "Bounty Hunter",
-    "Pitcher-Inner",
-    "Unit Crusher",
-    "Crowd Favorite",
-    "Jack of All Chores",
-    "One-Track Mind",
-    "Closer",
-    "Recurring Nightmare",
-    "The Reanimator",
-    "Team Player",
-    "Lone Wolf",
-    "Archaeologist",
-)
+# Each title's display emoji, in fixed display order when one person holds
+# several titles. Names stay bare everywhere else (badge_titles keys, tests);
+# the emoji is prepended only when a board line is rendered.
+BADGE_EMOJI = {
+    "Punctualist": "⏰",
+    "Early Bird": "🐦",
+    "Night Owl": "🦉",
+    "Bounty Hunter": "🥷",
+    "Pitcher-Inner": "🤝",
+    "Unit Crusher": "⚒️",
+    "Crowd Favorite": "👑",
+    "Jack of All Chores": "🃏",
+    "One-Track Mind": "🚂",
+    "Closer": "🚪",
+    "Recurring Nightmare": "👹",
+    "The Reanimator": "🧟",
+    "Team Player": "⚽",
+    "Lone Wolf": "🐺",
+    "Archaeologist": "🧾",
+}
+BADGE_ORDER = tuple(BADGE_EMOJI)
 
 
 def _is_chore(rec: dict) -> bool:
@@ -577,7 +580,9 @@ def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
         lines.append(f"{badge} **{pts} punto{'' if pts == 1 else 's'}** — <@{uid}>{star}{clap}")
         held = titles.get(uid) or []
         if held:
-            lines.append(f"*{' · '.join(held)}*")
+            lines.append(
+                f"*{' · '.join(f'{BADGE_EMOJI[t]} {t}' for t in held)}*"
+            )
 
     total_pts = sum(ent["points"] for ent in bucket.values())
     # A game round is one chore shared by all its scorers, not one per payout
@@ -703,6 +708,7 @@ async def covet(interaction: discord.Interaction, user: Optional[discord.Member]
 
 
 __all__ = [
+    "BADGE_EMOJI",
     "BADGE_ORDER",
     "BADGE_SHARE_MIN_PTS",
     "EARLY_BIRD_WINDOW",
