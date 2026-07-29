@@ -2859,6 +2859,23 @@ def test_web_repeat_input() -> None:
             assert back[key] == rule[key], f"{rule} came back as {back}"
 
 
+def test_web_period_days() -> None:
+    """period_days (the web list's frequency-tint input): average days between
+    occurrences, None for one-offs."""
+    for rule, want in (
+        ({"freq": "once", "interval_days": 0, "weekdays": [], "monthdays": []}, None),
+        ({"freq": "days", "interval_days": 1, "weekdays": [], "monthdays": []}, 1.0),
+        ({"freq": "days", "interval_days": 0, "weekdays": [], "monthdays": []}, 1.0),
+        ({"freq": "days", "interval_days": 14, "weekdays": [], "monthdays": []}, 14.0),
+        ({"freq": "weekly", "interval_days": 0, "weekdays": [0], "monthdays": []}, 7.0),
+        ({"freq": "weekly", "interval_days": 0, "weekdays": [0, 3], "monthdays": []}, 3.5),
+        ({"freq": "monthly", "interval_days": 0, "weekdays": [], "monthdays": [1]}, 30.44),
+        ({"freq": "monthly", "interval_days": 0, "weekdays": [], "monthdays": [1, 15]}, 15.22),
+    ):
+        got = webui.period_days_of(rule)
+        assert got == want, f"{rule} → {got}, wanted {want}"
+
+
 def test_web_schedule() -> None:
     """build_schedule: guild filtering, pending/live-first ordering, and form
     prefills for tasks and games alike — all from a plain snapshot."""
@@ -2897,9 +2914,11 @@ def test_web_schedule() -> None:
     assert items["bb"]["at_input"].count(":") == 1 and "-" in items["bb"]["at_input"]
     assert items["aa"]["status"] == "scheduled"
     assert items["aa"]["repeat_input"] == "daily" and items["aa"]["at_input"] == "18:00"
+    assert items["aa"]["period_days"] == 1.0 and items["bb"]["period_days"] is None
     assert items["pp"]["status"] == "live" and items["pp"]["editable"] is True
     assert items["pp"]["repeat_input"] == "once" and items["pp"]["at_input"] == ""
     assert items["pp"]["cap"] is None and items["pp"]["points_each"] == 2
+    assert items["pp"]["period_days"] is None  # one-off game: no tint
     assert items["pp"]["opens_at"] is None and items["pp"]["closes_at"]
     assert items["pp"]["close_input"]  # live close prefilled as wall time
     # Deferred game with a stored window: schedule exposes open + projected close.
@@ -3141,6 +3160,7 @@ def main() -> None:
     asyncio.run(test_edit_games())
     test_web_sessions()
     test_web_repeat_input()
+    test_web_period_days()
     test_web_schedule()
     asyncio.run(test_web_task_crud())
     asyncio.run(test_web_game_crud())

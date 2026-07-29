@@ -187,6 +187,19 @@ def repeat_input_of(rule: dict) -> str:
     return "once"
 
 
+def period_days_of(rule: dict) -> float | None:
+    """Average days between occurrences — ``None`` for a one-off. Drives the
+    rarity tint on the web list (daily = plain, rarer = more colour)."""
+    freq = rule["freq"]
+    if freq == "days":
+        return float(rule.get("interval_days") or 1)
+    if freq == "weekly":
+        return round(7 / len(rule["weekdays"]), 2)
+    if freq == "monthly":
+        return round(30.44 / len(rule["monthdays"]), 2)
+    return None
+
+
 def _task_item(t: dict, tz: ZoneInfo) -> dict:
     pending = t.get("pending")
     due = (pending or {}).get("due_at") or t.get("next_due")
@@ -204,6 +217,7 @@ def _task_item(t: dict, tz: ZoneInfo) -> dict:
         "recurring": rule["freq"] != "once",
         "schedule_label": schedule_label(t),
         "repeat_input": repeat_input_of(rule),
+        "period_days": period_days_of(rule),
         "at_input": at_input,
         # "pending" == the occurrence is live in Discord right now (fired,
         # awaiting ✅); "scheduled" == quietly waiting for next_due.
@@ -261,6 +275,7 @@ def _game_item(g: dict, kind: str, tz: ZoneInfo) -> dict:
         "recurring": bool(g.get("recurring")),
         "schedule_label": label,
         "repeat_input": repeat_input_of(rule),
+        "period_days": period_days_of(rule) if g.get("recurring") else None,
         "at_input": at_input,
         "close_input": close_input,
         # live → due_at is when the round closes (may be None: open-ended);
@@ -827,6 +842,7 @@ __all__ = [
     "create_task",
     "delete_game",
     "delete_task",
+    "period_days_of",
     "read_session",
     "repeat_input_of",
     "sign_session",
