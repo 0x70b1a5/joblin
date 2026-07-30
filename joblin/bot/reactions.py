@@ -30,6 +30,7 @@ from ..models import (
     next_due,
     now_utc,
     recurrence_of,
+    render_coward,
     to_iso,
 )
 from .core import (
@@ -528,6 +529,13 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
             "(it's worth 2 puntos!)."
         )
         return
+    # A puntobomb past its fuse can't be defused — the tick that blows it may
+    # simply not have come round yet. Let the sweep do its grim work.
+    if (task.get("puntobomb") and task.get("explodes_at")
+            and now_utc() >= from_iso(task["explodes_at"])):
+        await press.retract()
+        await press.whisper("💥 Too late — this puntobomb has already gone off.")
+        return
 
     await press.ack()
     completed = now_utc()
@@ -558,8 +566,9 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
             "brief": task["brief"],
             "user_id": press.user_id,
             "user_name": press.display,
-            "kind": "recurring" if task["recurring"] else "once",
-            "points": 2 if task.get("bounty") else 1,
+            "kind": ("puntobomb" if task.get("puntobomb")
+                     else "recurring" if task["recurring"] else "once"),
+            "points": 2 if task.get("bounty") else 1,  # a defusal is the plain 1
             "due_at": p["due_at"],
             "late_seconds": max(0, int((completed - due).total_seconds())),
         }
@@ -572,13 +581,23 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
     if record:
         await store.log_completion(record)
         bonus = " 💰 **+2 puntos**" if task.get("bounty") else ""
-        status = (
-            f"~~**{task['brief']}**~~\n"
-            f"✅ Completed by {press.mention}{bonus} • {discord_ts(completed, 't')}"
-        )
+        if task.get("puntobomb"):
+            status = (
+                f"~~**{task['brief']}**~~\n"
+                f"✂️ Defused by {press.mention} with time to spare • "
+                f"{discord_ts(completed, 't')}"
+            )
+        else:
+            status = (
+                f"~~**{task['brief']}**~~\n"
+                f"✅ Completed by {press.mention}{bonus} • {discord_ts(completed, 't')}"
+            )
         stale_undo: list[tuple[int, bool]] = []
         stale_requeue: list[tuple[int, bool]] = []
         stale_clap: list[tuple[int, bool]] = []
+        # No 🔄 on a defused bomb: a requeue past the fuse would re-arm it into
+        # an instant kaboom. ↩️ (an honest retraction) and 👏 both stay.
+        requeueable = not task.get("puntobomb")
         if message_ids:
             # Arm all three tables in ONE txn (one flush), then land ↩️ 🔄 👏 in
             # the one status edit — so a button can never be pressed before its
@@ -592,14 +611,16 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
             async with store.txn() as data:
                 stale_undo = _arm_undo_in(data, "done", tid, before, anchor,
                                           channel, completion_id=completion_id)
-                stale_requeue = _arm_requeue_in(data, tid, before, anchor,
-                                                channel, task["guild_id"])
+                if requeueable:
+                    stale_requeue = _arm_requeue_in(data, tid, before, anchor,
+                                                    channel, task["guild_id"])
                 stale_clap = _arm_clap_in(data, tid, anchor, channel,
                                           task["guild_id"], task["brief"],
                                           status, participants)
         await finalize_messages(
             channel, message_ids, status, legacy=legacy,
-            view=completed_view(tid, undo=True, requeue=True, clap=True) if message_ids else None,
+            view=(completed_view(tid, undo=True, requeue=requeueable, clap=True)
+                  if message_ids else None),
         )
         await _delete_panels(panels)
         tidy: set[int] = set()
@@ -640,7 +661,11 @@ async def _handle_skip_or_delete(tid, task, tz, press: Press) -> None:
     if mode == "skip":
         status = f"**{task['brief']}**\n⏭️ Skipped this time by {press.mention} — back next cycle."
     elif mode == "delete":
-        status = f"~~**{task['brief']}**~~\n❌ Cancelled by {press.mention}."
+        if task.get("puntobomb"):
+            # Deleting a live bomb is always permitted — and on the record.
+            status = render_coward(task["brief"], by=press.mention)
+        else:
+            status = f"~~**{task['brief']}**~~\n❌ Cancelled by {press.mention}."
     else:
         return
     tidy: set[int] = set()
@@ -673,7 +698,13 @@ def can_undo(action: str, before: dict, live: Optional[dict]) -> bool:
                             or the task was deleted in the meantime.
       * done/delete (one-off) — the task was removed; only restore if nothing
                             has since taken its id.
+      * any action on a puntobomb — additionally refuse once the fuse has run
+                            out: restoring would re-arm a bomb the next tick
+                            blows, letting a stray ↩️ nuke everyone's puntos.
     """
+    if (before.get("puntobomb") and before.get("explodes_at")
+            and now_utc() >= from_iso(before["explodes_at"])):
+        return False
     if action == "snooze":
         lp = live.get("pending") if live else None
         bp = before.get("pending")

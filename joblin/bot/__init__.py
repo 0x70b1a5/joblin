@@ -30,6 +30,12 @@ Lifecycle of a task occurrence
      🔊  un-shush  -> clears ``no_nag``: the hourly reminders resume (with a
                       fresh cadence).
 
+Puntobombs (bombs.py) ride this same lifecycle with a fuse on top: a strictly
+one-off task carrying ``explodes_at``. ✅ before the fuse runs out is the
+defusal (1 punto, kind "puntobomb"); past it the scheduler blows the bomb and
+everyone in the guild's completion log is docked puntos (kind "kaboom").
+❌ / ``/deletetask`` stays available — The Coward's Way Out — and moves nothing.
+
 Buttons are ``DynamicItem``s whose custom_id carries the task id, so a single
 ``add_dynamic_items`` call on startup revives every post's buttons after a
 restart. Live posts are additionally keyed in
@@ -69,6 +75,7 @@ from . import backup
 from . import month_close
 from . import scheduler
 from . import reactions
+from . import bombs
 from . import commands
 from . import listing
 from . import admin
@@ -77,7 +84,7 @@ from . import admin
 # used by __main__.py) so `import joblin.bot as bot; bot.<name>` and the
 # smoke tests keep resolving exactly as before the split.
 _SUBMODULES = (core, helpers, claps, games, scoring, backup, month_close,
-               scheduler, reactions, commands, listing, admin)
+               scheduler, reactions, bombs, commands, listing, admin)
 for _mod in _SUBMODULES:
     for _name in getattr(_mod, "__all__", ()):
         globals()[_name] = getattr(_mod, _name)

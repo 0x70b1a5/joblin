@@ -42,6 +42,13 @@ async def scheduler() -> None:
         if channel is None:
             continue
         try:
+            # A puntobomb's fuse outranks everything: past explodes_at it blows —
+            # pending, snoozed, shushed, or (after downtime) never even posted.
+            if (task.get("puntobomb") and task.get("explodes_at")
+                    and now >= from_iso(task["explodes_at"])):
+                from .bombs import explode_puntobomb  # runtime import — no cycle
+                await explode_puntobomb(tid, channel, cfg)
+                continue
             pending = task.get("pending")
             if pending:
                 if not task.get("no_nag") and now >= from_iso(pending["remind_at"]):

@@ -20,6 +20,7 @@ import discord
 from discord import app_commands
 
 from ...models import (
+    EMOJI_BOMB,
     UTC,
     describe_close_phrase,
     describe_repeat,
@@ -236,7 +237,8 @@ async def task_autocomplete(interaction: discord.Interaction, current: str):
     for tid, t in snap["tasks"].items():
         if str(t["guild_id"]) != str(interaction.guild_id):
             continue
-        label = f"{t['brief']} ({schedule_label(t)})"
+        icon = f"{EMOJI_BOMB} " if t.get("puntobomb") else ""
+        label = f"{icon}{t['brief']} ({schedule_label(t)})"
         if cur in label.lower() or cur in tid.lower():
             out.append(app_commands.Choice(name=label[:100], value=tid))
         if len(out) >= 25:

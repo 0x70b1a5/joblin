@@ -3407,6 +3407,269 @@ async def test_web_game_crud() -> None:
         assert "cancelled" in ch.msgs[msg2.id].content
 
 
+def _bomb_task(tid: str, now: dt.datetime, *, guild_id: int = 1,
+               fuse_hours: float = 2.0, due_in: float = -1.0) -> dict:
+    """A puntobomb task dict as /puntobomb would store it (due ``due_in``
+    seconds from now, blowing ``fuse_hours`` from now)."""
+    return {
+        "id": tid, "guild_id": guild_id, "brief": f"Defuse {tid}",
+        "description": None, "bounty": False, "puntobomb": True,
+        "explodes_at": m.to_iso(now + dt.timedelta(hours=fuse_hours)),
+        "recurring": False, "freq": "once", "interval_days": 0, "weekdays": [],
+        "monthdays": [], "time_of_day": None,
+        "next_due": m.to_iso(now + dt.timedelta(seconds=due_in)),
+        "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+    }
+
+
+def test_puntobomb_scoring() -> None:
+    """Kaboom rows are the economy's one signed negative: they subtract on the
+    board (and can sink a month below zero — no star for an all-negative top),
+    a defusal counts as the defuser's own chore and feeds Bomb Squad, and the
+    casualty roster is everyone the guild's log has ever seen."""
+    from joblin.bot import scoring as sc
+
+    def row(uid, name, kind, pts, month="2026-01", guild=1):
+        return {"id": m.new_id(), "ts": f"{month}-15T12:00:00+00:00",
+                "month": month, "guild_id": guild, "task_id": "t", "brief": "x",
+                "user_id": uid, "user_name": name, "kind": kind, "points": pts}
+
+    # Signed only for kaboom (defaulting to the penalty when the field is
+    # missing); every other kind still floors at 1.
+    assert sc._completion_points(row(1, "A", "kaboom", -5)) == -5
+    fieldless = row(1, "A", "kaboom", 0)
+    fieldless.pop("points")
+    assert sc._completion_points(fieldless) == -m.PUNTOBOMB_PENALTY
+    assert sc._completion_points(row(1, "A", "once", -3)) == 1
+
+    recs = [
+        row(42, "Pat", "puntobomb", 1),   # a defusal: 1 punto, a real chore
+        row(42, "Pat", "kaboom", -5),
+        row(7, "Sam", "kaboom", -5),      # only ever bombed: on the board at −5
+        row(7, "Sam", "clap", 1, month="2025-12"),
+    ]
+    jan = sc.monthly_scores(recs, 1)["2026-01"]
+    assert jan[42]["points"] == -4 and jan[42]["chores"] == 1, "defusal is a chore; kaboom isn't"
+    assert jan[7]["points"] == -5 and jan[7]["chores"] == 0
+
+    # 2026-01 tops out below zero — no star; Sam's +1 December still counts.
+    assert sc.star_counts(recs, 1, "2026-02") == {7: 1}
+
+    titles = sc.badge_titles(recs, 1, "2026-01")
+    assert "Bomb Squad" in titles.get(42, [])
+    assert all("Bomb Squad" not in t for uid, t in titles.items() if uid != 42)
+
+    # Everyone the log has ever seen is in the game (even a 🔄-only presser);
+    # other guilds' bombs find other guilds' players.
+    roster = sc.puntobomb_casualties(recs + [row(9, "Kid", "requeue", 0)], 1)
+    assert roster == [{"user_id": 7, "user_name": "Sam"},
+                      {"user_id": 9, "user_name": "Kid"},
+                      {"user_id": 42, "user_name": "Pat"}]
+    assert sc.puntobomb_casualties(recs, 2) == []
+
+    body = m.render_kaboom({"brief": "Gutter"}, roster)
+    assert "KABOOM" in body and "Sam" in body and f"−{m.PUNTOBOMB_PENALTY}" in body
+    assert "harmlessly" in m.render_kaboom({"brief": "Gutter"}, [])
+    assert "Coward" in m.render_coward("Gutter", by="<@1>")
+
+
+async def test_puntobomb_lifecycle() -> None:
+    """/puntobomb plants a fused one-off; it fires wearing the 💣 tag and the
+    ❌ coward face; ✅ in time defuses it for exactly one punto (kind
+    "puntobomb") and the resolved post carries ↩️/👏 but never 🔄 (a requeue
+    past the fuse would be an instant kaboom); ↩️ inside the fuse re-arms it
+    and voids the punto. A sub-hour fuse never gets planted at all."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+
+        short = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch)
+        await bot.puntobomb.callback(short, brief="Dud", expires="in 5m")
+        assert short.response.ephemeral and "hour" in short.response.content
+        assert (await st.snapshot())["tasks"] == {}
+
+        inter = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch)
+        await bot.puntobomb.callback(inter, brief="Unclog the gutter", expires="in 2 hours")
+        assert not inter.response.ephemeral and "Coward" in inter.response.content
+        snap = await st.snapshot()
+        (tid, task), = snap["tasks"].items()
+        assert task["puntobomb"] and not task["recurring"] and not task["bounty"]
+        assert m.from_iso(task["next_due"]) <= m.now_utc(), "arms now by default"
+        assert m.from_iso(task["explodes_at"]) > m.now_utc() + dt.timedelta(minutes=110)
+
+        await bot.fire_task(tid, ch, cfg)
+        mid = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][0]
+        assert "puntobomb" in ch.msgs[mid].content and m.EMOJI_BOMB in ch.msgs[mid].content
+        assert str(btn(ch.msgs[mid], f"task:skip:{tid}").emoji) == m.EMOJI_DELETE
+
+        press = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_task_button(tid, "done", press)
+        snap = await st.snapshot()
+        assert tid not in snap["tasks"]
+        recs = st.read_completions()
+        assert len(recs) == 1 and recs[0]["kind"] == "puntobomb" and recs[0]["points"] == 1
+        assert "Defused" in ch.msgs[mid].content
+        ids = btn_ids(ch.msgs[mid])
+        assert f"post:undo:{tid}" in ids and f"post:clap:{tid}" in ids
+        assert f"post:requeue:{tid}" not in ids, "no 🔄 on a defused bomb"
+        assert str(mid) not in snap["requeue"]
+
+        # ↩️ while the fuse still runs: honest retraction — the bomb comes
+        # back live and the defusal punto is voided.
+        undo = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_post_button("undo", undo)
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["pending"] is not None
+        assert st.read_completions() == []
+
+
+async def test_puntobomb_explodes() -> None:
+    """Past the fuse a ✅ is refused, and the sweep blows the bomb: the task is
+    gone, its post becomes the blast, and everyone in the guild's log is docked
+    the penalty via kind-"kaboom" rows (other guilds untouched). A bomb that
+    never even fired still blows with a fresh post, and an empty-log guild's
+    blast finds no one."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        now = m.now_utc()
+        for uid, name, guild in ((42, "Pat", 1), (7, "Sam", 1), (9, "Kid", 2)):
+            await st.log_completion({
+                "id": m.new_id(), "ts": m.to_iso(now - dt.timedelta(days=3)),
+                "month": "2026-06", "guild_id": guild, "task_id": "old",
+                "brief": "old", "user_id": uid, "user_name": name,
+                "kind": "once", "points": 1, "due_at": m.to_iso(now), "late_seconds": 0,
+            })
+
+        async with st.txn() as data:
+            data["tasks"]["boom1"] = _bomb_task("boom1", now)
+        await bot.fire_task("boom1", ch, cfg)
+        mid = (await st.snapshot())["tasks"]["boom1"]["pending"]["message_ids"][0]
+
+        async with st.txn() as data:  # the fuse runs out
+            data["tasks"]["boom1"]["explodes_at"] = m.to_iso(now - dt.timedelta(seconds=1))
+
+        late = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_task_button("boom1", "done", late)
+        assert late.response.ephemeral and "Too late" in late.response.content
+        assert len(st.read_completions()) == 3, "a late ✅ defuses nothing"
+
+        assert await bot.explode_puntobomb("boom1", ch, cfg)
+        snap = await st.snapshot()
+        assert "boom1" not in snap["tasks"] and str(mid) not in snap["messages"]
+        booms = [r for r in st.read_completions() if r.get("kind") == "kaboom"]
+        assert [(r["user_id"], r["points"]) for r in booms] == [(7, -5), (42, -5)]
+        assert all(r["guild_id"] == 1 and r["task_id"] == "boom1" for r in booms)
+        assert "KABOOM" in ch.msgs[mid].content and ch.msgs[mid].view is None
+        assert "Pat" in ch.msgs[mid].content and "Sam" in ch.msgs[mid].content
+        month = now.astimezone(ZoneInfo("Europe/Berlin")).strftime("%Y-%m")
+        bucket = bot.monthly_scores(st.read_completions(), 1)[month]
+        assert bucket[42]["points"] == -5 and bucket[42]["chores"] == 0
+        assert not await bot.explode_puntobomb("boom1", ch, cfg), "already blown"
+
+        # Downtime past both the due and the fuse: never posted, still blows.
+        async with st.txn() as data:
+            data["tasks"]["boom2"] = _bomb_task("boom2", now, fuse_hours=-0.01,
+                                                due_in=3600)
+        posted_before = len(ch.msgs)
+        assert await bot.explode_puntobomb("boom2", ch, cfg)
+        assert len(ch.msgs) == posted_before + 1, "the blast is announced fresh"
+        assert "boom2" not in (await st.snapshot())["tasks"]
+
+        # A guild with an empty log: the blast finds no one and docks no one.
+        async with st.txn() as data:
+            data["tasks"]["boom3"] = _bomb_task("boom3", now, guild_id=3,
+                                                fuse_hours=-0.01)
+        rows_before = len(st.read_completions())
+        assert await bot.explode_puntobomb("boom3", ch, cfg)
+        assert len(st.read_completions()) == rows_before
+        assert "harmlessly" in list(ch.msgs.values())[-1].content
+
+
+async def test_puntobomb_coward() -> None:
+    """Every deletion door stays open and moves no puntos — ❌ on the post,
+    /deletetask, and the web delete all take The Coward's Way Out (striking a
+    live post through) — while an ↩️ that would re-arm a spent fuse refuses."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        now = m.now_utc()
+
+        async with st.txn() as data:
+            data["tasks"]["c1"] = _bomb_task("c1", now)
+        await bot.fire_task("c1", ch, cfg)
+        mid = (await st.snapshot())["tasks"]["c1"]["pending"]["message_ids"][0]
+        press = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_task_button("c1", "skip", press)
+        assert "Coward" in ch.msgs[mid].content
+        assert "c1" not in (await st.snapshot())["tasks"]
+        assert st.read_completions() == [], "delete ≠ defuse ≠ kaboom"
+        assert "post:undo:c1" in btn_ids(ch.msgs[mid])
+
+        # ↩️ is honest while the fuse runs, refused once it's out.
+        live_bomb = _bomb_task("x", now)
+        assert bot.can_undo("delete", live_bomb, None)
+        spent = {**live_bomb, "explodes_at": m.to_iso(now - dt.timedelta(seconds=1))}
+        assert not bot.can_undo("delete", spent, None)
+
+        # /deletetask: flavored reply, live post struck through, buttons gone.
+        async with st.txn() as data:
+            data["tasks"]["c2"] = _bomb_task("c2", now)
+        await bot.fire_task("c2", ch, cfg)
+        mid2 = (await st.snapshot())["tasks"]["c2"]["pending"]["message_ids"][0]
+        inter = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch)
+        await bot.deletetask.callback(inter, "c2")
+        assert inter.response.ephemeral and "Coward" in inter.response.content
+        assert "Coward" in ch.msgs[mid2].content and ch.msgs[mid2].view is None
+        assert "c2" not in (await st.snapshot())["tasks"]
+
+        # The web delete mirrors it.
+        async with st.txn() as data:
+            data["tasks"]["c3"] = _bomb_task("c3", now)
+        await bot.fire_task("c3", ch, cfg)
+        mid3 = (await st.snapshot())["tasks"]["c3"]["pending"]["message_ids"][0]
+        removed = await webui.delete_task(1, "c3")
+        assert removed and removed["id"] == "c3"
+        assert "Coward" in ch.msgs[mid3].content
+        assert st.read_completions() == []
+
+
+async def test_puntobomb_edit_guards() -> None:
+    """A bomb can be renamed and re-armed inside its fuse, but never made
+    recurring, a bounty, or armed later than it blows — over Discord or the
+    web (the same rules both ways)."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        now = m.now_utc()
+        async with st.txn() as data:
+            data["tasks"]["e1"] = _bomb_task("e1", now, due_in=1800)
+
+        r1 = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch)
+        await bot.edit_task.callback(r1, task="e1", repeat="daily")
+        assert r1.response.ephemeral and "one-off" in r1.response.content
+        r2 = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch)
+        await bot.edit_task.callback(r2, task="e1", bounty=True)
+        assert r2.response.ephemeral and "one-off" in r2.response.content
+        r3 = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch)
+        await bot.edit_task.callback(r3, task="e1", at="2100-01-01 08:00")
+        assert r3.response.ephemeral and "after it blows" in r3.response.content
+
+        r4 = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch)
+        await bot.edit_task.callback(r4, task="e1", brief="Renamed", at="in 90 minutes")
+        assert not r4.response.ephemeral
+        live = (await st.snapshot())["tasks"]["e1"]
+        assert live["brief"] == "Renamed" and live["puntobomb"]
+
+        upd, _note, err = await webui.apply_task_edit(1, "e1", {"repeat": "daily"})
+        assert upd is None and "one-off" in err
+        upd, _note, err = await webui.apply_task_edit(1, "e1", {"bounty": True})
+        assert upd is None and "one-off" in err
+        upd, _note, err = await webui.apply_task_edit(1, "e1", {"at": "2100-01-01 08:00"})
+        assert upd is None and "after it blows" in err
+        upd, _note, err = await webui.apply_task_edit(1, "e1", {"brief": "Web name"})
+        assert err is None and upd["brief"] == "Web name"
+
+
 def main() -> None:
     test_emoji_key()
     test_time_parsing()
@@ -3443,6 +3706,11 @@ def main() -> None:
     test_month_close_batching()
     asyncio.run(test_void_completion())
     asyncio.run(test_bounty())
+    test_puntobomb_scoring()
+    asyncio.run(test_puntobomb_lifecycle())
+    asyncio.run(test_puntobomb_explodes())
+    asyncio.run(test_puntobomb_coward())
+    asyncio.run(test_puntobomb_edit_guards())
     asyncio.run(test_store())
     asyncio.run(test_finalize_keeps_fun_reactions())
     asyncio.run(test_nag_tally())

@@ -6,8 +6,10 @@ from typing import Optional
 import discord
 
 from ..models import (
+    EMOJI_BOMB,
     EMOJI_FLEX,
     EMOJI_HANDSHAKE,
+    PUNTOBOMB_PENALTY,
     describe_repeat,
     discord_ts,
     from_iso,
@@ -141,11 +143,14 @@ async def listtasks(interaction: discord.Interaction) -> None:
             state = "—"
         info = " ℹ️" if t.get("description") else ""
         flag = " 💰" if t.get("bounty") else ""
+        bomb = f" {EMOJI_BOMB}" if t.get("puntobomb") else ""
+        if t.get("puntobomb") and t.get("explodes_at"):
+            state += f" · 💥 {discord_ts(from_iso(t['explodes_at']), 'R')}"
         shush = " 🤫" if t.get("no_nag") else ""
         nags = t.get("nag_count", 0)
         nag = f" · 🔔×{nags}" if nags else ""
         rows.append(
-            f"• `{t['id']}` **{t['brief']}**{info}{flag}{shush} — {schedule_label(t)} · {state}{nag}"
+            f"• `{t['id']}` **{t['brief']}**{info}{flag}{bomb}{shush} — {schedule_label(t)} · {state}{nag}"
         )
 
     # Pitch-ins and do-em-ups list alongside tasks now (each with its id) so they
@@ -265,6 +270,8 @@ async def listopen(interaction: discord.Interaction) -> None:
         due = from_iso(p["due_at"])
         info = " ℹ️" if t.get("description") else ""
         flag = " 💰" if t.get("bounty") else ""
+        if t.get("puntobomb") and t.get("explodes_at"):
+            flag += f" {EMOJI_BOMB} blows {discord_ts(from_iso(t['explodes_at']), 'R')}"
         label = _safe_link_label(t["brief"])
         head = f"[{label}]({link})" if link else f"**{label}**"
         chores.append((due, f"• {head}{info}{flag} — ⏳ since {discord_ts(due, 'R')}"))
@@ -327,6 +334,7 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
         name="Commands",
         value=(
             "• `/newtask` — add a chore (see scheduling below; `bounty:true` for a 2-punto bounty)\n"
+            "• `/puntobomb` — plant a chore with a fuse: defuse it or everyone pays 💣\n"
             "• `/pitchin` — group task: everyone who ✅s before it closes scores\n"
             "• `/doemup` — per-unit task: tap ➕ for each one you do\n"
             "• `/listtasks` — list chores with their ids (paged; 🔔×n = times nagged)\n"
@@ -384,6 +392,20 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "earns a permanent **⭐ star** shown there for keeps. Title badges "
             "(Punctualist, Bounty Hunter, …) are derived from the log for the same "
             "scope and sit under each name; pass `all_time:true` for the lifetime board."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{EMOJI_BOMB} Puntobombs",
+        value=(
+            "`/puntobomb brief:\"unclog the gutter\" expires:tonight` plants a "
+            "bomb — a one-off chore with a **required fuse** (an hour minimum; "
+            "`at:` arms it later). The first ✅ defuses it for **1 punto**. If "
+            f"nobody does before it blows, **everyone in the game loses "
+            f"{PUNTOBOMB_PENALTY} puntos** — \"in the game\" meaning everyone "
+            "who has ever earned (or lost) a punto here. ❌ on the post or "
+            "`/deletetask` deletes it with no puntos moved: always allowed, "
+            "forever known as **The Coward's Way Out**. 🏳️"
         ),
         inline=False,
     )

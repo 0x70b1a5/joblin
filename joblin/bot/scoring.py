@@ -10,6 +10,7 @@ from discord import app_commands
 
 from .. import trinkets
 from ..models import (
+    PUNTOBOMB_PENALTY,
     UTC,
     from_iso,
     now_utc,
@@ -33,10 +34,14 @@ def _completion_points(rec: dict) -> int:
     """Puntos a logged completion is worth. Bounties record ``points: 2``; older
     records predate the field and count as the normal 1 punto. Requeue marker
     rows (``kind: "requeue"``) record an *action*, not a completion — they are
-    worth 0 everywhere, so a 🔄 can never mint a punto."""
+    worth 0 everywhere, so a 🔄 can never mint a punto. Kaboom rows (a blown
+    puntobomb's per-player penalty) are the economy's one sanctioned negative,
+    so only they keep a signed value — everything else floors at 1."""
     if rec.get("kind") == "requeue":
         return 0
     p = rec.get("points")
+    if rec.get("kind") == "kaboom":
+        return int(p) if isinstance(p, (int, float)) else -PUNTOBOMB_PENALTY
     return int(p) if isinstance(p, (int, float)) and p > 0 else 1
 
 
@@ -65,7 +70,9 @@ def monthly_scores(records: list[dict], guild_id: int) -> dict[str, dict[int, di
             rec["user_id"], {"points": 0, "chores": 0, "claps": 0, "name": str(rec["user_id"])}
         )
         ent["points"] += _completion_points(rec)
-        ent["chores"] += rec.get("kind") not in ("pitchin", "doemup", "clap")
+        # A ✅-defused puntobomb counts as the defuser's own chore; a kaboom
+        # penalty is no one's chore at all (its negative puntos still land).
+        ent["chores"] += rec.get("kind") not in ("pitchin", "doemup", "clap", "kaboom")
         ent["claps"] += rec.get("kind") == "clap"
         ent["name"] = rec.get("user_name", ent["name"])
     return months
@@ -86,6 +93,24 @@ def star_counts(records: list[dict], guild_id: int, current_month: str) -> dict[
             if ent["points"] == top:
                 stars[uid] = stars.get(uid, 0) + 1
     return stars
+
+
+def puntobomb_casualties(records: list[dict], guild_id: int) -> list[dict]:
+    """Everyone "in the game" when a puntobomb blows: every user who has ever
+    appeared in this guild's completion log — doing a chore, scoring in a game,
+    clapping, even pressing 🔄 (any row proves you're playing). The log is the
+    only member roster the bot has without privileged intents, and it's the
+    honest one: someone who never earned a punto has none to lose. Latest
+    ``user_name`` wins; sorted by user id for a stable render/log order."""
+    seen: dict[int, str] = {}
+    for rec in records:
+        if rec.get("guild_id") != guild_id:
+            continue
+        uid = rec.get("user_id")
+        if uid is None:
+            continue
+        seen[int(uid)] = rec.get("user_name", str(uid))
+    return [{"user_id": uid, "user_name": seen[uid]} for uid in sorted(seen)]
 
 
 def _guild_bar(cfg: Optional[dict]) -> int:
@@ -314,6 +339,7 @@ BADGE_EMOJI = {
     "Early Bird": "🐦",
     "Night Owl": "🦉",
     "Bounty Hunter": "🥷",
+    "Bomb Squad": "💣",
     "Pitcher-Inner": "🤝",
     "Unit Crusher": "⚒️",
     "Crowd Favorite": "👑",
@@ -330,8 +356,9 @@ BADGE_ORDER = tuple(BADGE_EMOJI)
 
 
 def _is_chore(rec: dict) -> bool:
-    """A solo chore row (not a pitch-in, do-em-up, clap bonus, or 🔄 marker)."""
-    return rec.get("kind") not in ("pitchin", "doemup", "clap", "requeue")
+    """A solo chore row (not a pitch-in, do-em-up, clap bonus, 🔄 marker, or
+    💥 kaboom penalty — a defused puntobomb, kind "puntobomb", *is* one)."""
+    return rec.get("kind") not in ("pitchin", "doemup", "clap", "requeue", "kaboom")
 
 
 def _in_window(hour: int, window: tuple[int, int]) -> bool:
@@ -345,6 +372,7 @@ def _empty_badge_stats() -> dict:
     return {
         "punctual": 0,
         "bounty": 0,
+        "defused": 0,
         "pitchin": 0,
         "doemup_pts": 0,
         "claps": 0,
@@ -389,6 +417,16 @@ def badge_stats(records: list[dict], guild_id: int,
             # A 🔄 marker: pts is 0 by definition, so the total_pts add above
             # was a no-op — it counts toward The Reanimator and nothing else.
             ent["requeue"] += 1
+            continue
+        if kind == "kaboom":
+            # A blast is a penalty, not an achievement: its (negative) puntos
+            # already hit total_pts above, and it feeds no badge counter.
+            continue
+        if kind == "puntobomb":
+            # A defusal: solo work (Lone Wolf material) and Bomb Squad fodder,
+            # but not a scheduled chore — the clock-window badges skip it.
+            ent["defused"] += 1
+            ent["chore_pts"] += pts
             continue
         if kind == "clap":
             ent["claps"] += 1
@@ -466,6 +504,7 @@ def badge_titles(records: list[dict], guild_id: int,
     award("Early Bird", _leaders(stats, lambda e: e["early"]))
     award("Night Owl", _leaders(stats, lambda e: e["night"]))
     award("Bounty Hunter", _leaders(stats, lambda e: e["bounty"]))
+    award("Bomb Squad", _leaders(stats, lambda e: e["defused"]))
     award("Pitcher-Inner", _leaders(stats, lambda e: e["pitchin"]))
     award("Unit Crusher", _leaders(stats, lambda e: e["doemup_pts"]))
     award("Crowd Favorite", _leaders(stats, lambda e: e["claps"]))
@@ -692,8 +731,10 @@ async def covet(interaction: discord.Interaction, user: Optional[discord.Member]
     # the bar, so a high scorer is already stacking several.
     ent = monthly_scores(records, interaction.guild_id).get(current_month, {}).get(target.id)
     pts = ent["points"] if ent else 0
-    secured = pts // bar
-    to_next = bar - pts % bar  # 1…bar: puntos until the next trinket tips over
+    # A kaboom-scarred month can sit below zero — no negative "secured" count,
+    # and the climb back to the first trinket is measured from where they are.
+    secured = max(0, pts // bar)
+    to_next = (secured + 1) * bar - pts  # puntos until the next trinket tips over
     zk = trinkets.zone_for_month(current_month)
     z = f"{trinkets.zone_emoji(zk)} {current_month}: **{trinkets.zone_label(zk)}** in season"
     if secured == 0:
@@ -724,6 +765,7 @@ __all__ = [
     "leaderboard",
     "monthly_scores",
     "covet",
+    "puntobomb_casualties",
     "rank_spice",
     "record_bar_change",
     "star_counts",

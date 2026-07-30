@@ -76,6 +76,7 @@ from ..models import (
     to_iso,
 )
 from ..bot import core
+from ..bot.bombs import coward_strike
 from ..bot.helpers import config_ready, guild_config, schedule_label
 from ..bot.commands.edit import apply_game_edit
 from ..bot.commands.tasks import _cancel_game_message, schedule_from_rule
@@ -225,6 +226,8 @@ def _task_item(t: dict, tz: ZoneInfo) -> dict:
         "due_at": due,
         "nag_count": t.get("nag_count", 0),
         "no_nag": bool(t.get("no_nag")),
+        "puntobomb": bool(t.get("puntobomb")),
+        "explodes_at": t.get("explodes_at"),
         "editable": True,
     }
 
@@ -386,6 +389,17 @@ async def apply_task_edit(
     if not live or str(live["guild_id"]) != str(guild_id):
         return None, None, "Task not found."
 
+    if live.get("puntobomb"):
+        # Mirrors /edit task's guard: a bomb stays a one-off, non-bounty chore.
+        try:
+            wants_repeat = ("repeat" in fields
+                            and parse_repeat(fields["repeat"])["freq"] != "once")
+        except ValueError:
+            wants_repeat = False  # junk repeat errors in the shared path below
+        if wants_repeat or fields.get("bounty"):
+            return None, None, ("A puntobomb stays a one-off, non-bounty chore — "
+                                "only its brief, details, and arm time can change.")
+
     recompute = "at" in fields or "repeat" in fields
     cfg = guild_config(snap, guild_id)
     if recompute and not config_ready(cfg):
@@ -403,6 +417,9 @@ async def apply_task_edit(
             )
         except ValueError as e:
             return None, None, str(e)
+        if (live.get("puntobomb") and live.get("explodes_at")
+                and sched["next_due"] >= from_iso(live["explodes_at"])):
+            return None, None, "That would arm the bomb after it blows."
 
     updated = None
     note = None
@@ -477,6 +494,9 @@ async def delete_task(guild_id: int, tid: str) -> Optional[dict]:
             panels = _take_task_panels(data, tid)
             removed = data["tasks"].pop(tid, None)
     await _delete_panels(panels)  # Discord I/O stays outside the txn
+    if removed and removed.get("puntobomb"):
+        # A deleted bomb's live post mustn't keep ticking in the channel.
+        await coward_strike(removed)
     return removed
 
 

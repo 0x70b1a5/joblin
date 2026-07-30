@@ -31,6 +31,13 @@ Task dict schema
                                     #   chore (it still fires on schedule). Set by
                                     #   reacting 🤫 on a live occurrence post,
                                     #   cleared by reacting 🔊. Absent means False.
+    "puntobomb":    bool,           # 💣: a strictly one-off, non-bounty chore with
+                                    #   a fuse (see bot/bombs.py). Absent means False.
+    "explodes_at":  str,            # puntobombs only (required there): ISO-8601 UTC.
+                                    #   If nobody has ✅-defused by then the scheduler
+                                    #   blows it — everyone in the game is docked
+                                    #   PUNTOBOMB_PENALTY (kind "kaboom"). The fuse is
+                                    #   never cleared, snoozed, or rescheduled.
 }
 
 Recurrence (``freq``)
@@ -87,6 +94,14 @@ EMOJI_UNSHUSH = "🔊"  # appears on a shushed task's posts; clears no-nag (resu
 EMOJI_END = "🏁"  # creator-only "end now" on a pitch-in (✅) or do-em-up post
 EMOJI_HANDSHAKE = "🤝"  # header icon on a pitch-in post
 EMOJI_FLEX = "💪"  # header icon on a do-em-up post
+EMOJI_BOMB = "💣"  # marker on a puntobomb's posts and list rows
+
+# Puntobombs: ✅ before the fuse runs out defuses for 1 punto (a normal chore
+# completion, kind "puntobomb"); past it, everyone in the game — every user in
+# the guild's completion log — is docked this many (kind "kaboom", the economy's
+# one sanctioned negative). The fuse can't be shorter than the minimum.
+PUNTOBOMB_PENALTY = 5
+PUNTOBOMB_MIN_FUSE_SECS = 3600
 
 # Snooze "numpad": tapping ⏩ opens a *separate* panel message that self-reacts
 # with these, so the task post itself stays uncluttered. Pick a number; toggle
@@ -965,4 +980,35 @@ def render_doemup(d: dict, *, final: bool = False) -> str:
         f"{EMOJI_FLEX} **{brief}**  ·  {per}{closes}{desc}\n"
         f"Tap ➕ each time you finish one (➖ to fix).\n"
         f"**Tally:** {tally_line}  —  {head}"
+    )
+
+
+# --- Puntobombs ------------------------------------------------------------
+# A puntobomb is a *task* (it lives in ``tasks`` and rides the normal
+# fire/nag/button lifecycle — see the schema at the top of this file), so only
+# its blast-and-surrender wording lives here, next to the other post renders.
+def render_kaboom(task: dict, victims: list[dict]) -> str:
+    """The post body when a puntobomb's fuse runs out. ``victims`` is the
+    everyone-in-the-game roster ([{"user_id", "user_name"}, …])."""
+    brief = task["brief"]
+    if not victims:
+        return (
+            f"💥 ~~**{brief}**~~ — **KABOOM!** …but nobody was in the game "
+            f"yet, so the blast fades harmlessly."
+        )
+    names = ", ".join(v["user_name"] for v in victims)
+    return (
+        f"💥 ~~**{brief}**~~ — **KABOOM!** Nobody defused it in time.\n"
+        f"−{PUNTOBOMB_PENALTY} puntos each: {names}"
+    )
+
+
+def render_coward(brief: str, by: Optional[str] = None) -> str:
+    """The post body when a puntobomb is deleted rather than defused (❌ on the
+    post, ``/deletetask``, or the web UI) — permitted, and on the record."""
+    who = f" — taken by {by}" if by else ""
+    return (
+        f"~~**{brief}**~~\n"
+        f"🏳️ **The Coward's Way Out**{who}. The bomb is deleted, not defused: "
+        f"no punto earned, none lost."
     )

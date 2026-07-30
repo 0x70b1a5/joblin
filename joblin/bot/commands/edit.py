@@ -89,6 +89,22 @@ async def edit_task(
         )
         return
 
+    if live.get("puntobomb"):
+        # A bomb keeps its nature: strictly one-off (only the fuse schedules
+        # it) and never a bounty. Junk `repeat` text falls through to the
+        # shared parse error below.
+        try:
+            wants_repeat = repeat is not None and parse_repeat(repeat)["freq"] != "once"
+        except ValueError:
+            wants_repeat = False
+        if wants_repeat or bounty:
+            await interaction.response.send_message(
+                "❌ 💣 A puntobomb stays a one-off, non-bounty chore — only its "
+                "brief, details, and arm time can change.",
+                ephemeral=True,
+            )
+            return
+
     cfg = guild_config(snap, interaction.guild_id)
     recompute = at is not None or repeat is not None
     if recompute and not config_ready(cfg):
@@ -109,6 +125,14 @@ async def edit_task(
         except ValueError as e:
             await interaction.response.send_message(
                 f"❌ {e}\nSee `/joblinhelp` for the `at` and `repeat` formats.", ephemeral=True
+            )
+            return
+        if (live.get("puntobomb") and live.get("explodes_at")
+                and sched["next_due"] >= from_iso(live["explodes_at"])):
+            await interaction.response.send_message(
+                "❌ 💣 That would arm the bomb after it blows "
+                f"({discord_ts(from_iso(live['explodes_at']), 'f')}).",
+                ephemeral=True,
             )
             return
 

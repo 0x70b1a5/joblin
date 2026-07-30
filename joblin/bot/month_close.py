@@ -114,7 +114,9 @@ def build_month_close_embeds(
     for i, (uid, ent) in enumerate(ranking):
         badge = medals[i] if i < 3 else f"`{i + 1}.`"
         star = " ⭐" if uid in star_uids else ""
-        n_tri = ent["points"] // bar
+        # max(0, …): a kaboom-scarred month can end below zero — that's a sad
+        # line on the board, not a negative trinket count.
+        n_tri = max(0, ent["points"] // bar)
         tri = f" · 🖼️×{n_tri}" if n_tri else ""
         pts = ent["points"]
         lines.append(

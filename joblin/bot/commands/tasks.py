@@ -12,12 +12,17 @@ import discord
 from discord import app_commands
 
 from ...models import (
+    EMOJI_BOMB,
+    PUNTOBOMB_MIN_FUSE_SECS,
+    PUNTOBOMB_PENALTY,
     discord_ts,
     first_due,
+    format_duration,
     new_id,
     now_utc,
     parse_repeat,
     pin_weekly,
+    resolve_close,
     resolve_when,
     time_of_day_from,
     to_iso,
@@ -25,10 +30,12 @@ from ...models import (
 from ..core import NO_PINGS, bot, store
 from ..helpers import config_ready, guild_config, schedule_label
 from ..reactions import _delete_panels, _take_task_panels
+from ..bombs import coward_strike
 from .lookup import (
     _find_game,
     _find_task,
     at_autocomplete,
+    close_autocomplete,
     delete_autocomplete,
     repeat_autocomplete,
 )
@@ -149,6 +156,90 @@ async def newtask(
     await interaction.response.send_message(body, allowed_mentions=NO_PINGS)
 
 
+@bot.tree.command(
+    name="puntobomb",
+    description="Plant a puntobomb: defuse it (✅) before it blows, or everyone in the game loses 5 puntos",
+)
+@app_commands.describe(
+    brief="What defusing it takes, e.g. 'unclog the gutter' (required)",
+    expires="When it blows — in 3h, tonight, tomorrow 8am (required; at least an hour of fuse)",
+    at="When the bomb posts and starts ticking (default: now)",
+    description="Optional longer details, revealed by the ℹ️ button",
+)
+async def puntobomb(
+    interaction: discord.Interaction,
+    brief: app_commands.Range[str, 1, 200],
+    expires: str,
+    at: Optional[str] = None,
+    description: Optional[str] = None,
+) -> None:
+    snap = await store.snapshot()
+    cfg = guild_config(snap, interaction.guild_id)
+    if not config_ready(cfg):
+        await interaction.response.send_message(
+            "❌ Run `/joblinconfig` to set a channel and timezone first.", ephemeral=True
+        )
+        return
+
+    tz, now = ZoneInfo(cfg["timezone"]), now_utc()
+    deferred = at is not None and (at or "").strip().lower() not in ("", "now")
+    try:
+        start = resolve_when(at, tz, now) if deferred else now
+        if deferred and start <= now:
+            raise ValueError("that start time is already in the past")
+        # Same phrase-class resolution as a game close: relative/bare-clock
+        # phrases measure from when the bomb arms, calendar ones from now.
+        exp = resolve_close(expires, tz, now=now, start=start)
+        if (exp - start).total_seconds() < PUNTOBOMB_MIN_FUSE_SECS:
+            raise ValueError(
+                "a puntobomb needs at least an hour of fuse — "
+                "set `expires` an hour or more after it arms"
+            )
+    except ValueError as e:
+        await interaction.response.send_message(
+            f"❌ {e}\nSee `/joblinhelp` for the time formats.", ephemeral=True
+        )
+        return
+
+    tid = new_id()
+    task = {
+        "id": tid,
+        "guild_id": interaction.guild_id,
+        "brief": str(brief),
+        "description": description[:1500] if description else None,
+        "bounty": False,  # never — "Defuser gets a punto" means exactly one
+        "puntobomb": True,
+        "explodes_at": to_iso(exp),
+        "recurring": False,
+        "freq": "once",
+        "interval_days": 0,
+        "weekdays": [],
+        "monthdays": [],
+        "time_of_day": None,
+        "next_due": to_iso(start),
+        "created_by": interaction.user.id,
+        "created_at": to_iso(now),
+        "pending": None,
+    }
+    async with store.txn() as data:
+        data["tasks"][tid] = task
+
+    fuse = format_duration(int((exp - start).total_seconds()))
+    ticking = (f"arms {discord_ts(start, 'R')}" if deferred
+               else "ticking now")
+    body = (
+        f"{EMOJI_BOMB} Planted **{brief}** — {ticking} · "
+        f"blows {discord_ts(exp, 'F')} ({discord_ts(exp, 'R')}, a {fuse} fuse).\n"
+        f"First ✅ defuses it for a punto — or everyone in the game loses "
+        f"**{PUNTOBOMB_PENALTY}**. (❌ / `/deletetask` is The Coward's Way Out.)"
+    )
+    if description:
+        body += "\nℹ️ Details attached."
+    body += f"\n· `{tid}` — rename or re-arm it with `/edit task`"
+    # Public on purpose, like /newtask: a ticking bomb concerns everyone.
+    await interaction.response.send_message(body, allowed_mentions=NO_PINGS)
+
+
 async def _cancel_game_message(
     channel: discord.abc.Messageable, brief: str, mid: int, *, sweep_reactions: bool
 ) -> None:
@@ -200,6 +291,10 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
                 panels = _take_task_panels(data, tid)
                 removed = data["tasks"].pop(tid, None)
         await _delete_panels(panels)
+        if removed and removed.get("puntobomb"):
+            # Deletion is always permitted — but a bomb's live post shouldn't
+            # keep ticking, so it's struck through as The Coward's Way Out.
+            await coward_strike(removed)
     else:
         # Not a task — it may be a pitch-in or do-em-up (kills the whole series).
         kind, game = _find_game(snap, interaction.guild_id, task)
@@ -225,9 +320,16 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
                                          and removed.get("ui") != "buttons"),
                     )
     if removed:
-        await interaction.response.send_message(
-            f"🗑️ Deleted **{removed['brief']}**.", ephemeral=True
-        )
+        if removed.get("puntobomb"):
+            await interaction.response.send_message(
+                f"🏳️ **The Coward's Way Out** — deleted **{removed['brief']}** "
+                "before it could blow. No puntos change hands.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"🗑️ Deleted **{removed['brief']}**.", ephemeral=True
+            )
     else:
         await interaction.response.send_message(
             "❌ Not found. Use `/listtasks` to see current tasks.", ephemeral=True
@@ -237,6 +339,8 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
 # The friendly live-preview autocompletes are shared with the other commands.
 newtask.autocomplete("at")(at_autocomplete)
 newtask.autocomplete("repeat")(repeat_autocomplete)
+puntobomb.autocomplete("at")(at_autocomplete)
+puntobomb.autocomplete("expires")(close_autocomplete)
 deletetask.autocomplete("task")(delete_autocomplete)
 
 
@@ -244,5 +348,6 @@ __all__ = [
     "_cancel_game_message",
     "deletetask",
     "newtask",
+    "puntobomb",
     "schedule_from_rule",
 ]

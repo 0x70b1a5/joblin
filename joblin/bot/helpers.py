@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import discord
 
 from ..models import (
+    EMOJI_BOMB,
     EMOJI_CLAP,
     EMOJI_DELETE,
     EMOJI_DONE,
@@ -17,8 +18,11 @@ from ..models import (
     EMOJI_SKIP,
     EMOJI_UNDO,
     EMOJI_UNSHUSH,
+    PUNTOBOMB_PENALTY,
     UTC,
     describe_repeat,
+    discord_ts,
+    from_iso,
     recurrence_of,
 )
 from .core import (
@@ -60,9 +64,18 @@ def bounty_tag(task: dict) -> str:
     return " 💰 *bounty · 2 puntos*" if task.get("bounty") else ""
 
 
+def puntobomb_tag(task: dict) -> str:
+    """The fuse line on a puntobomb's posts: when it blows, and what's at stake."""
+    if not task.get("puntobomb") or not task.get("explodes_at"):
+        return ""
+    boom = discord_ts(from_iso(task["explodes_at"]), "R")
+    return (f" {EMOJI_BOMB} *puntobomb · blows {boom} — ✅ defuses it for a "
+            f"punto, or everyone loses {PUNTOBOMB_PENALTY}*")
+
+
 def post_content(task: dict, *, reminder: bool, cfg: dict) -> str:
     brief = task["brief"]
-    tag = bounty_tag(task)
+    tag = bounty_tag(task) + puntobomb_tag(task)
     if not reminder:
         return f"**{brief}**{tag}"
     role_id = cfg.get("reminder_role_id")
@@ -461,6 +474,7 @@ __all__ = [
     "post_content",
     "post_occurrence",
     "post_view_for",
+    "puntobomb_tag",
     "refresh_post_view",
     "safe_delete",
     "schedule_label",
