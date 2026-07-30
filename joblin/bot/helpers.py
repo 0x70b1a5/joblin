@@ -13,11 +13,14 @@ from ..models import (
     EMOJI_DONE,
     EMOJI_FFWD,
     EMOJI_INFO,
+    EMOJI_LIST,
     EMOJI_REQUEUE,
     EMOJI_SHUSH,
     EMOJI_SKIP,
     EMOJI_UNDO,
     EMOJI_UNSHUSH,
+    LIST_MAX_ITEM_LEN,
+    LIST_MAX_ITEMS,
     PUNTOBOMB_PENALTY,
     UTC,
     describe_repeat,
@@ -73,9 +76,20 @@ def puntobomb_tag(task: dict) -> str:
             f"punto, or everyone loses {PUNTOBOMB_PENALTY}*")
 
 
+def list_tag(task: dict) -> str:
+    """The checklist line on a 🧾 list's posts. Item count only — tick progress
+    is what the buttons themselves show (green = done), so a tick costs one
+    view-only edit and never rewords a nag's content."""
+    items = task.get("items") or []
+    if not items:
+        return ""
+    return (f" {EMOJI_LIST} *list · {len(items)} items — every ticker earns "
+            "a punto when the last one's done*")
+
+
 def post_content(task: dict, *, reminder: bool, cfg: dict) -> str:
     brief = task["brief"]
-    tag = bounty_tag(task) + puntobomb_tag(task)
+    tag = bounty_tag(task) + puntobomb_tag(task) + list_tag(task)
     if not reminder:
         return f"**{brief}**{tag}"
     role_id = cfg.get("reminder_role_id")
@@ -200,13 +214,14 @@ class TaskButton(
     # One-offs aren't skipped, they're cancelled — same action id, harder face.
     CANCEL_FACE = (EMOJI_DELETE, discord.ButtonStyle.secondary)
 
-    def __init__(self, tid: str, action: str, *, face: Optional[tuple] = None) -> None:
+    def __init__(self, tid: str, action: str, *, face: Optional[tuple] = None,
+                 row: Optional[int] = None) -> None:
         self.tid = tid
         self.action = action
         emoji, style = face or self.FACES[action]
         super().__init__(discord.ui.Button(
             emoji=emoji, style=style,
-            custom_id=f"task:{action}:{tid}",
+            custom_id=f"task:{action}:{tid}", row=row,
         ))
 
     @classmethod
@@ -218,23 +233,64 @@ class TaskButton(
         await handle_task_button(self.tid, self.action, interaction)
 
 
+class ListItemButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"task:item:(?P<idx>\d+):(?P<tid>[\w-]+)",
+):
+    """One checklist item on a 🧾 list's live post. The item index rides in the
+    custom_id next to the task id (the label is presentation — the index is the
+    identity), so the same one-shot ``add_dynamic_items`` registration revives
+    these after a restart. Unticked = plain; ticked = green with a ✅."""
+
+    def __init__(self, tid: str, idx: int, label: str = "…", *,
+                 ticked: bool = False, row: Optional[int] = None) -> None:
+        self.tid = tid
+        self.idx = idx
+        super().__init__(discord.ui.Button(
+            label=label[:LIST_MAX_ITEM_LEN],
+            emoji=EMOJI_DONE if ticked else None,
+            style=(discord.ButtonStyle.success if ticked
+                   else discord.ButtonStyle.secondary),
+            custom_id=f"task:item:{idx}:{tid}", row=row,
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):  # noqa: ANN001
+        return cls(match["tid"], int(match["idx"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        from .reactions import handle_list_button  # runtime import — no cycle
+        await handle_list_button(self.tid, self.idx, interaction)
+
+
 def make_task_view(tid: str, task: dict, *, reminder: bool = False) -> discord.ui.View:
     """The live post's action row — mirrors what the bot used to self-react:
     ✅ ⏩ (ℹ️ with a description) ⏭️/❌, plus 🔊 on a shushed chore's posts and
-    🤫 on a nag."""
+    🤫 on a nag. A 🧾 list stacks an item button per entry above the controls
+    (up to four rows of five; the controls keep the fifth), rendered from the
+    pending occurrence's ticks so every fresh post shows the true state."""
     view = discord.ui.View(timeout=None)
-    view.add_item(TaskButton(tid, "done"))
-    view.add_item(TaskButton(tid, "ffwd"))
+    items = task.get("items") or []
+    control_row = None
+    if items:
+        ticks = (task.get("pending") or {}).get("ticks") or {}
+        for i, label in enumerate(items[:LIST_MAX_ITEMS]):
+            view.add_item(ListItemButton(tid, i, label,
+                                         ticked=str(i) in ticks, row=i // 5))
+        control_row = 4
+    view.add_item(TaskButton(tid, "done", row=control_row))
+    view.add_item(TaskButton(tid, "ffwd", row=control_row))
     if task.get("description"):
-        view.add_item(TaskButton(tid, "info"))
+        view.add_item(TaskButton(tid, "info", row=control_row))
     if task.get("recurring"):
-        view.add_item(TaskButton(tid, "skip"))
+        view.add_item(TaskButton(tid, "skip", row=control_row))
     else:
-        view.add_item(TaskButton(tid, "skip", face=TaskButton.CANCEL_FACE))
+        view.add_item(TaskButton(tid, "skip", face=TaskButton.CANCEL_FACE,
+                                 row=control_row))
     if task.get("no_nag"):
-        view.add_item(TaskButton(tid, "unshush"))
+        view.add_item(TaskButton(tid, "unshush", row=control_row))
     elif reminder:
-        view.add_item(TaskButton(tid, "shush"))
+        view.add_item(TaskButton(tid, "shush", row=control_row))
     return view
 
 
@@ -254,7 +310,8 @@ class PostButton(
         "clap":    (EMOJI_CLAP, discord.ButtonStyle.secondary),
     }
 
-    def __init__(self, tid: str, action: str, *, clap_count: int = 0) -> None:
+    def __init__(self, tid: str, action: str, *, clap_count: int = 0,
+                 row: Optional[int] = None) -> None:
         self.tid = tid
         self.action = action
         emoji, style = self.FACES[action]
@@ -262,7 +319,7 @@ class PostButton(
         label = f"×{clap_count}" if action == "clap" and clap_count else None
         super().__init__(discord.ui.Button(
             emoji=emoji, label=label, style=style,
-            custom_id=f"post:{action}:{tid}",
+            custom_id=f"post:{action}:{tid}", row=row,
         ))
 
     @classmethod
@@ -363,6 +420,28 @@ async def post_occurrence(
     )
 
 
+async def rerender_live_post(task: dict) -> None:
+    """Re-render the newest post of a live occurrence in place (content + action
+    row) after an out-of-band change — e.g. ``/edit`` or the web swapping a 🧾
+    list's items, which would otherwise leave buttons whose labels lie. Only
+    button-era posts are touched; a legacy reaction post has nothing to redraw."""
+    p = task.get("pending") or {}
+    mids = p.get("message_ids") or []
+    if not mids or p.get("ui") != "buttons" or not p.get("channel_id"):
+        return
+    channel = bot.get_channel(int(p["channel_id"]))
+    if channel is None:
+        return
+    try:
+        await channel.get_partial_message(mids[-1]).edit(
+            content=post_content(task, reminder=False, cfg={}),
+            view=make_task_view(task["id"], task),
+            allowed_mentions=NO_PINGS,
+        )
+    except discord.HTTPException:
+        pass
+
+
 async def safe_delete(message: Optional[discord.Message]) -> None:
     if message is None:
         return
@@ -457,6 +536,7 @@ def _game_tz(snap: dict, guild_id: int) -> ZoneInfo:
 
 
 __all__ = [
+    "ListItemButton",
     "PostButton",
     "Press",
     "TASK_FUNCTIONAL_EMOJIS",
@@ -470,12 +550,14 @@ __all__ = [
     "config_ready",
     "finalize_messages",
     "guild_config",
+    "list_tag",
     "make_task_view",
     "post_content",
     "post_occurrence",
     "post_view_for",
     "puntobomb_tag",
     "refresh_post_view",
+    "rerender_live_post",
     "safe_delete",
     "schedule_label",
     "web_base_url",

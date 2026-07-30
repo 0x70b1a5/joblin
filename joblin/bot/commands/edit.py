@@ -18,12 +18,14 @@ from discord import app_commands
 from ...models import (
     EMOJI_FLEX,
     EMOJI_HANDSHAKE,
+    EMOJI_LIST,
     UTC,
     describe_repeat,
     discord_ts,
     format_duration,
     from_iso,
     now_utc,
+    parse_items,
     parse_repeat,
     recurrence_of,
     render_doemup,
@@ -35,7 +37,7 @@ from ...models import (
 )
 from ..core import NO_PINGS, bot, store
 from ..games import _game_next_round, make_doemup_view
-from ..helpers import config_ready, guild_config, schedule_label
+from ..helpers import config_ready, guild_config, rerender_live_post, schedule_label
 from .games import _game_recurrence_from
 from .lookup import (
     _find_game_in,
@@ -43,6 +45,7 @@ from .lookup import (
     _game_event_autocomplete,
     at_autocomplete,
     close_autocomplete,
+    items_autocomplete,
     repeat_autocomplete,
     task_autocomplete,
 )
@@ -52,7 +55,7 @@ from .tasks import schedule_from_rule
 edit = app_commands.Group(name="edit", description="Edit a task, pitch-in, or do-em-up")
 
 
-@edit.command(name="task", description="Edit a task's text, time, repeat, or bounty")
+@edit.command(name="task", description="Edit a task's text, time, repeat, bounty, or 🧾 items")
 @app_commands.describe(
     task="The task to edit — pick from the list, or paste its id",
     brief="New short text (optional)",
@@ -61,6 +64,8 @@ edit = app_commands.Group(name="edit", description="Edit a task, pitch-in, or do
     description="New longer details (optional)",
     clear_description="Remove the existing long description",
     bounty="Make this a 2-punto bounty the creator can't complete (or turn it off)",
+    items="New 🧾 checklist, items separated by ; — replaces the old one (optional)",
+    clear_items="Remove the checklist — back to a plain one-tap chore",
 )
 async def edit_task(
     interaction: discord.Interaction,
@@ -71,6 +76,8 @@ async def edit_task(
     description: Optional[str] = None,
     clear_description: bool = False,
     bounty: Optional[bool] = None,
+    items: Optional[app_commands.Range[str, 1, 2000]] = None,
+    clear_items: bool = False,
 ) -> None:
     snap = await store.snapshot()
     live = _find_task(snap, interaction.guild_id, task)
@@ -82,28 +89,51 @@ async def edit_task(
     tid = live["id"]
 
     if (brief is None and at is None and repeat is None and description is None
-            and not clear_description and bounty is None):
+            and not clear_description and bounty is None
+            and items is None and not clear_items):
         await interaction.response.send_message(
-            "❌ Nothing to change — set at least one of brief, at, repeat, description, or bounty.",
+            "❌ Nothing to change — set at least one of brief, at, repeat, "
+            "description, bounty, or items.",
             ephemeral=True,
         )
         return
 
     if live.get("puntobomb"):
         # A bomb keeps its nature: strictly one-off (only the fuse schedules
-        # it) and never a bounty. Junk `repeat` text falls through to the
-        # shared parse error below.
+        # it), never a bounty, never a 🧾 list ("first ✅ defuses" means one
+        # defuser). Junk `repeat` text falls through to the shared parse error
+        # below.
         try:
             wants_repeat = repeat is not None and parse_repeat(repeat)["freq"] != "once"
         except ValueError:
             wants_repeat = False
-        if wants_repeat or bounty:
+        if wants_repeat or bounty or items is not None:
             await interaction.response.send_message(
-                "❌ 💣 A puntobomb stays a one-off, non-bounty chore — only its "
-                "brief, details, and arm time can change.",
+                "❌ 💣 A puntobomb stays a one-off, non-bounty, non-list chore — "
+                "only its brief, details, and arm time can change.",
                 ephemeral=True,
             )
             return
+
+    try:
+        items_list = parse_items(items) if items is not None else None
+    except ValueError as e:
+        await interaction.response.send_message(
+            f"❌ {e}\nSee `/joblinhelp` for the `items` format.", ephemeral=True
+        )
+        return
+    # The *resulting* task must never be both a bounty and a list — whichever
+    # half is kept from the current task still counts.
+    will_bounty = live.get("bounty") if bounty is None else bool(bounty)
+    will_items = (None if clear_items
+                  else items_list if items_list is not None else live.get("items"))
+    if will_bounty and will_items:
+        await interaction.response.send_message(
+            f"❌ {EMOJI_LIST} A list can't be a bounty — every ticker already "
+            "earns their own punto.",
+            ephemeral=True,
+        )
+        return
 
     cfg = guild_config(snap, interaction.guild_id)
     recompute = at is not None or repeat is not None
@@ -138,6 +168,7 @@ async def edit_task(
 
     updated = None
     pending_note = False
+    ticks_reset = False
     async with store.txn() as data:
         t = data["tasks"].get(tid)
         if t:
@@ -149,6 +180,14 @@ async def edit_task(
                 t["description"] = description[:1500]
             if bounty is not None:
                 t["bounty"] = bool(bounty)
+            if clear_items or items_list is not None:
+                t["items"] = items_list  # None when clearing
+                p = t.get("pending")
+                if p and p.get("ticks"):
+                    # The checklist changed under a live occurrence: old ticks
+                    # point at old items, so progress starts over.
+                    p["ticks"] = {}
+                    ticks_reset = True
             if sched is not None:
                 t["recurring"] = sched["recurring"]
                 t["freq"] = sched["freq"]
@@ -166,6 +205,11 @@ async def edit_task(
         await interaction.response.send_message("❌ Task not found.", ephemeral=True)
         return
 
+    if (clear_items or items_list is not None) and updated.get("pending"):
+        # The live post's item buttons would lie about the new checklist —
+        # redraw it in place (its content tag and action rows both change).
+        await rerender_live_post(updated)
+
     body = f"✏️ Updated **{updated['brief']}** — {schedule_label(updated)}."
     if pending_note:
         body += "\n(A reminder is live now; the new schedule applies from the next cycle.)"
@@ -177,6 +221,12 @@ async def edit_task(
             "\n💰 Now a **bounty** — worth 2 puntos; you can't complete it yourself."
             if bounty else "\n💰 Bounty removed — back to a normal 1-punto chore."
         )
+    if items_list is not None:
+        body += f"\n{EMOJI_LIST} List — now {len(items_list)} items."
+    elif clear_items:
+        body += f"\n{EMOJI_LIST} Checklist removed — back to a plain one-tap chore."
+    if ticks_reset:
+        body += "\n(The live post's ticks were reset for the new checklist.)"
     # Public on purpose: shared chores changing is something the family should see.
     await interaction.response.send_message(body, allowed_mentions=NO_PINGS)
 
@@ -499,6 +549,7 @@ async def edit_doemup(
 edit_task.autocomplete("task")(task_autocomplete)
 edit_task.autocomplete("at")(at_autocomplete)
 edit_task.autocomplete("repeat")(repeat_autocomplete)
+edit_task.autocomplete("items")(items_autocomplete)
 edit_pitchin.autocomplete("event")(_game_event_autocomplete("pitchins", EMOJI_HANDSHAKE))
 edit_pitchin.autocomplete("at")(at_autocomplete)
 edit_pitchin.autocomplete("expires")(close_autocomplete)

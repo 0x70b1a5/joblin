@@ -9,6 +9,7 @@ from ..models import (
     EMOJI_BOMB,
     EMOJI_FLEX,
     EMOJI_HANDSHAKE,
+    EMOJI_LIST,
     PUNTOBOMB_PENALTY,
     describe_repeat,
     discord_ts,
@@ -144,13 +145,14 @@ async def listtasks(interaction: discord.Interaction) -> None:
         info = " ℹ️" if t.get("description") else ""
         flag = " 💰" if t.get("bounty") else ""
         bomb = f" {EMOJI_BOMB}" if t.get("puntobomb") else ""
+        lst = f" {EMOJI_LIST}×{len(t['items'])}" if t.get("items") else ""
         if t.get("puntobomb") and t.get("explodes_at"):
             state += f" · 💥 {discord_ts(from_iso(t['explodes_at']), 'R')}"
         shush = " 🤫" if t.get("no_nag") else ""
         nags = t.get("nag_count", 0)
         nag = f" · 🔔×{nags}" if nags else ""
         rows.append(
-            f"• `{t['id']}` **{t['brief']}**{info}{flag}{bomb}{shush} — {schedule_label(t)} · {state}{nag}"
+            f"• `{t['id']}` **{t['brief']}**{info}{flag}{bomb}{lst}{shush} — {schedule_label(t)} · {state}{nag}"
         )
 
     # Pitch-ins and do-em-ups list alongside tasks now (each with its id) so they
@@ -270,6 +272,8 @@ async def listopen(interaction: discord.Interaction) -> None:
         due = from_iso(p["due_at"])
         info = " ℹ️" if t.get("description") else ""
         flag = " 💰" if t.get("bounty") else ""
+        if t.get("items"):
+            flag += f" {EMOJI_LIST} {len(p.get('ticks') or {})}/{len(t['items'])}"
         if t.get("puntobomb") and t.get("explodes_at"):
             flag += f" {EMOJI_BOMB} blows {discord_ts(from_iso(t['explodes_at']), 'R')}"
         label = _safe_link_label(t["brief"])
@@ -333,7 +337,8 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="Commands",
         value=(
-            "• `/newtask` — add a chore (see scheduling below; `bounty:true` for a 2-punto bounty)\n"
+            "• `/newtask` — add a chore (see scheduling below; `bounty:true` for a "
+            "2-punto bounty, `items:` for a 🧾 list)\n"
             "• `/puntobomb` — plant a chore with a fuse: defuse it or everyone pays 💣\n"
             "• `/pitchin` — group task: everyone who ✅s before it closes scores\n"
             "• `/doemup` — per-unit task: tap ➕ for each one you do\n"
@@ -392,6 +397,20 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "earns a permanent **⭐ star** shown there for keeps. Title badges "
             "(Punctualist, Bounty Hunter, …) are derived from the log for the same "
             "scope and sit under each name; pass `all_time:true` for the lifetime board."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{EMOJI_LIST} Lists",
+        value=(
+            "Give `/newtask` an `items:` checklist — `items: dishes away; wipe "
+            "counters; trash out` — and the posted chore carries a **button per "
+            "item**. Tap yours as you go (tap again to untick your own); when the "
+            "last one turns green the chore completes and **every ticker earns a "
+            "punto**, so several people can share one list. ✅ still finishes it "
+            "in one tap — it ticks whatever's left as yours. Rework the checklist "
+            "with `/edit task items:` (or drop it with `clear_items`). A recurring "
+            "list starts each cycle unticked. Lists can't be bounties."
         ),
         inline=False,
     )

@@ -3670,6 +3670,171 @@ async def test_puntobomb_edit_guards() -> None:
         assert err is None and upd["brief"] == "Web name"
 
 
+def test_parse_items() -> None:
+    assert m.parse_items("dishes; counters ; trash out") == ["dishes", "counters", "trash out"]
+    assert m.parse_items("a, b, c") == ["a", "b", "c"], "commas split when no ; is used"
+    assert m.parse_items("keep a, b together; second") == ["keep a, b together", "second"]
+    assert m.parse_items(" a ;; b ; ") == ["a", "b"], "blank entries are dropped"
+    too_many = ";".join(str(i) for i in range(m.LIST_MAX_ITEMS + 1))
+    too_long = "ok; " + "x" * (m.LIST_MAX_ITEM_LEN + 1)
+    for bad in ("", "just one", "a,", too_many, too_long):
+        try:
+            m.parse_items(bad)
+            raise AssertionError(f"parse_items({bad!r}) should have failed")
+        except ValueError:
+            pass
+
+
+def test_list_view_layout() -> None:
+    """A 🧾 list's view stacks an item button per entry (five per row) with the
+    control row pinned to the bottom; a ticked item goes green with a ✅ face,
+    an unticked one is a plain labelled button."""
+    import discord
+    import joblin.bot as bot
+
+    task = {
+        "id": "t1", "brief": "Kitchen reset", "description": None, "recurring": True,
+        "items": [f"item {i}" for i in range(7)],
+        "pending": {"ticks": {"2": {"user_id": 42, "user_name": "Pat"}}},
+    }
+    view = bot.make_task_view("t1", task)
+    ids = [c.custom_id for c in view.children]
+    assert ids[:7] == [f"task:item:{i}:t1" for i in range(7)]
+    assert "task:done:t1" in ids and "task:skip:t1" in ids
+    rows = [c.row for c in view.children]
+    assert rows[:7] == [0, 0, 0, 0, 0, 1, 1], "items pack five per row"
+    assert rows[7:] == [4] * (len(rows) - 7), "the ✅ ⏩ ⏭️ controls keep the bottom row"
+
+    def inner(c):  # unwrap a DynamicItem to the underlying Button
+        return getattr(c, "item", c)
+
+    ticked, plain = inner(view.children[2]), inner(view.children[0])
+    assert ticked.style is discord.ButtonStyle.success and str(ticked.emoji) == m.EMOJI_DONE
+    assert plain.style is discord.ButtonStyle.secondary and plain.emoji is None
+    assert plain.label == "item 0"
+
+
+async def test_list_lifecycle() -> None:
+    """The 🧾 flow end to end: a fired list carries item buttons, ticks flip
+    them (your own untick allowed, someone else's refused), the last tick
+    completes through the shared ✅ path with a punto for every distinct
+    ticker, ↩️ voids all of those rows at once, and a ✅ on the restored post
+    pays only the real tickers — a bystander can't mint themselves a punto."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        import discord
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        tid = "kitchen"
+        async with st.txn() as data:
+            data["tasks"][tid] = {
+                "id": tid, "guild_id": 1, "brief": "Kitchen reset", "description": None,
+                "items": ["dishes", "counters", "trash"],
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+        await bot.fire_task(tid, ch, cfg)
+        mid = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][0]
+        ids = btn_ids(ch.msgs[mid])
+        assert ids[:3] == [f"task:item:{i}:{tid}" for i in range(3)]
+        assert f"task:done:{tid}" in ids and f"task:ffwd:{tid}" in ids
+        assert "list · 3 items" in ch.msgs[mid].content
+
+        async def tick(uid, name, idx):
+            inter = FakeInteraction(
+                user=FakeUser(uid, name), channel=ch, message=ch.msgs[mid])
+            await bot.handle_list_button(tid, idx, inter)
+            return inter
+
+        # Pat ticks "dishes": recorded, the pressed post's button goes green,
+        # nothing is paid yet.
+        await tick(42, "Pat", 0)
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["pending"]["ticks"]["0"]["user_id"] == 42
+        assert st.read_completions() == [], "a part-done list pays nothing yet"
+        assert btn(ch.msgs[mid], f"task:item:0:{tid}").style is discord.ButtonStyle.success
+
+        # Sam can't untick Pat's item; Pat can (and then re-ticks it).
+        other = await tick(7, "Sam", 0)
+        assert other.response.ephemeral and "already ticked" in other.response.content
+        assert (await st.snapshot())["tasks"][tid]["pending"]["ticks"]["0"]["user_id"] == 42
+        await tick(42, "Pat", 0)
+        assert "0" not in (await st.snapshot())["tasks"][tid]["pending"]["ticks"]
+        await tick(42, "Pat", 0)
+
+        # Sam ticks the rest — the last tick completes it: a punto each.
+        await tick(7, "Sam", 1)
+        assert st.read_completions() == []
+        await tick(7, "Sam", 2)
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["pending"] is None and snap["tasks"][tid]["next_due"]
+        recs = sorted(st.read_completions(), key=lambda r: r["user_id"])
+        assert [(r["user_id"], r["points"], r["kind"]) for r in recs] == [
+            (7, 1, "list"), (42, 1, "list")]
+        assert "All 3 ticked by" in ch.msgs[mid].content
+        assert "<@42>" in ch.msgs[mid].content and "<@7>" in ch.msgs[mid].content
+        assert btn_ids(ch.msgs[mid]) == [
+            f"post:undo:{tid}", f"post:requeue:{tid}", f"post:clap:{tid}"]
+        parts = snap["claps"][str(mid)]["participants"]
+        assert sorted(p["user_id"] for p in parts) == [7, 42], "👏 tips every ticker"
+
+        # ↩️ voids BOTH rows and restores the live (fully ticked) checklist.
+        undo = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_post_button("undo", undo)
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["pending"] is not None
+        assert st.read_completions() == [], "an undone list voids every ticker's punto"
+        assert len(snap["tasks"][tid]["pending"]["ticks"]) == 3
+
+        # ✅ on the restored post re-completes it; the presser swept nothing,
+        # so only the real tickers are paid.
+        redo = FakeInteraction(user=FakeUser(9, "Lee"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_task_button(tid, "done", redo)
+        recs = sorted(st.read_completions(), key=lambda r: r["user_id"])
+        assert [r["user_id"] for r in recs] == [7, 42], "✅ can't mint a punto for a non-ticker"
+
+
+async def test_list_edit_and_web() -> None:
+    """The mirrors: web create with items (one per line, as the form sends
+    them), the bounty×list refusal from both directions, and an items edit on a
+    live occurrence that resets its ticks and redraws the post in place."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        task, err = await webui.create_task(
+            1, 1, {"brief": "Deep clean", "items": ["stove", "fridge"]})
+        assert err is None and task["items"] == ["stove", "fridge"]
+        _, err = await webui.create_task(
+            1, 1, {"brief": "Nope", "bounty": True, "items": ["a", "b"]})
+        assert err and "bounty" in err
+        _, _, err = await webui.apply_task_edit(1, task["id"], {"bounty": True})
+        assert err and "bounty" in err, "an edit can't sneak the combo in either"
+
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        async with st.txn() as data:
+            data["tasks"][task["id"]]["next_due"] = m.to_iso(
+                m.now_utc() - dt.timedelta(seconds=1))
+        await bot.fire_task(task["id"], ch, cfg)
+        mid = (await st.snapshot())["tasks"][task["id"]]["pending"]["message_ids"][0]
+        inter = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_list_button(task["id"], 0, inter)
+        assert (await st.snapshot())["tasks"][task["id"]]["pending"]["ticks"]
+
+        updated, note, err = await webui.apply_task_edit(
+            1, task["id"], {"items": ["stove", "fridge", "floor"]})
+        assert err is None and updated["items"] == ["stove", "fridge", "floor"]
+        assert updated["pending"]["ticks"] == {} and note and "reset" in note
+        assert f"task:item:2:{task['id']}" in btn_ids(ch.msgs[mid]), "live post redrawn"
+
+        # Clearing the checklist turns it back into a plain one-tap chore.
+        updated, _, err = await webui.apply_task_edit(1, task["id"], {"items": []})
+        assert err is None and updated["items"] is None
+        assert not any(i.startswith("task:item:") for i in btn_ids(ch.msgs[mid]))
+
+
 def main() -> None:
     test_emoji_key()
     test_time_parsing()
@@ -3716,6 +3881,10 @@ def main() -> None:
     asyncio.run(test_nag_tally())
     asyncio.run(test_shush())
     asyncio.run(test_task_buttons())
+    test_parse_items()
+    test_list_view_layout()
+    asyncio.run(test_list_lifecycle())
+    asyncio.run(test_list_edit_and_web())
     asyncio.run(test_snooze_numpad())
     asyncio.run(test_post_buttons())
     asyncio.run(test_done_arming_batch())

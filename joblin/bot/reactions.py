@@ -15,6 +15,7 @@ from ..models import (
     EMOJI_DONE,
     EMOJI_FFWD,
     EMOJI_INFO,
+    EMOJI_LIST,
     EMOJI_REQUEUE,
     EMOJI_SHUSH,
     EMOJI_SKIP,
@@ -23,6 +24,7 @@ from ..models import (
     EMOJI_UNDO,
     EMOJI_UNSHUSH,
     SNOOZE_CHOICES,
+    _join,
     discord_ts,
     emoji_key,
     from_iso,
@@ -188,6 +190,69 @@ async def handle_task_button(tid: str, action: str, interaction: discord.Interac
         await _handle_shush(tid, task, press, shush=action == "shush")
 
 
+async def handle_list_button(tid: str, idx: int, interaction: discord.Interaction) -> None:
+    """A 🧾 checklist item press: tick it as yours (a second tap unticks — but
+    only your own), and the tick that turns the last box green completes the
+    whole list through the ordinary ✅ path, so every distinct ticker earns a
+    punto. A part-done tick costs exactly one API call: the free interaction
+    response re-renders just the pressed post's buttons."""
+    press = Press.from_interaction(interaction)
+    snap = await store.snapshot()
+    task = snap["tasks"].get(tid)
+    # Same stale-press guard as handle_task_button: the custom_id proves the
+    # task, the "messages" registration proves the post is current.
+    if (not task or not task.get("pending")
+            or str(press.message_id) not in snap["messages"]):
+        await press.whisper("These buttons have gone stale — this post is no longer live.")
+        return
+    cfg = guild_config(snap, task["guild_id"])
+    if not config_ready(cfg):
+        return
+
+    outcome = None  # "ticked" | "unticked" | "complete" | "taken" | "stale"
+    taken_by = item = None
+    updated = None
+    async with store.txn() as data:
+        live = data["tasks"].get(tid)
+        p = live.get("pending") if live else None
+        items = (live or {}).get("items") or []
+        if not p or idx >= len(items):
+            outcome = "stale"  # resolved, or the checklist shrank under this post
+        else:
+            item = items[idx]
+            ticks = p.setdefault("ticks", {})
+            prev = ticks.get(str(idx))
+            if prev is None:
+                ticks[str(idx)] = {"user_id": press.user_id, "user_name": press.display}
+                outcome = "complete" if len(ticks) == len(items) else "ticked"
+            elif prev["user_id"] == press.user_id:
+                ticks.pop(str(idx))
+                outcome = "unticked"
+            else:
+                outcome, taken_by = "taken", prev["user_name"]
+            if outcome in ("ticked", "unticked"):
+                updated = json.loads(json.dumps(live))
+
+    if outcome == "stale":
+        await press.whisper("These buttons have gone stale — this post is no longer live.")
+        return
+    if outcome == "taken":
+        await press.whisper(
+            f"{EMOJI_LIST} **{item}** is already ticked — by {taken_by}, "
+            "and only they can untick it."
+        )
+        return
+    if outcome == "complete":
+        # The final tick is committed; the shared ✅ path finishes the job
+        # (status edit, per-ticker puntos, ↩️ 🔄 👏, recurrence roll).
+        await _handle_done(tid, task, cfg, ZoneInfo(cfg["timezone"]), press)
+        return
+    # Part-done: flip just the pressed post's buttons (a nag keeps its 🤫 face).
+    mids = (updated.get("pending") or {}).get("message_ids") or []
+    reminder = bool(mids) and press.message_id != mids[0]
+    await press.edit_pressed(view=make_task_view(tid, updated, reminder=reminder))
+
+
 async def handle_post_button(action: str, interaction: discord.Interaction) -> None:
     """Route a resolved post's ↩️/🔄 PostButton press (👏 routes to claps.py)."""
     press = Press.from_interaction(interaction)
@@ -286,7 +351,13 @@ async def _announce_snooze(
     )
     await _arm_undo("snooze", tid, before, anchor_id, channel)
     view = make_task_view(tid, before)
-    view.add_item(PostButton(tid, "undo"))
+    try:
+        # A 🧾 list's ↩️ joins the bottom control row rather than the items;
+        # a completely full view (20 items + 5 controls) simply goes without —
+        # the undo table is armed either way.
+        view.add_item(PostButton(tid, "undo", row=4 if before.get("items") else None))
+    except ValueError:
+        pass
     try:
         await channel.get_partial_message(anchor_id).edit(
             content=status, view=view, allowed_mentions=NO_PINGS
@@ -539,10 +610,11 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
 
     await press.ack()
     completed = now_utc()
-    record = None
+    records: list[dict] = []
     message_ids: list[int] = []
     before = None
-    completion_id = None
+    doers: list[dict] = []
+    items: list = []
     legacy = True
     async with store.txn() as data:
         live = data["tasks"].get(tid)
@@ -551,40 +623,71 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
             return
         before = json.loads(json.dumps(live))  # snapshot for undo
         legacy = p.get("ui") != "buttons"
-        completion_id = new_id()
         due = from_iso(p["due_at"])
         message_ids = list(p["message_ids"])
         for mid in message_ids:
             data["messages"].pop(str(mid), None)
         panels = _take_task_panels(data, tid)
-        record = {
-            "id": completion_id,  # lets an undo void exactly this log entry
+        items = live.get("items") or []
+        if items:
+            # A ✅ on a part-done 🧾 list means "the rest is done too" — the
+            # unticked remainder is swept as the presser's. Every distinct
+            # ticker is a doer and earns their own punto (never a bounty, so
+            # no doubling; a solo doer is the plain 1-chore-1-punto case).
+            ticks = p.setdefault("ticks", {})
+            for i in range(len(items)):
+                ticks.setdefault(str(i), {"user_id": press.user_id,
+                                          "user_name": press.display})
+            seen: set = set()
+            for i in range(len(items)):
+                t = ticks[str(i)]
+                if t["user_id"] not in seen:
+                    seen.add(t["user_id"])
+                    doers.append({"user_id": t["user_id"], "user_name": t["user_name"]})
+        else:
+            doers = [{"user_id": press.user_id, "user_name": press.display}]
+        # A 🧾 row's kind can't carry once-vs-recurring like a plain chore's
+        # does, so it says so explicitly (the once/recurring badge tally reads it).
+        extra = {"recurring": bool(task["recurring"])} if items else {}
+        records = [{
+            "id": new_id(),  # lets an undo void exactly these log entries
             "ts": to_iso(completed),
             "month": completed.astimezone(tz).strftime("%Y-%m"),  # local-tz bucket
             "guild_id": task["guild_id"],
             "task_id": tid,
             "brief": task["brief"],
-            "user_id": press.user_id,
-            "user_name": press.display,
+            "user_id": d["user_id"],
+            "user_name": d["user_name"],
             "kind": ("puntobomb" if task.get("puntobomb")
+                     else "list" if items
                      else "recurring" if task["recurring"] else "once"),
             "points": 2 if task.get("bounty") else 1,  # a defusal is the plain 1
             "due_at": p["due_at"],
             "late_seconds": max(0, int((completed - due).total_seconds())),
-        }
+            **extra,
+        } for d in doers]
         if live["recurring"]:
             live["pending"] = None
             live["next_due"] = to_iso(next_due(recurrence_of(live), tz, due, completed))
         else:
             data["tasks"].pop(tid, None)
 
-    if record:
-        await store.log_completion(record)
+    if records:
+        for record in records:
+            await store.log_completion(record)
         bonus = " 💰 **+2 puntos**" if task.get("bounty") else ""
+        mentions = _join([f"<@{d['user_id']}>" for d in doers])
         if task.get("puntobomb"):
             status = (
                 f"~~**{task['brief']}**~~\n"
                 f"✂️ Defused by {press.mention} with time to spare • "
+                f"{discord_ts(completed, 't')}"
+            )
+        elif items:
+            each = " — +1 punto each" if len(doers) > 1 else ""
+            status = (
+                f"~~**{task['brief']}**~~\n"
+                f"✅ {EMOJI_LIST} All {len(items)} ticked by {mentions}{each} • "
                 f"{discord_ts(completed, 't')}"
             )
         else:
@@ -605,12 +708,14 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
             # resolved posts waits until *after* that edit: the tidy-up doesn't
             # gate the new buttons, and the confirmation should land first.
             anchor = message_ids[-1]
-            # The doer is this occurrence's sole participant; anyone *else* can 👏
-            # them a bonus punto on the finished post.
-            participants = [{"user_id": press.user_id, "user_name": press.display}]
+            # The doers (one for a plain chore, every ticker for a 🧾 list) are
+            # this occurrence's participants; anyone *else* can 👏 them a bonus
+            # punto on the finished post.
+            participants = doers
             async with store.txn() as data:
                 stale_undo = _arm_undo_in(data, "done", tid, before, anchor,
-                                          channel, completion_id=completion_id)
+                                          channel,
+                                          completion_ids=[r["id"] for r in records])
                 if requeueable:
                     stale_requeue = _arm_requeue_in(data, tid, before, anchor,
                                                     channel, task["guild_id"])
@@ -722,12 +827,14 @@ def _arm_undo_in(
     anchor_id: int,
     channel: discord.abc.Messageable,
     *,
-    completion_id: Optional[str] = None,
+    completion_ids: Optional[list[str]] = None,
 ) -> list[tuple[int, bool]]:
     """Write the undo record for ``anchor_id`` into an open txn's ``data`` (the
     txn-body core of _arm_undo, so a caller arming several tables can land them
     all in one flush), returning the older anchors whose ↩️ this retires as
-    (message_id, was_buttons) pairs for _tidy_stale."""
+    (message_id, was_buttons) pairs for _tidy_stale. ``completion_ids`` are the
+    log rows this action wrote — one for a plain ✅, one per ticker for a 🧾
+    list — all voided together if the undo takes."""
     stale: list[tuple[int, bool]] = []
     for mid, rec in list(data["undo"].items()):
         if rec.get("task_id") == tid and str(mid) != str(anchor_id):
@@ -737,7 +844,7 @@ def _arm_undo_in(
         "action": action,
         "task_id": tid,
         "before": before,
-        "completion_id": completion_id,
+        "completion_ids": completion_ids,
         "channel_id": getattr(channel, "id", None),
         "ui": "buttons",
     }
@@ -751,7 +858,7 @@ async def _arm_undo(
     anchor_id: int,
     channel: discord.abc.Messageable,
     *,
-    completion_id: Optional[str] = None,
+    completion_ids: Optional[list[str]] = None,
     tidy: Optional[set] = None,
 ) -> None:
     """Record how to reverse the action just taken; the ↩️ button itself lands
@@ -762,7 +869,7 @@ async def _arm_undo(
         return
     async with store.txn() as data:
         stale = _arm_undo_in(
-            data, action, tid, before, anchor_id, channel, completion_id=completion_id
+            data, action, tid, before, anchor_id, channel, completion_ids=completion_ids
         )
     await _tidy_stale(channel, stale, EMOJI_UNDO, tidy)
 
@@ -825,7 +932,8 @@ async def _handle_undo(press: Press) -> None:
     # re-arm (e.g. a second snooze on this message) can't make us act on stale
     # snapshot data.
     outcome = None  # "ok" | "refused"
-    action = before = completion_id = None
+    action = before = None
+    completion_ids: list[str] = []
     tid = None
     legacy_record = False
     clap_log_ids: list[str] = []
@@ -835,7 +943,10 @@ async def _handle_undo(press: Press) -> None:
             return  # a concurrent ↩️ beat us to it
         action = rec["action"]
         before = rec["before"]
-        completion_id = rec.get("completion_id")
+        # Newer records carry the list; pre-list ones a single completion_id.
+        completion_ids = list(rec.get("completion_ids") or [])
+        if rec.get("completion_id"):
+            completion_ids.append(rec["completion_id"])
         tid = rec["task_id"]
         legacy_record = rec.get("ui") != "buttons"
         if can_undo(action, before, data["tasks"].get(tid)):
@@ -858,8 +969,9 @@ async def _handle_undo(press: Press) -> None:
             clap_log_ids = list(clap.get("log_ids", []))
 
     if outcome == "ok":
-        if action == "done" and completion_id:
-            await store.void_completion(completion_id)
+        if action == "done":
+            for cid in completion_ids:  # one row, or one per 🧾 ticker
+                await store.void_completion(cid)
         for lid in clap_log_ids:  # retract every bonus punto the claps awarded
             await store.void_completion(lid)
         await _restore_anchor(channel, press.message_id, tid, before,
@@ -1035,6 +1147,7 @@ __all__ = [
     "_restore_anchor",
     "_take_task_panels",
     "can_undo",
+    "handle_list_button",
     "handle_post_button",
     "handle_task_button",
     "on_raw_reaction_add",

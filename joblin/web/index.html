@@ -392,6 +392,7 @@ function splitItems() {
 
 function barIcons(it) { // recurrence details show on expand, not on the bar
   return (KIND_ICON[it.kind] || "")
+    + (it.items && it.items.length ? "🧾" : "")
     + (it.bounty ? "💰" : "")
     + (it.no_nag ? "🤫" : "");
 }
@@ -504,6 +505,7 @@ function taskForm(it) { // it = null for a new task
   const at = h("input", { type: "text", value: it ? it.at_input : "" });
   const repeat = h("input", { type: "text", value: it ? it.repeat_input : "" });
   const desc = h("textarea", { value: it ? it.description : "", rows: 2, maxLength: 1500 });
+  const items = h("textarea", { value: it && it.items ? it.items.join("\n") : "", rows: 3 });
   const bounty = h("input", { type: "checkbox", checked: it ? it.bounty : false });
   // Shush is edit-only: a brand-new chore has no nags yet, and Discord only
   // offers 🤫 once a reminder has fired. Edit can set the lifetime flag early.
@@ -516,6 +518,8 @@ function taskForm(it) { // it = null for a new task
     field("When", at, it ? AT_HINT : "empty = now · " + AT_HINT),
     field("Repeat", repeat, it ? REPEAT_HINT : "empty = once · " + REPEAT_HINT),
     field("Details", desc, "shown by the ℹ️ reaction"),
+    field("🧾 List items", items,
+      "one per line — a button each; every ticker earns a punto · empty = plain chore"),
     h("label", { class: "check" }, bounty, "Bounty — 2 puntos, someone else must do it"),
     noNag
       ? h("label", { class: "check" }, noNag,
@@ -523,7 +527,7 @@ function taskForm(it) { // it = null for a new task
       : null,
     err,
   );
-  form.values = () => ({ brief, at, repeat, desc, bounty, noNag });
+  form.values = () => ({ brief, at, repeat, desc, items, bounty, noNag });
   form.showError = (msg) => { err.textContent = msg; err.classList.remove("hidden"); };
   return form;
 }
@@ -536,6 +540,8 @@ function editorPanel(it) {
     const changed = {};
     if (v.brief.value.trim() !== it.brief) changed.brief = v.brief.value.trim();
     if (v.desc.value.trim() !== it.description) changed.description = v.desc.value.trim();
+    const lines = v.items.value.split("\n").map((s) => s.trim()).filter(Boolean);
+    if (lines.join("\n") !== (it.items || []).join("\n")) changed.items = lines;
     if (v.bounty.checked !== it.bounty) changed.bounty = v.bounty.checked;
     if (v.noNag && v.noNag.checked !== !!it.no_nag) changed.no_nag = v.noNag.checked;
     // `at`/`repeat` only when touched — an untouched save must never re-anchor
@@ -564,6 +570,10 @@ function editorPanel(it) {
     } catch (e) { form.showError(e.message); }
   });
   const meta = [it.schedule_label];
+  if (it.items && it.items.length)
+    meta.push(it.status === "pending"
+      ? `🧾 ${it.ticks_done || 0}/${it.items.length} ticked`
+      : `🧾 ${it.items.length} items`);
   if (it.status === "pending") meta.push("posted in Discord, waiting on ✅");
   if (it.nag_count) meta.push(`nagged ${it.nag_count}×`);
   if (it.no_nag) meta.push("🤫 shushed — no reminders");
@@ -680,6 +690,8 @@ function openSheet() {
     if (v.at.value.trim()) body.at = v.at.value.trim();
     if (v.repeat.value.trim()) body.repeat = v.repeat.value.trim();
     if (v.desc.value.trim()) body.description = v.desc.value.trim();
+    const lines = v.items.value.split("\n").map((s) => s.trim()).filter(Boolean);
+    if (lines.length) body.items = lines;
     create.disabled = true;
     try {
       await api(`/api/guilds/${S.gid}/tasks`, { method: "POST", body: JSON.stringify(body) });

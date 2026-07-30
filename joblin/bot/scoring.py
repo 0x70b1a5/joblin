@@ -442,10 +442,11 @@ def badge_stats(records: list[dict], guild_id: int,
 
         # Solo chore (including legacy rows with no kind).
         ent["chore_pts"] += pts
-        if kind == "once":
+        if kind == "once" or (kind == "list" and not rec.get("recurring")):
             ent["once"] += 1
         else:
-            # "recurring", missing kind, or any other non-game row.
+            # "recurring", a recurring 🧾 list row (which carries an explicit
+            # "recurring" flag), missing kind, or any other non-game row.
             ent["recurring"] += 1
         if pts == 2:
             ent["bounty"] += 1

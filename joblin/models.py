@@ -38,6 +38,15 @@ Task dict schema
                                     #   blows it — everyone in the game is docked
                                     #   PUNTOBOMB_PENALTY (kind "kaboom"). The fuse is
                                     #   never cleared, snoozed, or rescheduled.
+    "items":        list[str],      # 🧾: a checklist chore ("list"). Each item is a
+                                    #   button on the post; ticking the last one (or
+                                    #   ✅, which ticks whatever's left as yours)
+                                    #   completes it and every distinct ticker earns
+                                    #   1 punto (kind "list"). 2..LIST_MAX_ITEMS
+                                    #   entries, each ≤ LIST_MAX_ITEM_LEN chars.
+                                    #   None/absent = a plain one-tap chore. Never
+                                    #   combined with bounty (each ticker already
+                                    #   earns their own punto) or puntobomb.
 }
 
 Recurrence (``freq``)
@@ -64,6 +73,11 @@ pending dict schema (an occurrence that has fired and awaits action)
     "ui":           str,            # "buttons" on occurrences fired since the
                                     #   button migration; absent on older ones,
                                     #   whose posts self-reacted emoji instead.
+    "ticks":        dict,           # 🧾 lists only: {str(item index): {"user_id",
+                                    #   "user_name"}} — who has ticked what. Lives
+                                    #   in the occurrence, so a recurring list
+                                    #   starts each cycle unticked. Absent (and
+                                    #   ignored) on plain chores.
 }
 """
 
@@ -95,6 +109,7 @@ EMOJI_END = "🏁"  # creator-only "end now" on a pitch-in (✅) or do-em-up pos
 EMOJI_HANDSHAKE = "🤝"  # header icon on a pitch-in post
 EMOJI_FLEX = "💪"  # header icon on a do-em-up post
 EMOJI_BOMB = "💣"  # marker on a puntobomb's posts and list rows
+EMOJI_LIST = "🧾"  # marker on a checklist chore's posts and list rows
 
 # Puntobombs: ✅ before the fuse runs out defuses for 1 punto (a normal chore
 # completion, kind "puntobomb"); past it, everyone in the game — every user in
@@ -182,6 +197,41 @@ def parse_oneoff(s: str, tz: ZoneInfo) -> dt.datetime:
 
 def new_id() -> str:
     return uuid.uuid4().hex[:8]
+
+
+# ---------------------------------------------------------------------------
+# 🧾 Lists  (the `items` field)
+# ---------------------------------------------------------------------------
+# A post has 5 button rows of 5: items fill the first four, the fifth keeps the
+# ✅ ⏩ ℹ️ ⏭️ (🤫/🔊) controls. Item text rides on the button label, capped by
+# Discord at 80 chars.
+LIST_MAX_ITEMS = 20
+LIST_MAX_ITEM_LEN = 80
+
+
+def clean_items(items: list) -> list[str]:
+    """Validate a checklist: strip entries, drop empties, enforce the caps.
+    Raises ``ValueError`` (user-facing message) on an unusable list."""
+    out = [s for s in (str(i).strip() for i in items) if s]
+    if len(out) < 2:
+        raise ValueError("a list needs at least 2 items (one item is just a plain chore)")
+    if len(out) > LIST_MAX_ITEMS:
+        raise ValueError(f"a list holds at most {LIST_MAX_ITEMS} items — split it into two chores")
+    for s in out:
+        if len(s) > LIST_MAX_ITEM_LEN:
+            raise ValueError(
+                f"item too long (max {LIST_MAX_ITEM_LEN} chars): “{s[:30]}…”"
+            )
+    return out
+
+
+def parse_items(text: str) -> list[str]:
+    """Split a free-form ``items`` string into a checklist. ``;`` separates
+    items; when no ``;`` appears, ``,`` works too — so commas can live inside
+    item text as soon as any semicolon is used."""
+    s = (text or "").strip()
+    sep = ";" if ";" in s else ","
+    return clean_items(s.split(sep))
 
 
 # --- Recurrence math ---------------------------------------------------------

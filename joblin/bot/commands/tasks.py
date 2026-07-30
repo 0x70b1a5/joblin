@@ -13,6 +13,7 @@ from discord import app_commands
 
 from ...models import (
     EMOJI_BOMB,
+    EMOJI_LIST,
     PUNTOBOMB_MIN_FUSE_SECS,
     PUNTOBOMB_PENALTY,
     discord_ts,
@@ -20,6 +21,7 @@ from ...models import (
     format_duration,
     new_id,
     now_utc,
+    parse_items,
     parse_repeat,
     pin_weekly,
     resolve_close,
@@ -37,6 +39,7 @@ from .lookup import (
     at_autocomplete,
     close_autocomplete,
     delete_autocomplete,
+    items_autocomplete,
     repeat_autocomplete,
 )
 
@@ -94,6 +97,7 @@ def schedule_from_rule(
     repeat="How often — once, daily, every 2 days, weekdays, mon/thu, monthly on the 1st (default: once)",
     description="Optional longer details, revealed by the ℹ️ reaction",
     bounty="Worth 2 puntos, and only someone other than you can complete it (default: off)",
+    items="Make it a 🧾 list — items separated by ; (e.g. dishes; counters; trash out); every ticker earns a punto",
 )
 async def newtask(
     interaction: discord.Interaction,
@@ -102,6 +106,7 @@ async def newtask(
     repeat: Optional[str] = None,
     description: Optional[str] = None,
     bounty: bool = False,
+    items: Optional[app_commands.Range[str, 1, 2000]] = None,
 ) -> None:
     snap = await store.snapshot()
     cfg = guild_config(snap, interaction.guild_id)
@@ -113,10 +118,19 @@ async def newtask(
 
     tz, now = ZoneInfo(cfg["timezone"]), now_utc()
     try:
+        items_list = parse_items(items) if items is not None else None
         sched = schedule_from_rule(parse_repeat(repeat), at, tz, now, at_given=at is not None)
     except ValueError as e:
         await interaction.response.send_message(
-            f"❌ {e}\nSee `/joblinhelp` for the `at` and `repeat` formats.", ephemeral=True
+            f"❌ {e}\nSee `/joblinhelp` for the `at`, `repeat`, and `items` formats.",
+            ephemeral=True,
+        )
+        return
+    if items_list and bounty:
+        await interaction.response.send_message(
+            f"❌ {EMOJI_LIST} A list can't be a bounty — every ticker already "
+            "earns their own punto.",
+            ephemeral=True,
         )
         return
 
@@ -127,6 +141,7 @@ async def newtask(
         "brief": str(brief),
         "description": description[:1500] if description else None,
         "bounty": bool(bounty),
+        "items": items_list,
         "recurring": sched["recurring"],
         "freq": sched["freq"],
         "interval_days": sched["interval_days"],
@@ -151,6 +166,11 @@ async def newtask(
         body += "\nℹ️ Details attached."
     if bounty:
         body += "\n💰 **Bounty** — worth 2 puntos; anyone *but* you can complete it."
+    if items_list:
+        body += (
+            f"\n{EMOJI_LIST} **List** — {len(items_list)} items to tick off on the "
+            "post; when the last goes green, every ticker earns a punto."
+        )
     body += f"\n· `{tid}` — change it any time with `/edit task`"
     # Public on purpose: the family should see when a chore is added.
     await interaction.response.send_message(body, allowed_mentions=NO_PINGS)
@@ -339,6 +359,7 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
 # The friendly live-preview autocompletes are shared with the other commands.
 newtask.autocomplete("at")(at_autocomplete)
 newtask.autocomplete("repeat")(repeat_autocomplete)
+newtask.autocomplete("items")(items_autocomplete)
 puntobomb.autocomplete("at")(at_autocomplete)
 puntobomb.autocomplete("expires")(close_autocomplete)
 deletetask.autocomplete("task")(delete_autocomplete)

@@ -21,10 +21,12 @@ from discord import app_commands
 
 from ...models import (
     EMOJI_BOMB,
+    EMOJI_LIST,
     UTC,
     describe_close_phrase,
     describe_repeat,
     now_utc,
+    parse_items,
     parse_repeat,
     recurrence_of,
     resolve_when,
@@ -230,6 +232,27 @@ async def repeat_autocomplete(interaction: discord.Interaction, current: str):
     return _dedup(choices)
 
 
+async def items_autocomplete(interaction: discord.Interaction, current: str):
+    """Live preview of a 🧾 ``items`` string: echoes the parsed checklist back
+    (or the parse error) while typing. Past 100 chars no choice is offered at
+    all — a Choice value is capped at 100, so *picking* the echo would silently
+    truncate what was typed; the plain text keeps working regardless."""
+    cur = current.strip()
+    if not cur:
+        example = "dishes away; wipe counters; trash out"
+        return [app_commands.Choice(
+            name=f"{EMOJI_LIST} separate items with ; — e.g. {example}",
+            value=example)]
+    if len(cur) > 100:
+        return []
+    try:
+        items = parse_items(cur)
+    except ValueError as e:
+        return [app_commands.Choice(name=f"⚠️ {e}"[:100], value=cur)]
+    label = f"{EMOJI_LIST} {len(items)} items · " + " · ".join(items)
+    return [app_commands.Choice(name=label[:100], value=cur)]
+
+
 async def task_autocomplete(interaction: discord.Interaction, current: str):
     snap = await store.snapshot()
     cur = current.lower()
@@ -298,6 +321,7 @@ __all__ = [
     "at_autocomplete",
     "close_autocomplete",
     "delete_autocomplete",
+    "items_autocomplete",
     "repeat_autocomplete",
     "task_autocomplete",
 ]

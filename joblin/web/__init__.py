@@ -66,18 +66,25 @@ from aiohttp import web
 
 from ..models import (
     _ordinal,
+    clean_items,
     describe_repeat,
     duration_input,
     from_iso,
     new_id,
     now_utc,
+    parse_items,
     parse_repeat,
     recurrence_of,
     to_iso,
 )
 from ..bot import core
 from ..bot.bombs import coward_strike
-from ..bot.helpers import config_ready, guild_config, schedule_label
+from ..bot.helpers import (
+    config_ready,
+    guild_config,
+    rerender_live_post,
+    schedule_label,
+)
 from ..bot.commands.edit import apply_game_edit
 from ..bot.commands.tasks import _cancel_game_message, schedule_from_rule
 from ..bot.reactions import _delete_panels, _take_task_panels
@@ -215,6 +222,8 @@ def _task_item(t: dict, tz: ZoneInfo) -> dict:
         "brief": t["brief"],
         "description": t.get("description") or "",
         "bounty": bool(t.get("bounty")),
+        "items": t.get("items") or [],
+        "ticks_done": len((pending or {}).get("ticks") or {}),
         "recurring": rule["freq"] != "once",
         "schedule_label": schedule_label(t),
         "repeat_input": repeat_input_of(rule),
@@ -334,6 +343,17 @@ def build_schedule(snap: dict, guild_id: int) -> dict:
 # ---------------------------------------------------------------------------
 # Task mutations — mirrors of /newtask, /edit task, /deletetask
 # ---------------------------------------------------------------------------
+def _items_field(value) -> Optional[list[str]]:
+    """Normalise a web 🧾 ``items`` field: the form sends a list of lines, but a
+    ;-separated string works too. Empty means "no checklist" (None). Raises
+    ``ValueError`` with the same user-facing messages as the slash commands."""
+    if isinstance(value, list):
+        lines = [str(s).strip() for s in value if str(s).strip()]
+        return clean_items(lines) if lines else None
+    s = str(value or "").strip()
+    return parse_items(s) if s else None
+
+
 async def create_task(guild_id: int, user_id: int, fields: dict) -> tuple[Optional[dict], Optional[str]]:
     """Create a task exactly as ``/newtask`` would. Returns (task, error)."""
     snap = await core.store.snapshot()
@@ -347,11 +367,14 @@ async def create_task(guild_id: int, user_id: int, fields: dict) -> tuple[Option
     tz, now = ZoneInfo(cfg["timezone"]), now_utc()
     at = fields.get("at")
     try:
+        items_list = _items_field(fields.get("items"))
         sched = schedule_from_rule(
             parse_repeat(fields.get("repeat")), at, tz, now, at_given=at is not None
         )
     except ValueError as e:
         return None, str(e)
+    if items_list and fields.get("bounty"):
+        return None, "A list can't be a bounty — every ticker already earns their own punto."
 
     description = str(fields.get("description") or "").strip()
     tid = new_id()
@@ -361,6 +384,7 @@ async def create_task(guild_id: int, user_id: int, fields: dict) -> tuple[Option
         "brief": brief,
         "description": description[:1500] if description else None,
         "bounty": bool(fields.get("bounty")),
+        "items": items_list,
         "recurring": sched["recurring"],
         "freq": sched["freq"],
         "interval_days": sched["interval_days"],
@@ -389,16 +413,30 @@ async def apply_task_edit(
     if not live or str(live["guild_id"]) != str(guild_id):
         return None, None, "Task not found."
 
+    items_given = "items" in fields
+    try:
+        items_list = _items_field(fields.get("items")) if items_given else None
+    except ValueError as e:
+        return None, None, str(e)
+
     if live.get("puntobomb"):
-        # Mirrors /edit task's guard: a bomb stays a one-off, non-bounty chore.
+        # Mirrors /edit task's guard: a bomb stays a one-off, non-bounty,
+        # non-list chore.
         try:
             wants_repeat = ("repeat" in fields
                             and parse_repeat(fields["repeat"])["freq"] != "once")
         except ValueError:
             wants_repeat = False  # junk repeat errors in the shared path below
-        if wants_repeat or fields.get("bounty"):
-            return None, None, ("A puntobomb stays a one-off, non-bounty chore — "
-                                "only its brief, details, and arm time can change.")
+        if wants_repeat or fields.get("bounty") or items_list:
+            return None, None, ("A puntobomb stays a one-off, non-bounty, non-list "
+                                "chore — only its brief, details, and arm time can "
+                                "change.")
+
+    # The resulting task must never be both a bounty and a 🧾 list.
+    will_bounty = bool(fields["bounty"]) if "bounty" in fields else bool(live.get("bounty"))
+    will_items = items_list if items_given else live.get("items")
+    if will_bounty and will_items:
+        return None, None, "A list can't be a bounty — every ticker already earns their own punto."
 
     recompute = "at" in fields or "repeat" in fields
     cfg = guild_config(snap, guild_id)
@@ -435,6 +473,14 @@ async def apply_task_edit(
                 t["description"] = desc[:1500] if desc else None
             if "bounty" in fields:
                 t["bounty"] = bool(fields["bounty"])
+            if items_given:
+                t["items"] = items_list  # None clears the checklist
+                p = t.get("pending")
+                if p and p.get("ticks"):
+                    # Old ticks point at old items — progress starts over.
+                    p["ticks"] = {}
+                    if note is None:
+                        note = "The live post's ticks were reset for the new checklist."
             if "no_nag" in fields:
                 # Mirrors the 🤫/🔊 reaction pair: a lifetime flag that stops
                 # hourly nags without cancelling the schedule. Un-shushing a
@@ -471,6 +517,9 @@ async def apply_task_edit(
 
     if not updated:
         return None, None, "Task not found."
+    if items_given and updated.get("pending"):
+        # The live post's item buttons would lie about the new checklist.
+        await rerender_live_post(updated)
     return updated, note, None
 
 
