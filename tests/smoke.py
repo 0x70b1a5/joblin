@@ -2347,6 +2347,67 @@ async def test_post_buttons() -> None:
         assert len(markers) == 1 and markers[0]["user_id"] == 7
 
 
+async def test_done_arming_batch() -> None:
+    """✅ Done arms ↩️/🔄/👏 in ONE combined txn — exactly two store flushes per
+    completion (the completion txn + the arming txn), not one per table — and
+    the deferred tidy-up still retires the previous completed post's buttons
+    when the next occurrence completes."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        tid = "trough"
+        async with st.txn() as data:
+            data["tasks"][tid] = {
+                "id": tid, "guild_id": 1, "brief": "Scrub the trough", "description": None,
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+        await bot.fire_task(tid, ch, cfg)
+        # A nag too, so the completion has an older post to strip.
+        async with st.txn() as data:
+            data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
+        await bot.send_reminder(tid, ch, cfg)
+        first, anchor = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"]
+
+        flushes = 0
+        real_flush = st._flush
+        def counting_flush() -> None:
+            nonlocal flushes
+            flushes += 1
+            real_flush()
+        st._flush = counting_flush  # type: ignore[method-assign]
+        await bot.handle_task_button(tid, "done", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[anchor]))
+        st._flush = real_flush  # type: ignore[method-assign]
+        assert flushes == 2, f"completion + combined arming = 2 flushes, got {flushes}"
+        snap = await st.snapshot()
+        for table in ("undo", "requeue", "claps"):
+            assert list(snap[table]) == [str(anchor)], f"{table} armed in the batch"
+        assert btn_ids(ch.msgs[anchor]) == [
+            f"post:undo:{tid}", f"post:requeue:{tid}", f"post:clap:{tid}"]
+        assert btn_ids(ch.msgs[first]) == [], "the nagged-over post's row is stripped"
+
+        # The next occurrence completes: the old post's whole row retires (the
+        # tidy-up now runs after the status edit, but it still runs).
+        async with st.txn() as data:
+            data["tasks"][tid]["next_due"] = m.to_iso(now - dt.timedelta(seconds=1))
+        await bot.fire_task(tid, ch, cfg)
+        mid2 = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][-1]
+        await bot.handle_task_button(tid, "done", FakeInteraction(
+            user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid2]))
+        snap = await st.snapshot()
+        for table in ("undo", "requeue", "claps"):
+            assert list(snap[table]) == [str(mid2)], f"{table} moved to the new post"
+        assert btn_ids(ch.msgs[anchor]) == [], "the older completed post's row is retired"
+        assert btn_ids(ch.msgs[mid2]) == [
+            f"post:undo:{tid}", f"post:requeue:{tid}", f"post:clap:{tid}"]
+
+
 async def test_listopen() -> None:
     """/listopen lists open chores + live games, each linking to the ORIGINAL post
     (never a nag), posts publicly, and says so when nothing is open."""
@@ -3389,6 +3450,7 @@ def main() -> None:
     asyncio.run(test_task_buttons())
     asyncio.run(test_snooze_numpad())
     asyncio.run(test_post_buttons())
+    asyncio.run(test_done_arming_batch())
     asyncio.run(test_listopen())
     asyncio.run(test_listtasks_pagination())
     asyncio.run(test_lifecycle_and_snooze())

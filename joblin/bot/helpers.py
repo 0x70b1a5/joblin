@@ -398,11 +398,20 @@ async def finalize_messages(
     channel: discord.abc.Messageable, message_ids: list[int], status: str,
     *, view: Optional[discord.ui.View] = None, legacy: bool = False,
 ) -> None:
-    """Take down the action UI on every message of a resolved occurrence and
-    rewrite the most recent one with a status line (carrying ``view`` — e.g. the
-    ↩️/🔄/👏 row). ``legacy`` marks an occurrence that fired before the button
-    migration: its posts self-reacted, so the old emoji sweep also runs (keeping
-    any reaction a member added for fun)."""
+    """Rewrite the most recent message of a resolved occurrence with a status
+    line (carrying ``view`` — e.g. the ↩️/🔄/👏 row), then take down the action
+    UI on its older messages. The status edit goes first so the resolution is
+    visible the moment it lands — the cleanup edits queue behind it in the
+    channel's rate-limit bucket, not in front. ``legacy`` marks an occurrence
+    that fired before the button migration: its posts self-reacted, so the old
+    emoji sweep also runs (keeping any reaction a member added for fun)."""
+    if not message_ids:
+        return
+    last = channel.get_partial_message(message_ids[-1])
+    try:
+        await last.edit(content=status, view=view, allowed_mentions=NO_PINGS)
+    except discord.HTTPException:
+        pass
     for mid in message_ids:
         pm = channel.get_partial_message(mid)
         if legacy:
@@ -412,12 +421,6 @@ async def finalize_messages(
                 await pm.edit(view=None)
             except discord.HTTPException:
                 pass
-    if message_ids:
-        last = channel.get_partial_message(message_ids[-1])
-        try:
-            await last.edit(content=status, view=view, allowed_mentions=NO_PINGS)
-        except discord.HTTPException:
-            pass
 
 
 async def _remove_user_reaction(

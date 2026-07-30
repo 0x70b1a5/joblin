@@ -52,7 +52,7 @@ from .helpers import (
     safe_delete,
 )
 from .claps import (
-    _arm_clap,
+    _arm_clap_in,
     _handle_clap,
 )
 from .games import (
@@ -569,7 +569,6 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
         else:
             data["tasks"].pop(tid, None)
 
-    await _delete_panels(panels)
     if record:
         await store.log_completion(record)
         bonus = " 💰 **+2 puntos**" if task.get("bounty") else ""
@@ -577,27 +576,38 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
             f"~~**{task['brief']}**~~\n"
             f"✅ Completed by {press.mention}{bonus} • {discord_ts(completed, 't')}"
         )
+        stale_undo: list[tuple[int, bool]] = []
+        stale_requeue: list[tuple[int, bool]] = []
+        stale_clap: list[tuple[int, bool]] = []
         if message_ids:
-            # Arm the table entries first, then land ↩️ 🔄 👏 in the one status
-            # edit — so a button can never be pressed before its record exists.
+            # Arm all three tables in ONE txn (one flush), then land ↩️ 🔄 👏 in
+            # the one status edit — so a button can never be pressed before its
+            # record exists. Retiring the rows left on this task's older
+            # resolved posts waits until *after* that edit: the tidy-up doesn't
+            # gate the new buttons, and the confirmation should land first.
             anchor = message_ids[-1]
-            tidy: set[int] = set()
-            await _arm_undo("done", tid, before, anchor, channel,
-                            completion_id=completion_id, tidy=tidy)
-            await _arm_requeue(tid, before, anchor, channel, task["guild_id"], tidy=tidy)
             # The doer is this occurrence's sole participant; anyone *else* can 👏
             # them a bonus punto on the finished post.
             participants = [{"user_id": press.user_id, "user_name": press.display}]
-            await _arm_clap(
-                tid, anchor, channel, task["guild_id"], task["brief"], status,
-                participants, tidy=tidy,
-            )
-            for mid in tidy:
-                await refresh_post_view(channel, mid)
+            async with store.txn() as data:
+                stale_undo = _arm_undo_in(data, "done", tid, before, anchor,
+                                          channel, completion_id=completion_id)
+                stale_requeue = _arm_requeue_in(data, tid, before, anchor,
+                                                channel, task["guild_id"])
+                stale_clap = _arm_clap_in(data, tid, anchor, channel,
+                                          task["guild_id"], task["brief"],
+                                          status, participants)
         await finalize_messages(
             channel, message_ids, status, legacy=legacy,
             view=completed_view(tid, undo=True, requeue=True, clap=True) if message_ids else None,
         )
+        await _delete_panels(panels)
+        tidy: set[int] = set()
+        await _tidy_stale(channel, stale_undo, EMOJI_UNDO, tidy)
+        await _tidy_stale(channel, stale_requeue, EMOJI_REQUEUE, tidy)
+        await _tidy_stale(channel, stale_clap, EMOJI_CLAP, tidy)
+        for mid in tidy:
+            await refresh_post_view(channel, mid)
 
 
 async def _handle_skip_or_delete(tid, task, tz, press: Press) -> None:
@@ -627,19 +637,24 @@ async def _handle_skip_or_delete(tid, task, tz, press: Press) -> None:
             data["tasks"].pop(tid, None)
             mode = "delete"
 
-    await _delete_panels(panels)
     if mode == "skip":
         status = f"**{task['brief']}**\n⏭️ Skipped this time by {press.mention} — back next cycle."
     elif mode == "delete":
         status = f"~~**{task['brief']}**~~\n❌ Cancelled by {press.mention}."
     else:
         return
+    tidy: set[int] = set()
     if message_ids:
-        await _arm_undo(mode, tid, before, message_ids[-1], channel)
+        # Arm before the status edit lands the ↩️; retiring older posts' rows
+        # waits until after it (same order as _handle_done).
+        await _arm_undo(mode, tid, before, message_ids[-1], channel, tidy=tidy)
     await finalize_messages(
         channel, message_ids, status, legacy=legacy,
         view=completed_view(tid, undo=True) if message_ids else None,
     )
+    await _delete_panels(panels)
+    for mid in tidy:
+        await refresh_post_view(channel, mid)
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +683,36 @@ def can_undo(action: str, before: dict, live: Optional[dict]) -> bool:
     return live is None
 
 
+def _arm_undo_in(
+    data: dict,
+    action: str,
+    tid: str,
+    before: dict,
+    anchor_id: int,
+    channel: discord.abc.Messageable,
+    *,
+    completion_id: Optional[str] = None,
+) -> list[tuple[int, bool]]:
+    """Write the undo record for ``anchor_id`` into an open txn's ``data`` (the
+    txn-body core of _arm_undo, so a caller arming several tables can land them
+    all in one flush), returning the older anchors whose ↩️ this retires as
+    (message_id, was_buttons) pairs for _tidy_stale."""
+    stale: list[tuple[int, bool]] = []
+    for mid, rec in list(data["undo"].items()):
+        if rec.get("task_id") == tid and str(mid) != str(anchor_id):
+            data["undo"].pop(mid, None)
+            stale.append((int(mid), rec.get("ui") == "buttons"))
+    data["undo"][str(anchor_id)] = {
+        "action": action,
+        "task_id": tid,
+        "before": before,
+        "completion_id": completion_id,
+        "channel_id": getattr(channel, "id", None),
+        "ui": "buttons",
+    }
+    return stale
+
+
 async def _arm_undo(
     action: str,
     tid: str,
@@ -684,20 +729,10 @@ async def _arm_undo(
     _tidy_stale)."""
     if before is None:
         return
-    stale: list[tuple[int, bool]] = []
     async with store.txn() as data:
-        for mid, rec in list(data["undo"].items()):
-            if rec.get("task_id") == tid and str(mid) != str(anchor_id):
-                data["undo"].pop(mid, None)
-                stale.append((int(mid), rec.get("ui") == "buttons"))
-        data["undo"][str(anchor_id)] = {
-            "action": action,
-            "task_id": tid,
-            "before": before,
-            "completion_id": completion_id,
-            "channel_id": getattr(channel, "id", None),
-            "ui": "buttons",
-        }
+        stale = _arm_undo_in(
+            data, action, tid, before, anchor_id, channel, completion_id=completion_id
+        )
     await _tidy_stale(channel, stale, EMOJI_UNDO, tidy)
 
 
@@ -818,34 +853,31 @@ async def _handle_undo(press: Press) -> None:
 # "The Reanimator" title badge is derived from, same recompute-from-log spirit
 # as every other badge. Markers are never voided: undoing the fresh occurrence
 # doesn't un-happen the tap.
-async def _arm_requeue(
+def _arm_requeue_in(
+    data: dict,
     tid: str,
-    before: Optional[dict],
+    before: dict,
     anchor_id: int,
     channel: discord.abc.Messageable,
     guild_id: int,
-    *,
-    tidy: Optional[set] = None,
-) -> None:
-    """Remember how to re-fire the task from a just-completed post (the 🔄
-    button itself lands with the caller's status edit), retiring any 🔄 left on
-    this task's older completed posts (via ``tidy`` — see _tidy_stale)."""
-    if before is None:
-        return
+) -> list[tuple[int, bool]]:
+    """Write, into an open txn's ``data``, how to re-fire the task from a
+    just-completed post (the 🔄 button itself lands with the caller's status
+    edit), returning the older anchors whose 🔄 this retires as
+    (message_id, was_buttons) pairs for _tidy_stale."""
     stale: list[tuple[int, bool]] = []
-    async with store.txn() as data:
-        for mid, rec in list(data["requeue"].items()):
-            if rec.get("task_id") == tid and str(mid) != str(anchor_id):
-                data["requeue"].pop(mid, None)
-                stale.append((int(mid), rec.get("ui") == "buttons"))
-        data["requeue"][str(anchor_id)] = {
-            "task_id": tid,
-            "before": before,  # lets a completed one-off be recreated and re-run
-            "guild_id": guild_id,
-            "channel_id": getattr(channel, "id", None),
-            "ui": "buttons",
-        }
-    await _tidy_stale(channel, stale, EMOJI_REQUEUE, tidy)
+    for mid, rec in list(data["requeue"].items()):
+        if rec.get("task_id") == tid and str(mid) != str(anchor_id):
+            data["requeue"].pop(mid, None)
+            stale.append((int(mid), rec.get("ui") == "buttons"))
+    data["requeue"][str(anchor_id)] = {
+        "task_id": tid,
+        "before": before,  # lets a completed one-off be recreated and re-run
+        "guild_id": guild_id,
+        "channel_id": getattr(channel, "id", None),
+        "ui": "buttons",
+    }
+    return stale
 
 
 async def _handle_requeue(press: Press) -> None:
@@ -956,8 +988,9 @@ __all__ = [
     "SnoozeView",
     "_announce_snooze",
     "_apply_snooze",
-    "_arm_requeue",
+    "_arm_requeue_in",
     "_arm_undo",
+    "_arm_undo_in",
     "_delete_panels",
     "_disarm_undo_button",
     "_handle_done",

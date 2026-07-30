@@ -104,6 +104,39 @@ def _game_participants(event: dict, kind: str) -> list[dict]:
             for uid, e in event.get("tallies", {}).items() if e.get("count", 0) > 0]
 
 
+def _arm_clap_in(
+    data: dict,
+    tid: str,
+    anchor_id: int,
+    channel: discord.abc.Messageable,
+    guild_id: int,
+    brief: str,
+    status: str,
+    participants: list[dict],
+) -> list[tuple[int, bool]]:
+    """Write the 👏 record for ``anchor_id`` into an open txn's ``data`` (the
+    txn-body core of _arm_clap, so a caller arming several tables can land them
+    all in one flush), returning the older anchors whose 👏 this retires as
+    (message_id, was_buttons) pairs for _tidy_stale."""
+    stale: list[tuple[int, bool]] = []
+    for mid, rec in list(data["claps"].items()):
+        if rec.get("task_id") == tid and str(mid) != str(anchor_id):
+            data["claps"].pop(mid, None)
+            stale.append((int(mid), rec.get("ui") == "buttons"))
+    data["claps"][str(anchor_id)] = {
+        "task_id": tid,
+        "guild_id": guild_id,
+        "channel_id": getattr(channel, "id", None),
+        "brief": brief,
+        "status": status,
+        "participants": participants,
+        "clappers": [],  # outsider ids who've already clapped (the per-outsider cap)
+        "log_ids": [],  # completion ids the claps logged (so an undo can void them)
+        "ui": "buttons",
+    }
+    return stale
+
+
 async def _arm_clap(
     tid: str,
     anchor_id: int,
@@ -119,23 +152,10 @@ async def _arm_clap(
     with the caller's status edit), retiring any 👏 left on this task's older
     completed posts (their already-paid bonuses stand — only the button is
     taken away; see _tidy_stale)."""
-    stale: list[tuple[int, bool]] = []
     async with store.txn() as data:
-        for mid, rec in list(data["claps"].items()):
-            if rec.get("task_id") == tid and str(mid) != str(anchor_id):
-                data["claps"].pop(mid, None)
-                stale.append((int(mid), rec.get("ui") == "buttons"))
-        data["claps"][str(anchor_id)] = {
-            "task_id": tid,
-            "guild_id": guild_id,
-            "channel_id": getattr(channel, "id", None),
-            "brief": brief,
-            "status": status,
-            "participants": participants,
-            "clappers": [],  # outsider ids who've already clapped (the per-outsider cap)
-            "log_ids": [],  # completion ids the claps logged (so an undo can void them)
-            "ui": "buttons",
-        }
+        stale = _arm_clap_in(
+            data, tid, anchor_id, channel, guild_id, brief, status, participants
+        )
     await _tidy_stale(channel, stale, EMOJI_CLAP, tidy)
 
 
@@ -227,6 +247,7 @@ async def _handle_clap(press: Press) -> None:
 
 __all__ = [
     "_arm_clap",
+    "_arm_clap_in",
     "_arm_game_clap",
     "_clap_record",
     "_game_participants",
