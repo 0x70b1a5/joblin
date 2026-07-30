@@ -316,7 +316,7 @@ class SnoozeView(discord.ui.View):
         self.clear_items()
         for i, n in enumerate(SNOOZE_CHOICES):
             digit = discord.ui.Button(
-                label=str(n), style=discord.ButtonStyle.primary, row=i // 4
+                label=str(n), style=discord.ButtonStyle.secondary, row=i // 4
             )
             digit.callback = self._picker(n)
             self.add_item(digit)
@@ -330,7 +330,7 @@ class SnoozeView(discord.ui.View):
         toggle.callback = self._toggle
         self.add_item(toggle)
         cancel = discord.ui.Button(
-            emoji=EMOJI_DELETE, style=discord.ButtonStyle.danger, row=1
+            emoji=EMOJI_DELETE, style=discord.ButtonStyle.secondary, row=1
         )
         cancel.callback = self._cancel
         self.add_item(cancel)

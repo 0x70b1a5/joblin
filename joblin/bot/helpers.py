@@ -177,7 +177,7 @@ class TaskButton(
     # Emoji-only faces (no labels) — phone screens are narrow and the row is
     # wide; /joblinhelp is the legend.
     FACES = {  # action -> (emoji, style)
-        "done":    (EMOJI_DONE, discord.ButtonStyle.success),
+        "done":    (EMOJI_DONE, discord.ButtonStyle.secondary),
         "ffwd":    (EMOJI_FFWD, discord.ButtonStyle.secondary),
         "info":    (EMOJI_INFO, discord.ButtonStyle.secondary),
         "skip":    (EMOJI_SKIP, discord.ButtonStyle.secondary),
@@ -185,7 +185,7 @@ class TaskButton(
         "unshush": (EMOJI_UNSHUSH, discord.ButtonStyle.secondary),
     }
     # One-offs aren't skipped, they're cancelled — same action id, harder face.
-    CANCEL_FACE = (EMOJI_DELETE, discord.ButtonStyle.danger)
+    CANCEL_FACE = (EMOJI_DELETE, discord.ButtonStyle.secondary)
 
     def __init__(self, tid: str, action: str, *, face: Optional[tuple] = None) -> None:
         self.tid = tid
@@ -238,7 +238,7 @@ class PostButton(
     FACES = {  # action -> (emoji, style); emoji-only except the clap tally
         "undo":    (EMOJI_UNDO, discord.ButtonStyle.secondary),
         "requeue": (EMOJI_REQUEUE, discord.ButtonStyle.secondary),
-        "clap":    (EMOJI_CLAP, discord.ButtonStyle.primary),
+        "clap":    (EMOJI_CLAP, discord.ButtonStyle.secondary),
     }
 
     def __init__(self, tid: str, action: str, *, clap_count: int = 0) -> None:

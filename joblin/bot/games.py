@@ -384,12 +384,12 @@ class PitchinButton(
         # Emoji-only — the post body is the legend ("Tap ✅ … creator: 🏁").
         if action == "join":
             button = discord.ui.Button(
-                emoji=EMOJI_DONE, style=discord.ButtonStyle.success,
+                emoji=EMOJI_DONE, style=discord.ButtonStyle.secondary,
                 custom_id=f"pitchin:join:{pid}",
             )
         else:
             button = discord.ui.Button(
-                emoji=EMOJI_END, style=discord.ButtonStyle.danger,
+                emoji=EMOJI_END, style=discord.ButtonStyle.secondary,
                 custom_id=f"pitchin:end:{pid}",
             )
         super().__init__(button)
@@ -582,9 +582,9 @@ class DoEmUpButton(
     every do-em-up's buttons after a restart with no per-message bookkeeping."""
 
     FACES = {  # action -> (emoji, style); emoji-only, like every other row
-        "plus": ("➕", discord.ButtonStyle.success),
+        "plus": ("➕", discord.ButtonStyle.secondary),
         "minus": ("➖", discord.ButtonStyle.secondary),
-        "end": (EMOJI_END, discord.ButtonStyle.danger),
+        "end": (EMOJI_END, discord.ButtonStyle.secondary),
     }
 
     def __init__(self, did: str, action: str) -> None:
