@@ -1,43 +1,52 @@
-"""The Discord bot: slash commands, the scheduler tick, and reactions.
+"""The Discord bot: slash commands, the scheduler tick, and the button/reaction UI.
 
 Lifecycle of a task occurrence
 ------------------------------
 1. The scheduler tick (every 30s) notices ``now >= next_due`` and *fires* it:
-   posts the brief to the configured channel and self-reacts ✅ ⏩ ℹ️ ⏭️/❌
-   (ℹ️ only if the task has a long description; ⏭️ on recurring tasks, ❌ on
-   one-offs). The task flips to "pending"
-   with ``remind_at = due + 1h``; ``next_due`` is cleared so it can't re-fire.
+   posts the brief to the configured channel with an action row of buttons —
+   ✅ Done, ⏩ Snooze, ℹ️ Info (only if the task has a long description), and
+   ⏭️ Skip on recurring tasks / ❌ Cancel on one-offs. The task flips to
+   "pending" with ``remind_at = due + 1h``; ``next_due`` is cleared so it
+   can't re-fire.
 2. While pending, every tick checks ``remind_at``. When it passes, the bot
    posts a fresh nag (optionally pinging a role) and sets ``remind_at = now+1h``.
-   Nags additionally self-react 🤫; a task whose ``no_nag`` flag is set is
-   never nagged (it still fires — only the reminders stop).
-3. Reactions resolve or defer the occurrence:
-     ✅  complete  -> log the completer; recurring tasks roll to the next slot,
+   Nags additionally carry a 🤫 Shush button; a task whose ``no_nag`` flag is
+   set is never nagged (it still fires — only the reminders stop).
+3. Buttons resolve or defer the occurrence:
+     ✅  done      -> log the completer; recurring tasks roll to the next slot,
                       one-offs are removed.
-     ⏩  fast-fwd  -> snooze 1h, then 2h, 4h, 8h ... (doubling each press).
-     ℹ️  info      -> reply with the long description.
+     ⏩  snooze    -> opens an ephemeral numpad (hours/days); 1h, 2h, 4h ...
+     ℹ️  info      -> whisper the long description (ephemeral).
      ⏭️  skip      -> recurring only: skip just this occurrence.
-     ❌  delete    -> one-off only: delete the task.
+     ❌  cancel    -> one-off only: delete the task.
                       (Deleting an entire recurring task is /deletetask.)
      ↩️  undo      -> reverse the most recent ✅/⏩/⏭️/❌ on that occurrence. The
-                      bot adds this button right after one of those actions.
-     🔄  requeue   -> appears on a ✅-completed post; re-fires the chore right
-                      now (a fresh occurrence) without waiting for its next slot.
+                      bot puts this button on the message showing the result.
+     🔄  requeue   -> rides a ✅-completed post; re-fires the chore right now
+                      (a fresh occurrence) without waiting for its next slot.
      🤫  shush     -> sets the task's lifetime ``no_nag`` flag: stop the hourly
                       reminders while occurrences keep firing on schedule. A
-                      shushed chore's posts self-react 🔊 instead.
+                      shushed chore's posts carry 🔊 instead.
      🔊  un-shush  -> clears ``no_nag``: the hourly reminders resume (with a
                       fresh cadence).
 
-Everything is keyed off ``store["messages"][message_id] -> task_id`` so that
-reactions keep working across restarts, and the persisted ``remind_at`` means
-nags survive restarts too.
+Buttons are ``DynamicItem``s whose custom_id carries the task id, so a single
+``add_dynamic_items`` call on startup revives every post's buttons after a
+restart. Live posts are additionally keyed in
+``store["messages"][message_id] -> task_id`` (the stale-button guard), and the
+persisted ``remind_at`` means nags survive restarts too.
+
+Posts made before the button migration self-reacted the same emoji instead;
+``on_raw_reaction_add`` still routes those (and any manually added emoji on a
+live post) through the very same per-action handlers, via the ``Press``
+abstraction in helpers.py. An occurrence's ``pending["ui"]`` says which era it
+fired in, so resolution knows whether an emoji sweep is still needed.
 
 Undo
 ----
 Each of the three mutating actions stashes a deep copy of the task *as it was
 just before the action* into ``store["undo"][anchor_message_id]`` (plus the
-completion-log id for ✅) and self-reacts ↩️ on the message showing the result.
+completion-log id for ✅) and lands ↩️ on the message showing the result.
 Undo simply restores that snapshot — after first checking the occurrence hasn't
 moved on (``can_undo``), so we never clobber a newer occurrence — and voids the
 logged completion when reverting a ✅. Like the rest of the store it survives

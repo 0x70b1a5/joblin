@@ -150,17 +150,19 @@ async def newtask(
 
 
 async def _cancel_game_message(
-    channel: discord.abc.Messageable, brief: str, mid: int, *, is_doemup: bool
+    channel: discord.abc.Messageable, brief: str, mid: int, *, sweep_reactions: bool
 ) -> None:
     """Make a deleted game's live post inert: strike it through as cancelled and
-    strip its reactions/buttons. No puntos are awarded (delete ≠ close)."""
+    strip its buttons (view=None). No puntos are awarded (delete ≠ close).
+    ``sweep_reactions`` handles a pitch-in round posted before the button
+    migration, whose UI was self-reacted ✅/🏁."""
     pm = channel.get_partial_message(mid)
     try:
         await pm.edit(content=f"🗑️ ~~**{brief}**~~ — cancelled.",
                       view=None, allowed_mentions=NO_PINGS)
     except discord.HTTPException:
         pass
-    if not is_doemup:  # do-em-ups carry buttons (cleared by view=None); pitch-ins, reactions
+    if sweep_reactions:
         try:
             await pm.clear_reactions()
         except discord.HTTPException:
@@ -218,7 +220,9 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
                       if removed.get("channel_id") else None)
                 if ch is not None:
                     await _cancel_game_message(
-                        ch, removed["brief"], live_mid, is_doemup=(kind == "doemup")
+                        ch, removed["brief"], live_mid,
+                        sweep_reactions=(kind == "pitchin"
+                                         and removed.get("ui") != "buttons"),
                     )
     if removed:
         await interaction.response.send_message(

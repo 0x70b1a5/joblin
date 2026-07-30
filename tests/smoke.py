@@ -454,7 +454,8 @@ class FakeMessage:
         return self
 
     async def edit(self, content=None, **kw) -> None:  # absorbs view=/allowed_mentions=
-        self.content = content
+        if content is not None:
+            self.content = content
         if "view" in kw:
             self.view = kw["view"]
 
@@ -477,6 +478,7 @@ class FakeChannel:
         self._next += 1
         msg = FakeMessage(self._next, self)
         msg.content = content
+        msg.view = kw.get("view")
         if kw.get("embed") is not None:
             msg.embed = kw["embed"]
         if kw.get("embeds") is not None:
@@ -518,15 +520,18 @@ class FakeUser:
 
 
 class FakeResponse:
-    """Captures whatever a command / button handler does with the interaction."""
+    """Captures whatever a command / button handler does with the interaction.
+    When the interaction carries a ``message`` (a component press),
+    ``edit_message`` writes through to it — like the real thing."""
 
-    def __init__(self) -> None:
+    def __init__(self, message=None) -> None:
         self.content = None
         self.embed = None
         self.embeds = None
         self.ephemeral = None
         self.view = None
         self._done = False
+        self._message = message
 
     async def send_message(self, content=None, *, ephemeral=False, embed=None,
                            embeds=None, view=None, allowed_mentions=None) -> None:
@@ -536,6 +541,10 @@ class FakeResponse:
 
     async def edit_message(self, content=None, *, view=None, allowed_mentions=None) -> None:
         self.content, self.view, self._done = content, view, True
+        if self._message is not None:
+            if content is not None:
+                self._message.content = content
+            self._message.view = view
 
     async def defer(self, *a, **k) -> None:
         self._done = True
@@ -544,12 +553,37 @@ class FakeResponse:
         return self._done
 
 
+class FakeFollowup:
+    def __init__(self) -> None:
+        self.sent = []  # (content, ephemeral) pairs
+
+    async def send(self, content=None, *, ephemeral=False, **kw) -> None:
+        self.sent.append((content, ephemeral))
+
+
 class FakeInteraction:
-    def __init__(self, *, guild_id=1, user=None, channel=None) -> None:
+    def __init__(self, *, guild_id=1, user=None, channel=None, message=None) -> None:
         self.guild_id = guild_id
         self.user = user or FakeUser(1, "Boss")
         self.channel = channel
-        self.response = FakeResponse()
+        self.message = message
+        self.response = FakeResponse(message)
+        self.followup = FakeFollowup()
+
+
+def btn_ids(msg) -> list:
+    """The custom_ids of the buttons on a message's current view ([] if none)."""
+    view = getattr(msg, "view", None)
+    return [item.custom_id for item in view.children] if view else []
+
+
+def btn(msg, custom_id):
+    """The underlying Button with that custom_id on a message's view (or None)."""
+    view = getattr(msg, "view", None)
+    for item in view.children if view else ():
+        if item.custom_id == custom_id:
+            return getattr(item, "item", item)  # unwrap a DynamicItem
+    return None
 
 
 async def _game_setup(d):
@@ -569,8 +603,9 @@ async def _game_setup(d):
 
 
 async def test_pitchin_lifecycle() -> None:
-    """Post a pitch-in, two people ✅, one un-✅s, a non-creator 🏁 is ignored,
-    then the creator 🏁 closes it and awards a punto to whoever's still in."""
+    """Post a pitch-in, two people press ✅, one presses again to back out, a
+    non-creator 🏁 is refused, then the creator 🏁 closes it and awards a punto
+    to whoever's still in."""
     with tempfile.TemporaryDirectory() as d:
         bot, st, ch = await _game_setup(d)
         now = m.now_utc()
@@ -580,33 +615,43 @@ async def test_pitchin_lifecycle() -> None:
             max_scorers=None, now=now,
         )
         mid = msg.id
+        assert f"pitchin:join:{pid}" in btn_ids(ch.msgs[mid]), "live round carries ✅/🏁 buttons"
 
-        await bot.on_raw_reaction_add(FakePayload(mid, "✅", user_id=42, member=FakeMember(42, "Pat")))
-        await bot.on_raw_reaction_add(FakePayload(mid, "✅", user_id=7, member=FakeMember(7, "Sam")))
+        async def press(uid, name, action="join"):
+            inter = FakeInteraction(
+                user=FakeUser(uid, name), channel=ch, message=ch.msgs[mid])
+            await bot.handle_pitchin_button(pid, action, inter)
+            return inter
+
+        await press(42, "Pat")
+        await press(7, "Sam")
         snap = await st.snapshot()
         assert [s["user_id"] for s in snap["pitchins"][pid]["scorers"]] == [42, 7]
         assert "Pitched in (2):" in ch.msgs[mid].content
 
-        # Sam pulls his ✅ back off -> dropped before it closes.
-        await bot.on_raw_reaction_remove(FakePayload(mid, "✅", user_id=7))
+        # Sam presses ✅ again -> toggled back out before it closes.
+        await press(7, "Sam")
         snap = await st.snapshot()
         assert [s["user_id"] for s in snap["pitchins"][pid]["scorers"]] == [42]
         assert "Pitched in (1):" in ch.msgs[mid].content
 
-        # A non-creator 🏁 must NOT close it.
-        await bot.on_raw_reaction_add(FakePayload(mid, m.EMOJI_END, user_id=42, member=FakeMember(42, "Pat")))
+        # A non-creator 🏁 must NOT close it (refused with a whisper).
+        refused = await press(42, "Pat", action="end")
         assert pid in (await st.snapshot())["pitchins"], "only the creator ends a pitch-in"
+        assert refused.response.ephemeral, "the refusal is whispered, not public"
 
         # The creator 🏁 closes it: Pat earns 1 punto, the post is finalized.
-        await bot.on_raw_reaction_add(FakePayload(mid, m.EMOJI_END, user_id=1, member=FakeMember(1, "Boss")))
+        await press(1, "Boss", action="end")
         snap = await st.snapshot()
         assert pid not in snap["pitchins"] and str(mid) not in snap["game_messages"]
         recs = st.read_completions()
         assert len(recs) == 1 and recs[0]["user_id"] == 42 and recs[0]["points"] == 1
         assert recs[0]["kind"] == "pitchin"
-        # Closing strips our ✅/🏁 buttons (not via the all-nuking clear_reactions).
+        # Closing swaps the ✅/🏁 buttons for the 👏 in the same edit — and never
+        # touches reactions (a member's fun 😄 would survive).
         assert "pitched in!" in ch.msgs[mid].content
-        assert (mid, "✅") in ch.cleared_emoji and (mid, m.EMOJI_END) in ch.cleared_emoji
+        ids = btn_ids(ch.msgs[mid])
+        assert f"post:clap:{pid}" in ids and f"pitchin:join:{pid}" not in ids
         assert mid not in ch.cleared
 
 
@@ -775,7 +820,7 @@ async def test_pitchin_recurring() -> None:
         assert new_mid is not None and new_mid != mid, "a brand-new round post"
         assert p["next_due"] is None and m.from_iso(p["expires_at"]) > m.now_utc()
         assert snap["game_messages"][str(new_mid)] == {"kind": "pitchin", "id": pid}
-        assert (new_mid, m.EMOJI_DONE) in ch.added, "the fresh round self-reacts ✅"
+        assert f"pitchin:join:{pid}" in btn_ids(ch.msgs[new_mid]), "the fresh round carries ✅/🏁 buttons"
 
         # Score the new round; the creator's 🏁 closes THIS round (awarding Sam)
         # and the recurring series rolls on rather than ending.
@@ -894,7 +939,9 @@ async def test_doemup_recurring() -> None:
         snap = await st.snapshot()
         dd = snap["doemups"][did]
         assert dd["message_id"] is None and dd["tallies"] == {}, "round closed -> dormant"
-        assert dd["next_due"] is not None and ch.msgs[mid].view is None
+        assert dd["next_due"] is not None
+        ids = btn_ids(ch.msgs[mid])
+        assert f"post:clap:{did}" in ids and f"doemup:plus:{did}" not in ids, "➕/➖ gave way to 👏"
         assert "done!" in ch.msgs[mid].content and "Next round" in ch.msgs[mid].content
         assert {r["user_id"]: r["points"] for r in st.read_completions()} == {42: 2}
 
@@ -1020,7 +1067,8 @@ async def test_delete_live_game() -> None:
         await bot.deletetask.callback(inter, pid)
         snap = await st.snapshot()
         assert pid not in snap["pitchins"] and str(msg.id) not in snap["game_messages"]
-        assert "cancelled" in ch.msgs[msg.id].content and msg.id in ch.cleared
+        assert "cancelled" in ch.msgs[msg.id].content and ch.msgs[msg.id].view is None
+        assert msg.id not in ch.cleared, "a button round has no reactions to sweep"
         assert st.read_completions() == [], "delete awards nobody"
 
         # A live do-em-up -> its buttons are dropped (view=None) on cancel.
@@ -1080,7 +1128,7 @@ async def test_game_commands() -> None:
         assert "joblinconfig" in inter.response.content
         assert not (await st.snapshot())["pitchins"]
 
-        # Happy path: default 24h expiry; posts and self-reacts ✅ + 🏁.
+        # Happy path: default 24h expiry; posts with ✅ + 🏁 buttons.
         inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
         await bot.pitchin.callback(inter, brief="Laundry bonanza")
         snap = await st.snapshot()
@@ -1089,7 +1137,8 @@ async def test_game_commands() -> None:
         assert p["points_each"] == 1 and p["max_scorers"] is None
         assert "🤝 Posted" in inter.response.content and inter.response.ephemeral
         mid = p["message_id"]
-        assert (mid, m.EMOJI_DONE) in ch.added and (mid, m.EMOJI_END) in ch.added
+        ids = btn_ids(ch.msgs[mid])
+        assert f"pitchin:join:{p['id']}" in ids and f"pitchin:end:{p['id']}" in ids
 
         # A past expiry is rejected; nothing new is posted.
         inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
@@ -1335,7 +1384,7 @@ async def test_requeue() -> None:
         snap = await st.snapshot()
         assert snap["tasks"][tid]["pending"] is None
         assert str(posted) in snap["requeue"], "completing arms a requeue on the post"
-        assert (posted, "🔄") in ch.added, "🔄 button added to the completed post"
+        assert f"post:requeue:{tid}" in btn_ids(ch.msgs[posted]), "🔄 button on the completed post"
         assert len(st.read_completions()) == 1
 
         # 🔄 re-fires it now as a fresh occurrence; the spent record is dropped.
@@ -1414,7 +1463,7 @@ async def test_claps() -> None:
         await bot.on_raw_reaction_add(FakePayload(posted, "✅", member=FakeMember(42, "Pat")))
         snap = await st.snapshot()
         assert str(posted) in snap["claps"], "completing arms a clap on the post"
-        assert (posted, "👏") in ch.added, "👏 button added to the completed post"
+        assert f"post:clap:{tid}" in btn_ids(ch.msgs[posted]), "👏 button on the completed post"
         assert [p["user_id"] for p in snap["claps"][str(posted)]["participants"]] == [42]
         assert len(st.read_completions()) == 1, "just the completion so far"
 
@@ -1488,7 +1537,7 @@ async def test_game_claps() -> None:
         assert pid not in snap["pitchins"], "creator 🏁 closed the round"
         assert str(mid) in snap["claps"], "the finished round armed a clap"
         assert {p["user_id"] for p in snap["claps"][str(mid)]["participants"]} == {42, 7}
-        assert (mid, "👏") in ch.added
+        assert f"post:clap:{pid}" in btn_ids(ch.msgs[mid]), "👏 button on the closed round"
         assert len(st.read_completions()) == 2, "Pat + Sam each scored 1"
 
         # An outsider (Lee) claps -> +1 to BOTH scorers; the tally shows "each"
@@ -1530,7 +1579,7 @@ async def test_game_claps() -> None:
         snap = await st.snapshot()
         assert did not in snap["doemups"] and str(dmid) in snap["claps"], "closed round armed a clap"
         assert {p["user_id"] for p in snap["claps"][str(dmid)]["participants"]} == {42, 7}
-        assert (dmid, "👏") in ch.added
+        assert f"post:clap:{did}" in btn_ids(ch.msgs[dmid]), "👏 button on the closed round"
 
         # An outsider claps the closed do-em-up -> +1 to each tallier (once).
         await bot.on_raw_reaction_add(FakePayload(dmid, "👏", user_id=9, member=FakeMember(9, "Lee")))
@@ -1981,11 +2030,11 @@ async def test_nag_tally() -> None:
 
 
 async def test_shush() -> None:
-    """🤫 on a live post sets the lifetime no_nag flag and 🔊 clears it: nags
-    self-react 🤫, a shush flips the button to 🔊, a shushed task never nags
-    (even across occurrences) but still fires with a 🔊 button on its posts,
-    a same-direction tap is a no-op, and un-shushing (🔊) restarts the hourly
-    cadence fresh."""
+    """The 🤫/🔊 buttons set/clear the lifetime no_nag flag: nags carry a Shush
+    button, a shush stamps the pressed post and flips its button to 🔊, a
+    shushed task never nags (even across occurrences) but still fires with a 🔊
+    button on its posts, a same-direction press is a whispered no-op, and
+    un-shushing restarts the hourly cadence fresh."""
     with tempfile.TemporaryDirectory() as d:
         bot, st, ch = await _game_setup(d)
         tz = ZoneInfo("Europe/Berlin")
@@ -2002,40 +2051,40 @@ async def test_shush() -> None:
                 "created_by": 1, "created_at": m.to_iso(now), "pending": None,
             }
 
-        # Fire, then nag once: the original post carries no 🤫, the nag does.
+        # Fire, then nag once: the original post carries no 🤫 button, the nag does.
         await bot.fire_task(tid, ch, cfg)
         snap = await st.snapshot()
         first = snap["tasks"][tid]["pending"]["message_ids"][0]
-        assert m.EMOJI_SHUSH not in ch.msgs[first].reactions, "no 🤫 on the original post"
+        assert f"task:done:{tid}" in btn_ids(ch.msgs[first]), "live post carries the action row"
+        assert f"task:shush:{tid}" not in btn_ids(ch.msgs[first]), "no 🤫 on the original post"
         async with st.txn() as data:
             data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
         await bot.send_reminder(tid, ch, cfg)
         snap = await st.snapshot()
         nag = snap["tasks"][tid]["pending"]["message_ids"][-1]
-        assert nag != first and m.EMOJI_SHUSH in ch.msgs[nag].reactions, "nags grow a 🤫"
+        assert nag != first and f"task:shush:{tid}" in btn_ids(ch.msgs[nag]), "nags grow a 🤫"
 
-        # 🤫 the nag: flag set, the tapped post is stamped with who shushed
-        # (no separate confirmation post), the bot's button flips to 🔊, and
+        # Press 🤫 on the nag: flag set, the pressed post is stamped with who
+        # shushed (no separate confirmation post), the button flips to 🔊, and
         # no further reminders even with remind_at long past.
         posted_before = len(ch.msgs)
-        await bot.on_raw_reaction_add(
-            FakePayload(nag, m.EMOJI_SHUSH, member=FakeMember(42, "Pat"))
-        )
+        await bot.handle_task_button(tid, "shush", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[nag]))
         snap = await st.snapshot()
         assert snap["tasks"][tid]["no_nag"] is True
         assert len(ch.msgs) == posted_before, "the stamp is an edit, not a new post"
-        assert "Shushed by <@42>" in (ch.msgs[nag].content or ""), "tapped post is stamped"
-        assert m.EMOJI_UNSHUSH in ch.msgs[nag].reactions, "shush flips the button to 🔊"
-        assert m.EMOJI_SHUSH not in ch.msgs[nag].reactions, "the 🤫 face is retired"
+        assert "Shushed by <@42>" in (ch.msgs[nag].content or ""), "pressed post is stamped"
+        assert f"task:unshush:{tid}" in btn_ids(ch.msgs[nag]), "shush flips the button to 🔊"
+        assert f"task:shush:{tid}" not in btn_ids(ch.msgs[nag]), "the 🤫 face is retired"
 
         # A second 🤫 on an already-shushed chore is a no-op (no toggle-back).
         posted_before = len(ch.msgs)
-        await bot.on_raw_reaction_add(
-            FakePayload(nag, m.EMOJI_SHUSH, member=FakeMember(42, "Pat"))
-        )
+        stale = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[nag])
+        await bot.handle_task_button(tid, "shush", stale)
         snap = await st.snapshot()
         assert snap["tasks"][tid]["no_nag"] is True, "🤫 never un-shushes"
-        assert len(ch.msgs) == posted_before, "a same-direction tap posts nothing"
+        assert len(ch.msgs) == posted_before, "a same-direction press posts nothing"
+        assert stale.response.ephemeral, "the refusal is whispered, not public"
         async with st.txn() as data:
             data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
         posted_before = len(ch.msgs)
@@ -2045,14 +2094,15 @@ async def test_shush() -> None:
         assert snap["tasks"][tid]["pending"]["message_ids"][-1] == nag
 
         # The flag outlives the occurrence: complete it, re-fire, still no nag —
-        # and the fresh post carries a 🔊 so un-shushing stays one tap away.
-        await bot.on_raw_reaction_add(FakePayload(first, "✅", member=FakeMember(42, "Pat")))
+        # and the fresh post carries a 🔊 so un-shushing stays one press away.
+        await bot.handle_task_button(tid, "done", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[first]))
         async with st.txn() as data:
             data["tasks"][tid]["next_due"] = m.to_iso(now - dt.timedelta(seconds=1))
         await bot.fire_task(tid, ch, cfg)
         snap = await st.snapshot()
         fresh = snap["tasks"][tid]["pending"]["message_ids"][0]
-        assert m.EMOJI_UNSHUSH in ch.msgs[fresh].reactions, "shushed chore's post offers 🔊"
+        assert f"task:unshush:{tid}" in btn_ids(ch.msgs[fresh]), "shushed chore's post offers 🔊"
         async with st.txn() as data:
             data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
         posted_before = len(ch.msgs)
@@ -2068,17 +2118,16 @@ async def test_shush() -> None:
         # remind_at moves ~1h out instead of staying in the past — and the
         # button flips back to 🤫.
         posted_before = len(ch.msgs)
-        await bot.on_raw_reaction_add(
-            FakePayload(fresh, m.EMOJI_UNSHUSH, member=FakeMember(42, "Pat"))
-        )
+        await bot.handle_task_button(tid, "unshush", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[fresh]))
         snap = await st.snapshot()
         assert snap["tasks"][tid]["no_nag"] is False
         remind = m.from_iso(snap["tasks"][tid]["pending"]["remind_at"])
         assert (remind - m.now_utc()).total_seconds() > 3500, "cadence restarted ~1h out"
         assert len(ch.msgs) == posted_before, "un-shush stamps the post, no new message"
         assert "Un-shushed by <@42>" in (ch.msgs[fresh].content or "")
-        assert m.EMOJI_SHUSH in ch.msgs[fresh].reactions, "un-shush flips the button to 🤫"
-        assert m.EMOJI_UNSHUSH not in ch.msgs[fresh].reactions, "the 🔊 face is retired"
+        assert f"task:shush:{tid}" in btn_ids(ch.msgs[fresh]), "un-shush flips the button to 🤫"
+        assert f"task:unshush:{tid}" not in btn_ids(ch.msgs[fresh]), "the 🔊 face is retired"
 
         # Nags flow again once that fresh hour elapses.
         async with st.txn() as data:
@@ -2087,14 +2136,215 @@ async def test_shush() -> None:
         await bot.send_reminder(tid, ch, cfg)
         assert len(ch.msgs) == posted_before + 1, "un-shushed task nags again"
 
-        # Re-toggling on the same post REPLACES its stamp instead of stacking:
-        # after 🔊 then 🤫 on `fresh`, only the latest stamp line remains.
+        # A manually-reacted 🤫 (the legacy entry way) still routes and REPLACES
+        # the post's stamp instead of stacking: after 🔊 then 🤫 on `fresh`,
+        # only the latest stamp line remains.
         await bot.on_raw_reaction_add(
             FakePayload(fresh, m.EMOJI_SHUSH, member=FakeMember(7, "Sam"))
         )
         body = ch.msgs[fresh].content or ""
         assert "Shushed by <@7>" in body and "Un-shushed" not in body
         assert body.count("Shushed by") == 1, "one stamp line, not a pile"
+
+
+async def test_task_buttons() -> None:
+    """Fired posts carry the action row instead of self-reactions: composition
+    matches the task (ℹ️ only with a description, ⏭️ Skip recurring / ❌ Cancel
+    one-off), ✅ Done completes with the ↩️🔄👏 row landing in the same status
+    edit, a stale press refuses with a whisper, and a bounty's creator is
+    whispered off their own ✅."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        async with st.txn() as data:
+            data["tasks"]["barn"] = {
+                "id": "barn", "guild_id": 1, "brief": "Sweep the barn",
+                "description": "Get the corners too.",
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+            data["tasks"]["gate"] = {
+                "id": "gate", "guild_id": 1, "brief": "Fix the gate", "description": None,
+                "bounty": True,
+                "recurring": False, "freq": "once", "interval_days": 0, "weekdays": [],
+                "monthdays": [], "time_of_day": None,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+
+        await bot.fire_task("barn", ch, cfg)
+        await bot.fire_task("gate", ch, cfg)
+        snap = await st.snapshot()
+        barn_mid = snap["tasks"]["barn"]["pending"]["message_ids"][0]
+        gate_mid = snap["tasks"]["gate"]["pending"]["message_ids"][0]
+        assert snap["tasks"]["barn"]["pending"]["ui"] == "buttons"
+        assert btn_ids(ch.msgs[barn_mid]) == [
+            "task:done:barn", "task:ffwd:barn", "task:info:barn", "task:skip:barn"]
+        assert btn_ids(ch.msgs[gate_mid]) == [
+            "task:done:gate", "task:ffwd:gate", "task:skip:gate"], "no ℹ️ without a description"
+        gate_skip = btn(ch.msgs[gate_mid], "task:skip:gate")
+        assert str(gate_skip.emoji) == m.EMOJI_DELETE, "a one-off's skip face is ❌"
+        assert gate_skip.label is None, "buttons are emoji-only"
+        assert str(btn(ch.msgs[barn_mid], "task:skip:barn").emoji) == m.EMOJI_SKIP
+
+        # ℹ️ whispers the description — no channel clutter.
+        posted_before = len(ch.msgs)
+        info = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[barn_mid])
+        await bot.handle_task_button("barn", "info", info)
+        assert info.response.ephemeral and "corners" in info.response.content
+        assert len(ch.msgs) == posted_before, "info is a whisper, not a post"
+
+        # The bounty's creator is whispered off their own ✅.
+        own = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch, message=ch.msgs[gate_mid])
+        await bot.handle_task_button("gate", "done", own)
+        assert own.response.ephemeral and "your" in own.response.content
+        assert (await st.snapshot())["tasks"]["gate"]["pending"] is not None
+        assert st.read_completions() == []
+
+        # ✅ Done completes: log written, and the status edit carries ↩️🔄👏.
+        press = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[barn_mid])
+        await bot.handle_task_button("barn", "done", press)
+        snap = await st.snapshot()
+        assert snap["tasks"]["barn"]["pending"] is None
+        recs = st.read_completions()
+        assert len(recs) == 1 and recs[0]["user_id"] == 42
+        assert "Completed by <@42>" in ch.msgs[barn_mid].content
+        assert btn_ids(ch.msgs[barn_mid]) == [
+            "post:undo:barn", "post:requeue:barn", "post:clap:barn"]
+        assert snap["undo"][str(barn_mid)]["ui"] == "buttons"
+
+        # A stale ✅ press on the resolved post refuses with a whisper.
+        stale = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[barn_mid])
+        await bot.handle_task_button("barn", "done", stale)
+        assert stale.response.ephemeral and "no longer live" in stale.response.content
+        assert len(st.read_completions()) == 1, "a stale press completes nothing"
+
+
+async def test_snooze_numpad() -> None:
+    """⏩ answers with a private ephemeral numpad: the unit toggle relabels it in
+    place, a digit snoozes (stamping the pressed post, which keeps its live
+    action row and gains ↩️), nothing is ever persisted for the numpad, and ↩️
+    then restores the post."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        tid = "milk"
+        async with st.txn() as data:
+            data["tasks"][tid] = {
+                "id": tid, "guild_id": 1, "brief": "Milk the cow", "description": None,
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+        await bot.fire_task(tid, ch, cfg)
+        mid = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][0]
+
+        posted_before = len(ch.msgs)
+        ffwd = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_task_button(tid, "ffwd", ffwd)
+        assert ffwd.response.ephemeral and "hours" in ffwd.response.content
+        pad = ffwd.response.view
+        assert pad is not None and len(ch.msgs) == posted_before, "the numpad is ephemeral"
+        assert (await st.snapshot())["snooze_panels"] == {}, "no persisted panel for buttons"
+
+        # Toggle to days: the same ephemeral is edited, digits keep their labels.
+        # The emoji-only toggle wears the unit it switches TO (📅 while on hours).
+        toggle = next(
+            i for i in pad.children
+            if str(getattr(i, "emoji", "")) == m.EMOJI_SNOOZE_DAYS
+        )
+        flip = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch)
+        await toggle.callback(flip)
+        assert "days" in flip.response.content and flip.response.view is pad
+
+        # Pick 3 (days): remind_at lands ~72h out, the post is stamped and keeps
+        # its live row plus a fresh ↩️, and the numpad edits to a confirmation.
+        three = next(i for i in pad.children if getattr(i, "label", None) == "3")
+        pick = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch)
+        await three.callback(pick)
+        snap = await st.snapshot()
+        p = snap["tasks"][tid]["pending"]
+        assert p["ffwd_count"] == 1
+        remind = m.from_iso(p["remind_at"])
+        assert 71.9 * 3600 < (remind - m.now_utc()).total_seconds() < 72.1 * 3600
+        assert "Snoozed 3 days by <@42>" in ch.msgs[mid].content
+        ids = btn_ids(ch.msgs[mid])
+        assert f"task:done:{tid}" in ids and f"post:undo:{tid}" in ids, \
+            "snoozed post stays actionable and gains ↩️"
+        assert pick.response.view is None and "Snoozed" in pick.response.content
+
+        # ↩️ restores the post to a live, unsnoozed occurrence.
+        undo = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_post_button("undo", undo)
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["pending"]["ffwd_count"] == 0, "snooze undone"
+        assert "Milk the cow" in ch.msgs[mid].content and "Snoozed" not in ch.msgs[mid].content
+        ids = btn_ids(ch.msgs[mid])
+        assert f"post:undo:{tid}" not in ids and f"task:done:{tid}" in ids
+
+
+async def test_post_buttons() -> None:
+    """On a completed post: 👏 tips every participant once per outsider (the
+    button label counts ×n), a participant's or repeat clap is whispered off,
+    and 🔄 re-fires the chore — the old post's row re-derives to just ↩️/👏."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        tid = "eggs"
+        async with st.txn() as data:
+            data["tasks"][tid] = {
+                "id": tid, "guild_id": 1, "brief": "Collect the eggs", "description": None,
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+        await bot.fire_task(tid, ch, cfg)
+        mid = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][0]
+        await bot.handle_task_button(tid, "done", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid]))
+
+        # An outsider claps: bonus logged, tally line + ×1 label in ONE edit.
+        clap = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_clap_button(clap)
+        claps = [r for r in st.read_completions() if r["kind"] == "clap"]
+        assert len(claps) == 1 and claps[0]["user_id"] == 42
+        assert "👏 ×1" in ch.msgs[mid].content
+        assert btn(ch.msgs[mid], f"post:clap:{tid}").label == "×1", "the 👏 label counts"
+
+        # A participant's own 👏 and a repeat 👏 are whispered off.
+        own = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_clap_button(own)
+        assert own.response.ephemeral and "your own" in own.response.content
+        again = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_clap_button(again)
+        assert again.response.ephemeral and "Once per person" in again.response.content
+        assert len([r for r in st.read_completions() if r["kind"] == "clap"]) == 1
+
+        # 🔄 re-fires right now; the old post's row re-derives to ↩️/👏 only.
+        rq = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_post_button("requeue", rq)
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["pending"] is not None, "a fresh occurrence is live"
+        assert snap["tasks"][tid]["pending"]["message_ids"][-1] != mid
+        ids = btn_ids(ch.msgs[mid])
+        assert f"post:requeue:{tid}" not in ids
+        assert f"post:undo:{tid}" in ids and f"post:clap:{tid}" in ids
+        assert any("Re-queued by <@7>" in (msg.content or "") for msg in ch.msgs.values())
+        markers = [r for r in st.read_completions() if r["kind"] == "requeue"]
+        assert len(markers) == 1 and markers[0]["user_id"] == 7
 
 
 async def test_listopen() -> None:
@@ -3136,6 +3386,9 @@ def main() -> None:
     asyncio.run(test_finalize_keeps_fun_reactions())
     asyncio.run(test_nag_tally())
     asyncio.run(test_shush())
+    asyncio.run(test_task_buttons())
+    asyncio.run(test_snooze_numpad())
+    asyncio.run(test_post_buttons())
     asyncio.run(test_listopen())
     asyncio.run(test_listtasks_pagination())
     asyncio.run(test_lifecycle_and_snooze())

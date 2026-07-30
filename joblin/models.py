@@ -54,6 +54,9 @@ pending dict schema (an occurrence that has fired and awaits action)
     "ffwd_count":   int,            # number of fast-forwards so far
     "channel_id":   int,
     "message_ids":  list[int],      # every message posted for this occurrence
+    "ui":           str,            # "buttons" on occurrences fired since the
+                                    #   button migration; absent on older ones,
+                                    #   whose posts self-reacted emoji instead.
 }
 """
 

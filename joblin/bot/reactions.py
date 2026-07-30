@@ -38,12 +38,17 @@ from .core import (
     store,
 )
 from .helpers import (
+    PostButton,
+    Press,
     _remove_user_reaction,
-    add_task_reactions,
+    _tidy_stale,
+    completed_view,
     config_ready,
     finalize_messages,
     guild_config,
+    make_task_view,
     post_content,
+    refresh_post_view,
     safe_delete,
 )
 from .claps import (
@@ -59,7 +64,10 @@ from .scheduler import fire_task
 
 
 # ---------------------------------------------------------------------------
-# Reactions
+# Reactions (the legacy entry way — posts made before the button migration
+# carry self-reacted emoji, and any manually-added emoji still routes here;
+# button presses arrive via handle_task_button / handle_post_button below and
+# meet in the same per-action handlers)
 # ---------------------------------------------------------------------------
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
@@ -77,19 +85,19 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     # message map, because a completed/skipped message has been de-registered
     # from "messages" — yet we still want its ↩️ button to work.
     if key == emoji_key(EMOJI_UNDO):
-        await _handle_undo(payload, channel)
+        await _handle_undo(Press.from_payload(payload, channel))
         return
 
     # Requeue (🔄) sits on a ✅-completed post, which — like an undone one — has
     # been de-registered from "messages", so it is keyed off its own table.
     if key == emoji_key(EMOJI_REQUEUE):
-        await _handle_requeue(payload, channel)
+        await _handle_requeue(Press.from_payload(payload, channel))
         return
 
     # Clap (👏) likewise lives on a ✅-completed (de-registered) post and is keyed
     # off its own table — a non-participant's tap tips the doer a bonus punto.
     if key == emoji_key(EMOJI_CLAP):
-        await _handle_clap(payload, channel)
+        await _handle_clap(Press.from_payload(payload, channel))
         return
 
     snap = await store.snapshot()
@@ -112,24 +120,18 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         return
 
     tz = ZoneInfo(cfg["timezone"])
-    reacted = channel.get_partial_message(payload.message_id)
-    member = payload.member
-    mention = member.mention if member else f"<@{payload.user_id}>"
-    display = member.display_name if member else str(payload.user_id)
+    press = Press.from_payload(payload, channel)
 
     if key == emoji_key(EMOJI_INFO):
-        await _handle_info(task, channel, reacted, payload)
+        await _handle_info(task, press)
     elif key == emoji_key(EMOJI_FFWD):
-        await _handle_ffwd(tid, task, channel, reacted, payload)
+        await _handle_ffwd(tid, task, press)
     elif key == emoji_key(EMOJI_DONE):
-        await _handle_done(tid, task, cfg, tz, channel, payload, mention, display)
+        await _handle_done(tid, task, cfg, tz, press)
     elif key in (emoji_key(EMOJI_SKIP), emoji_key(EMOJI_DELETE)):
-        await _handle_skip_or_delete(tid, task, tz, channel, mention)
+        await _handle_skip_or_delete(tid, task, tz, press)
     elif key in (emoji_key(EMOJI_SHUSH), emoji_key(EMOJI_UNSHUSH)):
-        await _handle_shush(
-            tid, task, channel, reacted, payload, mention,
-            shush=key == emoji_key(EMOJI_SHUSH),
-        )
+        await _handle_shush(tid, task, press, shush=key == emoji_key(EMOJI_SHUSH))
 
 
 @bot.event
@@ -152,28 +154,67 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
         await _handle_pitchin_unreact(payload, channel, game["id"])
 
 
+# ---------------------------------------------------------------------------
+# Buttons (the primary entry way — every post since the button migration)
+# ---------------------------------------------------------------------------
+async def handle_task_button(tid: str, action: str, interaction: discord.Interaction) -> None:
+    """Route a TaskButton press — the button-age twin of on_raw_reaction_add's
+    task branch, dispatching to the same per-action handlers."""
+    press = Press.from_interaction(interaction)
+    snap = await store.snapshot()
+    task = snap["tasks"].get(tid)
+    # The tid rides in the custom_id, so unlike a reaction the press doesn't
+    # prove the post is current — a button the bot failed to strip could
+    # otherwise poke a *newer* occurrence. Live posts are still registered in
+    # "messages"; anything else refuses politely.
+    if (not task or not task.get("pending")
+            or str(press.message_id) not in snap["messages"]):
+        await press.whisper("These buttons have gone stale — this post is no longer live.")
+        return
+    cfg = guild_config(snap, task["guild_id"])
+    if not config_ready(cfg):
+        return
+    tz = ZoneInfo(cfg["timezone"])
+    if action == "info":
+        await _handle_info(task, press)
+    elif action == "ffwd":
+        await _handle_ffwd(tid, task, press)
+    elif action == "done":
+        await _handle_done(tid, task, cfg, tz, press)
+    elif action == "skip":
+        await _handle_skip_or_delete(tid, task, tz, press)
+    elif action in ("shush", "unshush"):
+        await _handle_shush(tid, task, press, shush=action == "shush")
 
 
-async def _handle_info(task, channel, reacted, payload) -> None:
+async def handle_post_button(action: str, interaction: discord.Interaction) -> None:
+    """Route a resolved post's ↩️/🔄 PostButton press (👏 routes to claps.py)."""
+    press = Press.from_interaction(interaction)
+    if action == "undo":
+        await _handle_undo(press)
+    elif action == "requeue":
+        await _handle_requeue(press)
+
+
+async def _handle_info(task, press: Press) -> None:
     desc = task.get("description")
     if desc:
-        try:
-            await channel.send(
-                f"ℹ️ **{task['brief']}**\n{desc}",
-                reference=reacted,
-                allowed_mentions=NO_PINGS,
-            )
-        except discord.HTTPException:
-            pass
-    await _remove_user_reaction(reacted, payload)
+        await press.whisper(f"ℹ️ **{task['brief']}**\n{desc}")
+    elif press.interaction is not None:
+        await press.whisper("No extra details on this one.")
+    await press.retract()
 
 
-# --- Snooze "numpad" panel -------------------------------------------------
-# Tapping ⏩ posts a separate panel message that self-reacts with a number pad
-# plus an hours/days unit toggle, so the task post itself stays clean. Picking a
-# number snoozes the occurrence, edits the task post with the result + ↩️ undo,
-# and deletes the panel. The panel is keyed in store["snooze_panels"] so it
-# survives restarts.
+# --- Snooze "numpad" -------------------------------------------------------
+# Tapping the ⏩ button answers with an *ephemeral* numpad (SnoozeView below):
+# digit buttons plus an hours/days unit toggle, private to the snoozer and
+# deliberately not persisted — after a restart a dead numpad is just a fresh ⏩
+# tap away. Picking a number snoozes the occurrence and edits the task post
+# with the result + ↩️ undo.
+#
+# The ⏩ *reaction* (pre-button posts) instead opens the legacy public panel
+# message that self-reacts the same numpad, keyed in store["snooze_panels"] so
+# it survives restarts.
 SNOOZE_REACTIONS = (
     [DIGIT_EMOJI[n] for n in SNOOZE_CHOICES]
     + [EMOJI_SNOOZE_HOURS, EMOJI_SNOOZE_DAYS, EMOJI_DELETE]
@@ -206,19 +247,153 @@ async def _delete_panels(panels: list[tuple[int, Optional[int]]]) -> None:
             await safe_delete(ch.get_partial_message(mid))
 
 
-async def _handle_ffwd(tid, task, channel, reacted, payload) -> None:
+async def _apply_snooze(
+    tid: str, n: int, unit: str, *, panel_mid: Optional[int] = None
+) -> Optional[tuple[dict, dt.datetime, str]]:
+    """The snooze txn shared by the button numpad and the legacy reaction panel:
+    bump ffwd_count and push remind_at out. When ``panel_mid`` is given the
+    panel record is popped in the same txn, so two racing digit taps can't both
+    land. Returns (before-snapshot, new remind instant, human amount), or None
+    if the occurrence resolved (or the panel was spent) in the meantime."""
+    hours = n if unit == "hours" else n * 24
+    remind = None
+    async with store.txn() as data:
+        if panel_mid is not None and data["snooze_panels"].pop(str(panel_mid), None) is None:
+            return None  # a concurrent tap already took this panel
+        live = data["tasks"].get(tid)
+        p = live.get("pending") if live else None
+        if not p:
+            return None
+        before = json.loads(json.dumps(live))  # snapshot for undo
+        p["ffwd_count"] = p.get("ffwd_count", 0) + 1
+        remind = now_utc() + dt.timedelta(hours=hours)
+        p["remind_at"] = to_iso(remind)
+    amount = (f"{hours} hour{'' if hours == 1 else 's'}" if unit == "hours"
+              else f"{n} day{'' if n == 1 else 's'}")
+    return before, remind, amount
+
+
+async def _announce_snooze(
+    tid: str, before: dict, remind: dt.datetime, amount: str, mention: str,
+    anchor_id: int, channel: discord.abc.Messageable,
+) -> None:
+    """Stamp the anchor post with the snooze result — keeping its live action
+    row (the occurrence is still pending) plus a fresh ↩️ — and arm the undo."""
+    status = (
+        f"**{before['brief']}**\n"
+        f"⏩ Snoozed {amount} by {mention} — next reminder {discord_ts(remind, 'R')}"
+    )
+    await _arm_undo("snooze", tid, before, anchor_id, channel)
+    view = make_task_view(tid, before)
+    view.add_item(PostButton(tid, "undo"))
+    try:
+        await channel.get_partial_message(anchor_id).edit(
+            content=status, view=view, allowed_mentions=NO_PINGS
+        )
+    except discord.HTTPException:
+        pass
+
+
+class SnoozeView(discord.ui.View):
+    """The ⏩ numpad as an ephemeral button grid: a digit snoozes the pending
+    occurrence by that many hours/days, the toggle flips the unit, ❌ cancels.
+    Unlike the legacy reaction panel this is *not* persisted: the grid is
+    private to the snoozer and transient — after a restart it goes dead, and
+    ⏩ on the post summons a fresh one."""
+
+    def __init__(self, tid: str, brief: str, anchor_id: int, unit: str = "hours") -> None:
+        super().__init__(timeout=600)
+        self.tid = tid
+        self.brief = brief
+        self.anchor_id = anchor_id
+        self.unit = unit
+        self._build()
+
+    def content(self) -> str:
+        return f"💤 **Snooze {self.brief}** — pick a number of **{self.unit}**."
+
+    def _build(self) -> None:
+        self.clear_items()
+        for i, n in enumerate(SNOOZE_CHOICES):
+            digit = discord.ui.Button(
+                label=str(n), style=discord.ButtonStyle.primary, row=i // 4
+            )
+            digit.callback = self._picker(n)
+            self.add_item(digit)
+        # Emoji-only: 📅/⏱️ shows the unit a press switches TO (the current
+        # unit is bolded in the content line above), ❌ dismisses.
+        flip = "days" if self.unit == "hours" else "hours"
+        toggle = discord.ui.Button(
+            emoji=EMOJI_SNOOZE_DAYS if flip == "days" else EMOJI_SNOOZE_HOURS,
+            style=discord.ButtonStyle.secondary, row=1,
+        )
+        toggle.callback = self._toggle
+        self.add_item(toggle)
+        cancel = discord.ui.Button(
+            emoji=EMOJI_DELETE, style=discord.ButtonStyle.danger, row=1
+        )
+        cancel.callback = self._cancel
+        self.add_item(cancel)
+
+    def _picker(self, n: int):
+        async def pick(interaction: discord.Interaction) -> None:
+            unit = self.unit
+            self.stop()
+            applied = await _apply_snooze(self.tid, n, unit)
+            if applied is None:
+                await interaction.response.edit_message(
+                    content="↩️ Too late — that occurrence was already resolved.",
+                    view=None,
+                )
+                return
+            before, remind, amount = applied
+            await interaction.response.edit_message(
+                content=f"⏩ Snoozed **{self.brief}** {amount} — next reminder "
+                        f"{discord_ts(remind, 'R')}.",
+                view=None,
+            )
+            await _announce_snooze(
+                self.tid, before, remind, amount, interaction.user.mention,
+                self.anchor_id, interaction.channel,
+            )
+        return pick
+
+    async def _toggle(self, interaction: discord.Interaction) -> None:
+        self.unit = "days" if self.unit == "hours" else "hours"
+        self._build()
+        await interaction.response.edit_message(content=self.content(), view=self)
+
+    async def _cancel(self, interaction: discord.Interaction) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="💤 Snooze cancelled.", view=None)
+
+
+async def _handle_ffwd(tid, task, press: Press) -> None:
     snap = await store.snapshot()
     live = snap["tasks"].get(tid)
     if not live or not live.get("pending"):
-        await _remove_user_reaction(reacted, payload)
+        await press.retract()
+        if press.interaction is not None:
+            await press.whisper("Nothing to snooze — this occurrence has already been resolved.")
         return  # occurrence already resolved — nothing to snooze
+    if press.interaction is not None:
+        numpad = SnoozeView(tid, task["brief"], press.message_id)
+        try:
+            await press.interaction.response.send_message(
+                numpad.content(), view=numpad, ephemeral=True
+            )
+        except discord.HTTPException:
+            pass
+        return
+    # ⏩ reaction on a pre-button post: the legacy public, persisted panel.
+    channel = press.channel
     panel = await channel.send(
         snooze_panel_text(task["brief"], "hours"), allowed_mentions=NO_PINGS
     )
     async with store.txn() as data:
         data["snooze_panels"][str(panel.id)] = {
             "task_id": tid,
-            "anchor_id": payload.message_id,
+            "anchor_id": press.message_id,
             "unit": "hours",
             "brief": task["brief"],
             "channel_id": getattr(channel, "id", None),
@@ -228,7 +403,7 @@ async def _handle_ffwd(tid, task, channel, reacted, payload) -> None:
             await panel.add_reaction(emoji)
         except discord.HTTPException:
             pass
-    await _remove_user_reaction(reacted, payload)
+    await press.retract()
 
 
 async def _handle_snooze_panel(
@@ -266,48 +441,25 @@ async def _handle_snooze_panel(
         return  # an unrelated reaction on the panel
 
     unit = rec.get("unit", "hours")
-    hours = n if unit == "hours" else n * 24
     member = payload.member
     mention = member.mention if member else f"<@{payload.user_id}>"
     anchor_id = rec.get("anchor_id")
 
-    before = None
-    remind = None
-    async with store.txn() as data:
-        data["snooze_panels"].pop(str(payload.message_id), None)
-        live = data["tasks"].get(tid)
-        p = live.get("pending") if live else None
-        if p:
-            before = json.loads(json.dumps(live))  # snapshot for undo
-            p["ffwd_count"] = p.get("ffwd_count", 0) + 1
-            remind = now_utc() + dt.timedelta(hours=hours)
-            p["remind_at"] = to_iso(remind)
+    applied = await _apply_snooze(tid, n, unit, panel_mid=payload.message_id)
     await safe_delete(panel)
-    if before is None or remind is None:
+    if applied is None:
         return  # resolved between opening the panel and picking a number
-
-    amount = f"{hours} hour{'' if hours == 1 else 's'}" if unit == "hours" \
-        else f"{n} day{'' if n == 1 else 's'}"
-    status = (
-        f"**{brief}**\n"
-        f"⏩ Snoozed {amount} by {mention} — next reminder {discord_ts(remind, 'R')}"
-    )
     if anchor_id:
-        try:
-            await channel.get_partial_message(anchor_id).edit(
-                content=status, allowed_mentions=NO_PINGS
-            )
-        except discord.HTTPException:
-            pass
-        await _arm_undo("snooze", tid, before, anchor_id, channel)
+        before, remind, amount = applied
+        await _announce_snooze(tid, before, remind, amount, mention, anchor_id, channel)
 
 
-async def _handle_shush(tid, task, channel, reacted, payload, mention, *, shush: bool) -> None:
+async def _handle_shush(tid, task, press: Press, *, shush: bool) -> None:
     """🤫 sets the task's lifetime no-nag flag, 🔊 clears it: a shushed chore
     still fires on schedule, but the hourly reminders stop until someone taps
-    🔊 on a live post. Nag posts self-react 🤫 and a shushed chore's posts
-    self-react 🔊; either emoji added manually on any message of a live
-    occurrence routes here too. A tap that matches the current state (🤫 on an
+    🔊 on a live post. Nag posts carry the 🤫 button and a shushed chore's
+    posts carry 🔊 (either emoji added manually on a live pre-button post
+    routes here too). A tap that matches the current state (🤫 on an
     already-shushed chore, or vice versa) is a no-op."""
     changed = False
     async with store.txn() as data:
@@ -320,11 +472,33 @@ async def _handle_shush(tid, task, channel, reacted, payload, mention, *, shush:
                 # Un-shushing: remind_at is stale (often long past), so restart
                 # the hourly cadence fresh instead of nagging on the next tick.
                 p["remind_at"] = to_iso(now_utc() + dt.timedelta(hours=1))
-    await _remove_user_reaction(reacted, payload)
+    await press.retract()
     if not changed:
-        return  # task vanished under us, or already in the asked-for state
-    # Flip our button on the tapped post so it always shows the *next* action
-    # (🤫 to shush, 🔊 to un-shush) — the two directions never share a face.
+        # Task vanished under us, or already in the asked-for state.
+        if press.interaction is not None:
+            await press.whisper("Already sorted — this chore is in that state.")
+        return
+    # No separate confirmation post: stamp the tapped post itself with who
+    # flipped the switch, replacing any earlier stamp so repeated toggles on
+    # one post never stack up. The button/emoji face flips with it so the post
+    # always shows the *next* action — the two directions never share a face.
+    if shush:
+        line = f"{EMOJI_SHUSH} Shushed by {press.mention} — reminders off."
+    else:
+        line = f"{EMOJI_UNSHUSH} Un-shushed by {press.mention} — reminders back on."
+    stamps = (f"{EMOJI_SHUSH} Shushed by ", f"{EMOJI_UNSHUSH} Un-shushed by ")
+    if press.interaction is not None:
+        # One edit does it all: restamp the content and flip the action row
+        # (reminder=True keeps a shush face on the post in both directions).
+        content = press.interaction.message.content or ""
+        kept = [ln for ln in content.split("\n") if ln and not ln.startswith(stamps)]
+        await press.edit_pressed(
+            content="\n".join(kept + [line]),
+            view=make_task_view(tid, {**task, "no_nag": shush}, reminder=True),
+            allowed_mentions=NO_PINGS,
+        )
+        return
+    reacted = press.message
     old, new = (EMOJI_SHUSH, EMOJI_UNSHUSH) if shush else (EMOJI_UNSHUSH, EMOJI_SHUSH)
     if bot.user:
         try:
@@ -335,14 +509,6 @@ async def _handle_shush(tid, task, channel, reacted, payload, mention, *, shush:
         await reacted.add_reaction(new)
     except discord.HTTPException:
         pass
-    # No separate confirmation post: stamp the tapped post itself with who
-    # flipped the switch, replacing any earlier stamp so repeated toggles on
-    # one post never stack up.
-    if shush:
-        line = f"{EMOJI_SHUSH} Shushed by {mention} — reminders off."
-    else:
-        line = f"{EMOJI_UNSHUSH} Un-shushed by {mention} — reminders back on."
-    stamps = (f"{EMOJI_SHUSH} Shushed by ", f"{EMOJI_UNSHUSH} Un-shushed by ")
     try:
         content = (await reacted.fetch()).content or ""
         kept = [ln for ln in content.split("\n") if ln and not ln.startswith(stamps)]
@@ -351,34 +517,32 @@ async def _handle_shush(tid, task, channel, reacted, payload, mention, *, shush:
         pass
 
 
-async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -> None:
+async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
+    channel = press.channel
     # A bounty is a chore the creator has put up for *someone else*: it's worth
     # double, and they can't claim it themselves.
-    if task.get("bounty") and payload.user_id == task.get("created_by"):
-        reacted = channel.get_partial_message(payload.message_id)
-        await _remove_user_reaction(reacted, payload)
-        try:
-            await channel.send(
-                f"💰 {mention}, this is **your** bounty — someone else has to claim it "
-                "(it's worth 2 puntos!).",
-                reference=reacted,
-                allowed_mentions=NO_PINGS,
-            )
-        except discord.HTTPException:
-            pass
+    if task.get("bounty") and press.user_id == task.get("created_by"):
+        await press.retract()
+        await press.whisper(
+            f"💰 {press.mention}, this is **your** bounty — someone else has to claim it "
+            "(it's worth 2 puntos!)."
+        )
         return
 
+    await press.ack()
     completed = now_utc()
     record = None
     message_ids: list[int] = []
     before = None
     completion_id = None
+    legacy = True
     async with store.txn() as data:
         live = data["tasks"].get(tid)
         p = live.get("pending") if live else None
         if not p:
             return
         before = json.loads(json.dumps(live))  # snapshot for undo
+        legacy = p.get("ui") != "buttons"
         completion_id = new_id()
         due = from_iso(p["due_at"])
         message_ids = list(p["message_ids"])
@@ -392,8 +556,8 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
             "guild_id": task["guild_id"],
             "task_id": tid,
             "brief": task["brief"],
-            "user_id": payload.user_id,
-            "user_name": display,
+            "user_id": press.user_id,
+            "user_name": press.display,
             "kind": "recurring" if task["recurring"] else "once",
             "points": 2 if task.get("bounty") else 1,
             "due_at": p["due_at"],
@@ -411,30 +575,45 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
         bonus = " 💰 **+2 puntos**" if task.get("bounty") else ""
         status = (
             f"~~**{task['brief']}**~~\n"
-            f"✅ Completed by {mention}{bonus} • {discord_ts(completed, 't')}"
+            f"✅ Completed by {press.mention}{bonus} • {discord_ts(completed, 't')}"
         )
-        await finalize_messages(channel, message_ids, status)
         if message_ids:
-            await _arm_undo("done", tid, before, message_ids[-1], channel, completion_id=completion_id)
-            await _arm_requeue(tid, before, message_ids[-1], channel, task["guild_id"])
+            # Arm the table entries first, then land ↩️ 🔄 👏 in the one status
+            # edit — so a button can never be pressed before its record exists.
+            anchor = message_ids[-1]
+            tidy: set[int] = set()
+            await _arm_undo("done", tid, before, anchor, channel,
+                            completion_id=completion_id, tidy=tidy)
+            await _arm_requeue(tid, before, anchor, channel, task["guild_id"], tidy=tidy)
             # The doer is this occurrence's sole participant; anyone *else* can 👏
             # them a bonus punto on the finished post.
-            participants = [{"user_id": payload.user_id, "user_name": display}]
+            participants = [{"user_id": press.user_id, "user_name": press.display}]
             await _arm_clap(
-                tid, message_ids[-1], channel, task["guild_id"], task["brief"], status, participants
+                tid, anchor, channel, task["guild_id"], task["brief"], status,
+                participants, tidy=tidy,
             )
+            for mid in tidy:
+                await refresh_post_view(channel, mid)
+        await finalize_messages(
+            channel, message_ids, status, legacy=legacy,
+            view=completed_view(tid, undo=True, requeue=True, clap=True) if message_ids else None,
+        )
 
 
-async def _handle_skip_or_delete(tid, task, tz, channel, mention) -> None:
+async def _handle_skip_or_delete(tid, task, tz, press: Press) -> None:
+    channel = press.channel
+    await press.ack()
     message_ids: list[int] = []
     mode = None
     before = None
+    legacy = True
     async with store.txn() as data:
         live = data["tasks"].get(tid)
         p = live.get("pending") if live else None
         if not p:
             return
         before = json.loads(json.dumps(live))  # snapshot for undo
+        legacy = p.get("ui") != "buttons"
         message_ids = list(p["message_ids"])
         for mid in message_ids:
             data["messages"].pop(str(mid), None)
@@ -450,14 +629,17 @@ async def _handle_skip_or_delete(tid, task, tz, channel, mention) -> None:
 
     await _delete_panels(panels)
     if mode == "skip":
-        status = f"**{task['brief']}**\n⏭️ Skipped this time by {mention} — back next cycle."
+        status = f"**{task['brief']}**\n⏭️ Skipped this time by {press.mention} — back next cycle."
     elif mode == "delete":
-        status = f"~~**{task['brief']}**~~\n❌ Cancelled by {mention}."
+        status = f"~~**{task['brief']}**~~\n❌ Cancelled by {press.mention}."
     else:
         return
-    await finalize_messages(channel, message_ids, status)
     if message_ids:
         await _arm_undo(mode, tid, before, message_ids[-1], channel)
+    await finalize_messages(
+        channel, message_ids, status, legacy=legacy,
+        view=completed_view(tid, undo=True) if message_ids else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -494,102 +676,102 @@ async def _arm_undo(
     channel: discord.abc.Messageable,
     *,
     completion_id: Optional[str] = None,
+    tidy: Optional[set] = None,
 ) -> None:
-    """Record how to reverse the action just taken and add the ↩️ button to the
-    message that shows its result. Only the most recent action per task is kept
-    undoable, so older ↩️ buttons for this task are retired."""
+    """Record how to reverse the action just taken; the ↩️ button itself lands
+    with the caller's status edit. Only the most recent action per task is kept
+    undoable, so older ↩️ buttons for this task are retired (via ``tidy`` — see
+    _tidy_stale)."""
     if before is None:
         return
-    stale: list[int] = []
+    stale: list[tuple[int, bool]] = []
     async with store.txn() as data:
         for mid, rec in list(data["undo"].items()):
             if rec.get("task_id") == tid and str(mid) != str(anchor_id):
                 data["undo"].pop(mid, None)
-                stale.append(int(mid))
+                stale.append((int(mid), rec.get("ui") == "buttons"))
         data["undo"][str(anchor_id)] = {
             "action": action,
             "task_id": tid,
             "before": before,
             "completion_id": completion_id,
             "channel_id": getattr(channel, "id", None),
+            "ui": "buttons",
         }
-    try:
-        await channel.get_partial_message(anchor_id).add_reaction(EMOJI_UNDO)
-    except discord.HTTPException:
-        pass
-    if bot.user:  # tidy now-dead ↩️ buttons left on this task's older messages
-        for mid in stale:
-            try:
-                await channel.get_partial_message(mid).remove_reaction(EMOJI_UNDO, bot.user)
-            except discord.HTTPException:
-                pass
+    await _tidy_stale(channel, stale, EMOJI_UNDO, tidy)
 
 
 async def _restore_anchor(
-    channel: discord.abc.Messageable, msg_id: int, task: dict
+    channel: discord.abc.Messageable, msg_id: int, tid: str, task: dict,
+    *, legacy_record: bool = False,
 ) -> None:
     """Bring the resolved message back to a live, actionable post: restore the
-    brief, drop the ↩️ button, and re-add the ✅/⏩/(ℹ️)/❌ reactions."""
+    brief and the live action row (dropping ↩️/🔄/👏). A pre-button anchor also
+    gets its old reaction UI swept — its other posts' reactions still work, so
+    losing the emoji row here costs nothing."""
     pm = channel.get_partial_message(msg_id)
     try:
-        await pm.edit(content=post_content(task, reminder=False, cfg={}), allowed_mentions=NO_PINGS)
-    except discord.HTTPException:
-        pass
-    try:
-        await pm.clear_reactions()  # needs Manage Messages; best effort
-    except discord.HTTPException:
-        pass
-    if bot.user:  # ensure our ↩️/🔄/👏 are gone even without Manage Messages
-        for emoji in (EMOJI_UNDO, EMOJI_REQUEUE, EMOJI_CLAP):
-            try:
-                await pm.remove_reaction(emoji, bot.user)
-            except discord.HTTPException:
-                pass
-    try:
-        await add_task_reactions(pm, task)
-    except discord.HTTPException:
-        pass
-
-
-async def _disarm_undo_button(channel: discord.abc.Messageable, msg_id: int) -> None:
-    """A refused undo: remove the dead ↩️ and say (quietly) why nothing happened."""
-    pm = channel.get_partial_message(msg_id)
-    if bot.user:
-        try:
-            await pm.remove_reaction(EMOJI_UNDO, bot.user)
-        except discord.HTTPException:
-            pass
-    try:
-        await channel.send(
-            "↩️ Too late to undo — this chore has already moved on.",
-            reference=pm,
+        await pm.edit(
+            content=post_content(task, reminder=False, cfg={}),
+            view=make_task_view(tid, task),
             allowed_mentions=NO_PINGS,
         )
     except discord.HTTPException:
         pass
+    if legacy_record or (task.get("pending") or {}).get("ui") != "buttons":
+        try:
+            await pm.clear_reactions()  # needs Manage Messages; best effort
+        except discord.HTTPException:
+            pass
+        if bot.user:  # ensure our ↩️/🔄/👏 are gone even without Manage Messages
+            for emoji in (EMOJI_UNDO, EMOJI_REQUEUE, EMOJI_CLAP):
+                try:
+                    await pm.remove_reaction(emoji, bot.user)
+                except discord.HTTPException:
+                    pass
 
 
-async def _handle_undo(
-    payload: discord.RawReactionActionEvent, channel: discord.abc.Messageable
-) -> None:
+async def _disarm_undo_button(press: Press, legacy_record: bool) -> None:
+    """A refused undo: retire the dead ↩️ and say (quietly) why nothing happened."""
+    if legacy_record:
+        if bot.user:
+            try:
+                await press.message.remove_reaction(EMOJI_UNDO, bot.user)
+            except discord.HTTPException:
+                pass
+    else:
+        # The undo record was popped, so re-deriving drops just the ↩️ (any
+        # armed 🔄/👏 stay).
+        await refresh_post_view(press.channel, press.message_id)
+    await press.whisper("↩️ Too late to undo — this chore has already moved on.")
+
+
+async def _handle_undo(press: Press) -> None:
+    channel = press.channel
     snap = await store.snapshot()
-    if str(payload.message_id) not in snap["undo"]:
+    if str(press.message_id) not in snap["undo"]:
+        if press.interaction is not None:
+            await press.whisper("Nothing left to undo here.")
         return  # fast path: a ↩️ on something we don't track — ignore
+    await press.ack()
 
     # Everything authoritative is read from inside the txn so a concurrent
     # re-arm (e.g. a second snooze on this message) can't make us act on stale
     # snapshot data.
     outcome = None  # "ok" | "refused"
     action = before = completion_id = None
+    tid = None
+    legacy_record = False
     clap_log_ids: list[str] = []
     async with store.txn() as data:
-        rec = data["undo"].get(str(payload.message_id))
+        rec = data["undo"].get(str(press.message_id))
         if not rec:
             return  # a concurrent ↩️ beat us to it
         action = rec["action"]
         before = rec["before"]
         completion_id = rec.get("completion_id")
         tid = rec["task_id"]
+        legacy_record = rec.get("ui") != "buttons"
         if can_undo(action, before, data["tasks"].get(tid)):
             data["tasks"][tid] = json.loads(json.dumps(before))
             pending = before.get("pending") or {}
@@ -598,14 +780,14 @@ async def _handle_undo(
             outcome = "ok"
         else:
             outcome = "refused"
-        data["undo"].pop(str(payload.message_id), None)
+        data["undo"].pop(str(press.message_id), None)
         # Undoing a ✅ turns its post back into a live occurrence, so the 🔄
         # requeue and 👏 claps we armed on that same post no longer apply. Any
         # bonus puntos the claps already paid are retracted below — but only when
         # the undo actually takes (a refused ↩️ leaves the completion, and its
         # claps, standing).
-        data["requeue"].pop(str(payload.message_id), None)
-        clap = data["claps"].pop(str(payload.message_id), None)
+        data["requeue"].pop(str(press.message_id), None)
+        clap = data["claps"].pop(str(press.message_id), None)
         if clap:
             clap_log_ids = list(clap.get("log_ids", []))
 
@@ -614,9 +796,10 @@ async def _handle_undo(
             await store.void_completion(completion_id)
         for lid in clap_log_ids:  # retract every bonus punto the claps awarded
             await store.void_completion(lid)
-        await _restore_anchor(channel, payload.message_id, before)
+        await _restore_anchor(channel, press.message_id, tid, before,
+                              legacy_record=legacy_record)
     elif outcome == "refused":
-        await _disarm_undo_button(channel, payload.message_id)
+        await _disarm_undo_button(press, legacy_record)
 
 
 # ---------------------------------------------------------------------------
@@ -641,53 +824,48 @@ async def _arm_requeue(
     anchor_id: int,
     channel: discord.abc.Messageable,
     guild_id: int,
+    *,
+    tidy: Optional[set] = None,
 ) -> None:
-    """Add the 🔄 button to a just-completed post and remember how to re-fire the
-    task from it, retiring any 🔄 left on this task's older completed posts."""
+    """Remember how to re-fire the task from a just-completed post (the 🔄
+    button itself lands with the caller's status edit), retiring any 🔄 left on
+    this task's older completed posts (via ``tidy`` — see _tidy_stale)."""
     if before is None:
         return
-    stale: list[int] = []
+    stale: list[tuple[int, bool]] = []
     async with store.txn() as data:
         for mid, rec in list(data["requeue"].items()):
             if rec.get("task_id") == tid and str(mid) != str(anchor_id):
                 data["requeue"].pop(mid, None)
-                stale.append(int(mid))
+                stale.append((int(mid), rec.get("ui") == "buttons"))
         data["requeue"][str(anchor_id)] = {
             "task_id": tid,
             "before": before,  # lets a completed one-off be recreated and re-run
             "guild_id": guild_id,
             "channel_id": getattr(channel, "id", None),
+            "ui": "buttons",
         }
-    try:
-        await channel.get_partial_message(anchor_id).add_reaction(EMOJI_REQUEUE)
-    except discord.HTTPException:
-        pass
-    if bot.user:  # tidy now-dead 🔄 buttons left on this task's older posts
-        for mid in stale:
-            try:
-                await channel.get_partial_message(mid).remove_reaction(EMOJI_REQUEUE, bot.user)
-            except discord.HTTPException:
-                pass
+    await _tidy_stale(channel, stale, EMOJI_REQUEUE, tidy)
 
 
-async def _handle_requeue(
-    payload: discord.RawReactionActionEvent, channel: discord.abc.Messageable
-) -> None:
+async def _handle_requeue(press: Press) -> None:
+    channel = press.channel
     snap = await store.snapshot()
-    if str(payload.message_id) not in snap["requeue"]:
+    if str(press.message_id) not in snap["requeue"]:
+        if press.interaction is not None:
+            await press.whisper("This post's 🔄 has been retired.")
         return  # a 🔄 on something we don't track — ignore
-
-    member = payload.member
-    mention = member.mention if member else f"<@{payload.user_id}>"
-    display = member.display_name if member else str(payload.user_id)
+    await press.ack()
 
     outcome = None  # "fired" | "busy" | "gone"
     tid = cfg = brief = None
+    legacy_record = False
     async with store.txn() as data:
-        rec = data["requeue"].get(str(payload.message_id))
+        rec = data["requeue"].get(str(press.message_id))
         if not rec:
             return  # a concurrent 🔄 beat us to it
         tid = rec["task_id"]
+        legacy_record = rec.get("ui") != "buttons"
         cfg = guild_config(snap, rec["guild_id"])
         if not config_ready(cfg):
             return
@@ -712,9 +890,9 @@ async def _handle_requeue(
         if outcome == "fired":
             # This completed post is spent; the fresh occurrence carries its own
             # buttons. Drop the record so a second tap can't double-fire.
-            data["requeue"].pop(str(payload.message_id), None)
+            data["requeue"].pop(str(press.message_id), None)
 
-    pm = channel.get_partial_message(payload.message_id)
+    pm = press.message
     if outcome == "fired":
         # The tap itself is on the record: a zero-punto marker row, outside the
         # txn (log_completion takes the same lock). Scoring skips these rows
@@ -728,23 +906,26 @@ async def _handle_requeue(
             "guild_id": rec["guild_id"],
             "task_id": tid,
             "brief": brief,
-            "user_id": payload.user_id,
-            "user_name": display,
+            "user_id": press.user_id,
+            "user_name": press.display,
             "kind": "requeue",
             "points": 0,
         })
         await fire_task(tid, channel, cfg)
         # Tidy the spent 🔄 off the old completed post (both ours and theirs) and
         # confirm right where they tapped — the fresh post may be far down.
-        await _remove_user_reaction(pm, payload)
-        if bot.user:
-            try:
-                await pm.remove_reaction(EMOJI_REQUEUE, bot.user)
-            except discord.HTTPException:
-                pass
+        await press.retract()
+        if legacy_record:
+            if bot.user:
+                try:
+                    await pm.remove_reaction(EMOJI_REQUEUE, bot.user)
+                except discord.HTTPException:
+                    pass
+        else:
+            await refresh_post_view(channel, press.message_id)
         try:
             await channel.send(
-                f"🔄 Re-queued by {mention} — posted it again below.",
+                f"🔄 Re-queued by {press.mention} — posted it again below.",
                 reference=pm,
                 allowed_mentions=NO_PINGS,
             )
@@ -752,26 +933,29 @@ async def _handle_requeue(
             pass
     elif outcome == "busy":
         # Leave the button so they can requeue once the live one is resolved.
-        await _remove_user_reaction(pm, payload)
-        try:
-            await channel.send(
-                f"🔄 {mention}, that chore is already queued — finish the active "
-                "reminder above first.",
-                reference=pm,
-                allowed_mentions=NO_PINGS,
-            )
-        except discord.HTTPException:
-            pass
+        await press.retract()
+        await press.whisper(
+            f"🔄 {press.mention}, that chore is already queued — finish the active "
+            "reminder above first."
+        )
     else:  # gone
-        if bot.user:
-            try:
-                await pm.remove_reaction(EMOJI_REQUEUE, bot.user)
-            except discord.HTTPException:
-                pass
+        if legacy_record:
+            if bot.user:
+                try:
+                    await pm.remove_reaction(EMOJI_REQUEUE, bot.user)
+                except discord.HTTPException:
+                    pass
+        else:
+            await refresh_post_view(channel, press.message_id)
+        if press.interaction is not None:
+            await press.whisper("Nothing left to re-run here.")
 
 
 __all__ = [
     "SNOOZE_REACTIONS",
+    "SnoozeView",
+    "_announce_snooze",
+    "_apply_snooze",
     "_arm_requeue",
     "_arm_undo",
     "_delete_panels",
@@ -787,6 +971,8 @@ __all__ = [
     "_restore_anchor",
     "_take_task_panels",
     "can_undo",
+    "handle_post_button",
+    "handle_task_button",
     "on_raw_reaction_add",
     "on_raw_reaction_remove",
     "snooze_panel_text",

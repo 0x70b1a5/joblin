@@ -69,7 +69,7 @@ async def fire_task(tid: str, channel: discord.abc.Messageable, cfg: dict) -> No
     if now_utc() < from_iso(task["next_due"]):
         return
 
-    message = await post_occurrence(channel, task, cfg, reminder=False)
+    message = await post_occurrence(channel, tid, task, cfg, reminder=False)
 
     orphan = False
     async with store.txn() as data:
@@ -84,6 +84,7 @@ async def fire_task(tid: str, channel: discord.abc.Messageable, cfg: dict) -> No
                 "ffwd_count": 0,
                 "channel_id": getattr(channel, "id", None),
                 "message_ids": [message.id],
+                "ui": "buttons",  # posts carry views, not self-reactions
             }
             live["next_due"] = None
             data["messages"][str(message.id)] = tid
@@ -98,7 +99,7 @@ async def send_reminder(tid: str, channel: discord.abc.Messageable, cfg: dict) -
     if not pending or task.get("no_nag") or now_utc() < from_iso(pending["remind_at"]):
         return  # nothing pending, shushed (🤫), or not yet time
 
-    message = await post_occurrence(channel, task, cfg, reminder=True)
+    message = await post_occurrence(channel, tid, task, cfg, reminder=True)
 
     orphan = False
     async with store.txn() as data:

@@ -505,7 +505,9 @@ async def delete_game(guild_id: int, kind: str, eid: str) -> Optional[dict]:
                    if removed.get("channel_id") else None)
         if channel is not None:
             await _cancel_game_message(
-                channel, removed["brief"], live_mid, is_doemup=(kind == "doemup"))
+                channel, removed["brief"], live_mid,
+                sweep_reactions=(kind == "pitchin"
+                                 and removed.get("ui") != "buttons"))
     return removed
 
 

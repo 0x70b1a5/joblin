@@ -59,14 +59,16 @@ class JoblinBot(commands.Bot):
     async def setup_hook(self) -> None:
         # Local imports avoid an import cycle (these modules import `bot`).
         from .scheduler import scheduler
-        from .games import DoEmUpButton
+        from .games import DoEmUpButton, PitchinButton
+        from .helpers import PostButton, TaskButton
         from ..web import start_web
         scheduler.start()
         # The web UI shares this event loop; it's a no-op unless configured
         # and never raises (a web failure must not take the bot down).
         await start_web()
-        # Revive every do-em-up's buttons after a restart in one shot.
-        self.add_dynamic_items(DoEmUpButton)
+        # Revive every post's buttons after a restart in one shot (task posts,
+        # resolved posts' ↩️/🔄/👏, pitch-ins, do-em-ups).
+        self.add_dynamic_items(DoEmUpButton, PitchinButton, TaskButton, PostButton)
         dev_guild = os.getenv("DEV_GUILD_ID")
         if dev_guild:
             guild = discord.Object(id=int(dev_guild))

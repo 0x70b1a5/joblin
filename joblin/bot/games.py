@@ -44,9 +44,9 @@ from .claps import _arm_game_clap
 # Pitch-ins and do-em-ups  (ad-hoc punto events; see models.py for the schemas)
 # ---------------------------------------------------------------------------
 # Both are posted immediately by their slash command into the configured farm
-# channel, resolve by people reacting (pitch-in ✅) or clicking buttons (do-em-up
-# ➕/➖), and close at an expiry/deadline, a punto cap, or the creator's manual
-# end. Closing awards puntos to the same completion log as chores (with a
+# channel, resolve by people clicking their buttons (pitch-in ✅ toggle,
+# do-em-up ➕/➖), and close at an expiry/deadline, a punto cap, or the creator's
+# manual end. Closing awards puntos to the same completion log as chores (with a
 # ``points`` field), so one /leaderboard totals chores and games alike. The
 # ``ended`` flag is flipped inside the same txn that pops the row, so an
 # expiry-tick and a manual end racing each other can only award once.
@@ -110,14 +110,10 @@ def _game_recurrence_fields(
 
 
 async def _send_pitchin(channel: discord.abc.Messageable, p: dict) -> discord.Message:
-    """Post a pitch-in's live body and self-react ✅ (pitch in) + 🏁 (end)."""
-    msg = await channel.send(render_pitchin(p), allowed_mentions=NO_PINGS)
-    try:
-        await msg.add_reaction(EMOJI_DONE)
-        await msg.add_reaction(EMOJI_END)
-    except discord.HTTPException:
-        pass
-    return msg
+    """Post a pitch-in's live body with its ✅ Pitch in! / 🏁 End buttons."""
+    return await channel.send(
+        render_pitchin(p), view=make_pitchin_view(p["id"]), allowed_mentions=NO_PINGS
+    )
 
 
 async def _send_doemup(channel: discord.abc.Messageable, d: dict) -> discord.Message:
@@ -164,14 +160,17 @@ async def finalize_pitchin(pid: str, channel: discord.abc.Messageable) -> bool:
     if nxt is not None:
         body += f"\n🔁 Next round {discord_ts(nxt, 'R')}."
     pm = channel.get_partial_message(event["message_id"])
+    if event.get("ui") != "buttons":
+        # A round posted before the button migration self-reacted ✅/🏁 — sweep
+        # ours (a member's fun reaction — a 😄, a 🎉 — stays).
+        await _clear_bot_reactions(pm, (EMOJI_DONE, EMOJI_END))
+    # One edit closes the round: the result line replaces the live body, and the
+    # 👏 button (armed first, so it can't be pressed recordless) replaces ✅/🏁.
+    view = await _arm_game_clap(event, "pitchin", body, channel)
     try:
-        await pm.edit(content=body, allowed_mentions=NO_PINGS)
+        await pm.edit(content=body, view=view, allowed_mentions=NO_PINGS)
     except discord.HTTPException:
         pass
-    # Take down only our ✅/🏁 buttons — a member's fun reaction (a 😄, a 🎉) stays.
-    await _clear_bot_reactions(pm, (EMOJI_DONE, EMOJI_END))
-    # Our buttons are gone, so add the 👏 (which _arm_clap does) afterwards.
-    await _arm_game_clap(event, "pitchin", body, channel)
     return True
 
 
@@ -204,13 +203,14 @@ async def finalize_doemup(did: str, channel: discord.abc.Messageable) -> bool:
     body = render_doemup(event, final=True)
     if nxt is not None:
         body += f"\n🔁 Next round {discord_ts(nxt, 'R')}."
+    # One edit closes the round: ➕/➖/End give way to the 👏 (or nothing).
+    view = await _arm_game_clap(event, "doemup", body, channel)
     try:
         await channel.get_partial_message(event["message_id"]).edit(
-            content=body, view=None, allowed_mentions=NO_PINGS
+            content=body, view=view, allowed_mentions=NO_PINGS
         )
     except discord.HTTPException:
         pass
-    await _arm_game_clap(event, "doemup", body, channel)
     return True
 
 
@@ -233,7 +233,7 @@ async def repost_pitchin(pid: str, channel: discord.abc.Messageable) -> None:
         if not p or p.get("ended") or p.get("message_id") or not p.get("next_due"):
             orphan = True  # something raced us
         else:
-            p.update({"message_id": msg.id, "scorers": [],
+            p.update({"message_id": msg.id, "scorers": [], "ui": "buttons",
                       "expires_at": to_iso(exp), "next_due": None})
             data["game_messages"][str(msg.id)] = {"kind": "pitchin", "id": pid}
     if orphan:
@@ -282,7 +282,7 @@ async def post_pitchin(
         "message_id": None, "brief": brief, "description": description,
         "created_by": creator_id, "created_at": to_iso(now),
         "points_each": points_each, "max_scorers": max_scorers,
-        "expires_at": expires_at, "scorers": [], "ended": False,
+        "expires_at": expires_at, "scorers": [], "ended": False, "ui": "buttons",
         **_game_recurrence_fields(recurrence, duration_secs),
     }
     msg = await _send_pitchin(channel, p)
@@ -369,10 +369,106 @@ async def schedule_doemup(
     return did
 
 
+class PitchinButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"pitchin:(?P<action>join|end):(?P<pid>[\w-]+)",
+):
+    """A persistent ✅ Pitch in! / 🏁 End button on a live pitch-in post — the
+    button-age successor of the self-reacted ✅/🏁. ✅ is a *toggle*: pressing
+    again backs you out before the round closes (the reaction era did that via
+    un-reacting). Revived on startup via ``add_dynamic_items``."""
+
+    def __init__(self, pid: str, action: str) -> None:
+        self.pid = pid
+        self.action = action
+        # Emoji-only — the post body is the legend ("Tap ✅ … creator: 🏁").
+        if action == "join":
+            button = discord.ui.Button(
+                emoji=EMOJI_DONE, style=discord.ButtonStyle.success,
+                custom_id=f"pitchin:join:{pid}",
+            )
+        else:
+            button = discord.ui.Button(
+                emoji=EMOJI_END, style=discord.ButtonStyle.danger,
+                custom_id=f"pitchin:end:{pid}",
+            )
+        super().__init__(button)
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):  # noqa: ANN001
+        return cls(match["pid"], match["action"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await handle_pitchin_button(self.pid, self.action, interaction)
+
+
+def make_pitchin_view(pid: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(PitchinButton(pid, "join"))
+    view.add_item(PitchinButton(pid, "end"))
+    return view
+
+
+async def handle_pitchin_button(
+    pid: str, action: str, interaction: discord.Interaction
+) -> None:
+    """A ✅ toggle (pitch in / back out) or a creator's 🏁 on a pitch-in post.
+    The message-id check refuses a stale button from an already-rolled round."""
+    user = interaction.user
+    if action == "end":
+        snap = await store.snapshot()
+        p = snap["pitchins"].get(pid)
+        if not p or p.get("ended") or p.get("message_id") != interaction.message.id:
+            await interaction.response.send_message(
+                "That pitch-in round has already closed.", ephemeral=True
+            )
+            return
+        if user.id != p["created_by"]:
+            await interaction.response.send_message(
+                "Only the person who called this pitch-in can end it.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()  # finalize edits the post itself
+        await finalize_pitchin(pid, interaction.channel)
+        return
+
+    body = None
+    do_finalize = gone = False
+    async with store.txn() as data:
+        p = data["pitchins"].get(pid)
+        if not p or p.get("ended") or p.get("message_id") != interaction.message.id:
+            gone = True
+        elif any(s["user_id"] == user.id for s in p.get("scorers", [])):
+            pitchin_remove(p, user.id)  # toggle off — back out before the close
+            body = render_pitchin(p)
+        else:
+            res = pitchin_add(p, user.id, user.display_name)
+            if res["changed"]:
+                if res["full"]:
+                    do_finalize = True  # cap reached — close it now
+                else:
+                    body = render_pitchin(p)
+            else:
+                gone = True  # couldn't join (e.g. already at cap) — treat as stale
+    if gone:
+        await interaction.response.send_message(
+            "That pitch-in round has already closed.", ephemeral=True
+        )
+    elif do_finalize:
+        await interaction.response.defer()  # finalize edits the post itself
+        await finalize_pitchin(pid, interaction.channel)
+    else:
+        await interaction.response.edit_message(
+            content=body, view=make_pitchin_view(pid)
+        )
+
+
 async def _handle_pitchin_reaction(
     payload: discord.RawReactionActionEvent, channel: discord.abc.Messageable, pid: str
 ) -> None:
-    """A ✅ (pitch in) or 🏁 (creator: end now) on a pitch-in post."""
+    """A ✅ (pitch in) or 🏁 (creator: end now) reacted onto a pitch-in post —
+    the legacy entry way for rounds posted before the button migration (and any
+    manually-added emoji since)."""
     key = emoji_key(payload.emoji)
     reacted = channel.get_partial_message(payload.message_id)
 
@@ -485,20 +581,19 @@ class DoEmUpButton(
     custom_id, so a single ``add_dynamic_items`` registration on startup revives
     every do-em-up's buttons after a restart with no per-message bookkeeping."""
 
-    LABELS = {"plus": "➕", "minus": "➖", "end": f"{EMOJI_END} End"}
-    STYLES = {
-        "plus": discord.ButtonStyle.success,
-        "minus": discord.ButtonStyle.secondary,
-        "end": discord.ButtonStyle.danger,
+    FACES = {  # action -> (emoji, style); emoji-only, like every other row
+        "plus": ("➕", discord.ButtonStyle.success),
+        "minus": ("➖", discord.ButtonStyle.secondary),
+        "end": (EMOJI_END, discord.ButtonStyle.danger),
     }
 
     def __init__(self, did: str, action: str) -> None:
         self.did = did
         self.action = action
+        emoji, style = self.FACES[action]
         super().__init__(
             discord.ui.Button(
-                label=self.LABELS[action],
-                style=self.STYLES[action],
+                emoji=emoji, style=style,
                 custom_id=f"doemup:{action}:{did}",
             )
         )
@@ -558,6 +653,7 @@ async def sweep_games(now: dt.datetime, snap: dict) -> None:
 
 __all__ = [
     "DoEmUpButton",
+    "PitchinButton",
     "_doemup_press",
     "_game_next_round",
     "_game_record",
@@ -570,7 +666,9 @@ __all__ = [
     "finalize_pitchin",
     "game_records",
     "handle_doemup_button",
+    "handle_pitchin_button",
     "make_doemup_view",
+    "make_pitchin_view",
     "post_doemup",
     "post_pitchin",
     "repost_doemup",
