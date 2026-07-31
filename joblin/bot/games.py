@@ -31,6 +31,7 @@ from .core import (
     store,
 )
 from .helpers import (
+    Press,
     _clear_bot_reactions,
     _game_tz,
     _remove_user_reaction,
@@ -414,22 +415,19 @@ async def handle_pitchin_button(
 ) -> None:
     """A ✅ toggle (pitch in / back out) or a creator's 🏁 on a pitch-in post.
     The message-id check refuses a stale button from an already-rolled round."""
+    press = Press.from_interaction(interaction)
+    await press.ack()  # first act: beat the 3s deadline; replies follow up
     user = interaction.user
     if action == "end":
         snap = await store.snapshot()
         p = snap["pitchins"].get(pid)
         if not p or p.get("ended") or p.get("message_id") != interaction.message.id:
-            await interaction.response.send_message(
-                "That pitch-in round has already closed.", ephemeral=True
-            )
+            await press.whisper("That pitch-in round has already closed.")
             return
         if user.id != p["created_by"]:
-            await interaction.response.send_message(
-                "Only the person who called this pitch-in can end it.", ephemeral=True
-            )
+            await press.whisper("Only the person who called this pitch-in can end it.")
             return
-        await interaction.response.defer()  # finalize edits the post itself
-        await finalize_pitchin(pid, interaction.channel)
+        await finalize_pitchin(pid, interaction.channel)  # edits the post itself
         return
 
     body = None
@@ -451,16 +449,11 @@ async def handle_pitchin_button(
             else:
                 gone = True  # couldn't join (e.g. already at cap) — treat as stale
     if gone:
-        await interaction.response.send_message(
-            "That pitch-in round has already closed.", ephemeral=True
-        )
+        await press.whisper("That pitch-in round has already closed.")
     elif do_finalize:
-        await interaction.response.defer()  # finalize edits the post itself
-        await finalize_pitchin(pid, interaction.channel)
+        await finalize_pitchin(pid, interaction.channel)  # edits the post itself
     else:
-        await interaction.response.edit_message(
-            content=body, view=make_pitchin_view(pid)
-        )
+        await press.edit_pressed(content=body, view=make_pitchin_view(pid))
 
 
 async def _handle_pitchin_reaction(
@@ -554,23 +547,20 @@ async def _doemup_press(did: str, action: str, user_id: int, user_name: str) -> 
 async def handle_doemup_button(
     did: str, action: str, interaction: discord.Interaction
 ) -> None:
+    press = Press.from_interaction(interaction)
+    await press.ack()  # first act: beat the 3s deadline; replies follow up
     res = await _doemup_press(did, action, interaction.user.id, interaction.user.display_name)
     status = res["status"]
     if status == "gone":
-        await interaction.response.send_message(
-            "That do-em-up has already closed.", ephemeral=True
-        )
+        await press.whisper("That do-em-up has already closed.")
     elif status == "error":
-        await interaction.response.send_message(
-            "Only the person who started this do-em-up can end it.", ephemeral=True
-        )
+        await press.whisper("Only the person who started this do-em-up can end it.")
     elif status == "final":
-        await interaction.response.defer()  # finalize edits the post itself
         # End and hitting the point_limit both just close this round; a recurring
         # do-em-up rolls on to its next slot (stop the series with /deletetask).
-        await finalize_doemup(did, interaction.channel)
+        await finalize_doemup(did, interaction.channel)  # edits the post itself
     else:  # changed — update the live tally in place
-        await interaction.response.edit_message(content=res["body"], view=make_doemup_view(did))
+        await press.edit_pressed(content=res["body"], view=make_doemup_view(did))
 
 
 class DoEmUpButton(

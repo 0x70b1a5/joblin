@@ -178,7 +178,9 @@ async def _arm_game_clap(
 
 
 async def handle_clap_button(interaction: discord.Interaction) -> None:
-    await _handle_clap(Press.from_interaction(interaction))
+    press = Press.from_interaction(interaction)
+    await press.ack()  # first act: beat the 3s deadline; replies follow up
+    await _handle_clap(press)
 
 
 async def _handle_clap(press: Press) -> None:

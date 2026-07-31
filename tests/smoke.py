@@ -555,10 +555,10 @@ class FakeResponse:
 
 class FakeFollowup:
     def __init__(self) -> None:
-        self.sent = []  # (content, ephemeral) pairs
+        self.sent = []  # {"content", "ephemeral", "view"} records
 
-    async def send(self, content=None, *, ephemeral=False, **kw) -> None:
-        self.sent.append((content, ephemeral))
+    async def send(self, content=None, *, ephemeral=False, view=None, **kw) -> None:
+        self.sent.append({"content": content, "ephemeral": ephemeral, "view": view})
 
 
 class FakeInteraction:
@@ -569,6 +569,11 @@ class FakeInteraction:
         self.message = message
         self.response = FakeResponse(message)
         self.followup = FakeFollowup()
+
+    async def edit_original_response(self, content=None, *, view=None, **kw) -> None:
+        # Edits what this interaction already sent/deferred — for a component
+        # press that's the pressed (possibly ephemeral) message itself.
+        await self.response.edit_message(content=content, view=view)
 
 
 def btn_ids(msg) -> list:
@@ -583,6 +588,20 @@ def btn(msg, custom_id):
     for item in view.children if view else ():
         if item.custom_id == custom_id:
             return getattr(item, "item", item)  # unwrap a DynamicItem
+    return None
+
+
+def whispered(inter):
+    """The private note a button handler sent the presser — a followup under
+    the ack-first rule, or the interaction response itself for anything that
+    answered directly — as a {"content", "ephemeral", "view"} record (None if
+    the press got no reply at all)."""
+    if inter.followup.sent:
+        return inter.followup.sent[-1]
+    if inter.response.content is not None:
+        return {"content": inter.response.content,
+                "ephemeral": inter.response.ephemeral,
+                "view": inter.response.view}
     return None
 
 
@@ -638,7 +657,7 @@ async def test_pitchin_lifecycle() -> None:
         # A non-creator 🏁 must NOT close it (refused with a whisper).
         refused = await press(42, "Pat", action="end")
         assert pid in (await st.snapshot())["pitchins"], "only the creator ends a pitch-in"
-        assert refused.response.ephemeral, "the refusal is whispered, not public"
+        assert whispered(refused)["ephemeral"], "the refusal is whispered, not public"
 
         # The creator 🏁 closes it: Pat earns 1 punto, the post is finalized.
         await press(1, "Boss", action="end")
@@ -709,14 +728,14 @@ async def test_doemup_lifecycle() -> None:
         mid = msg.id
 
         async def press(action, uid, name):
-            inter = FakeInteraction(user=FakeUser(uid, name), channel=ch)
+            inter = FakeInteraction(
+                user=FakeUser(uid, name), channel=ch, message=ch.msgs[mid])
             await bot.handle_doemup_button(did, action, inter)
             return inter
 
-        last = None
         for _ in range(5):
-            last = await press("plus", 42, "Pat")
-        assert "Pat ×5" in last.response.content  # live tally rode the interaction
+            await press("plus", 42, "Pat")
+        assert "Pat ×5" in ch.msgs[mid].content  # live tally lands on the post
         for _ in range(3):
             await press("plus", 7, "Bo")
         await press("minus", 7, "Bo")  # Bo fixes one -> 2
@@ -726,7 +745,7 @@ async def test_doemup_lifecycle() -> None:
 
         # Non-creator End is refused; the do-em-up stays open.
         inter = await press("end", 42, "Pat")
-        assert "Only the person" in inter.response.content
+        assert "Only the person" in whispered(inter)["content"]
         assert did in (await st.snapshot())["doemups"]
 
         # Creator End closes it and awards 5 + 2.
@@ -759,7 +778,8 @@ async def test_doemup_limit_and_deadline() -> None:
         )
         for _ in range(3):
             await bot.handle_doemup_button(
-                did, "plus", FakeInteraction(user=FakeUser(42, "Pat"), channel=ch)
+                did, "plus", FakeInteraction(user=FakeUser(42, "Pat"), channel=ch,
+                                             message=ch.msgs[msg.id])
             )
         assert did not in (await st.snapshot())["doemups"], "hits the cap -> closes"
         assert {r["user_id"]: r["points"] for r in st.read_completions()} == {42: 3}
@@ -771,7 +791,8 @@ async def test_doemup_limit_and_deadline() -> None:
             point_limit=None, now=now,
         )
         await bot.handle_doemup_button(
-            did2, "plus", FakeInteraction(user=FakeUser(7, "Bo"), channel=ch)
+            did2, "plus", FakeInteraction(user=FakeUser(7, "Bo"), channel=ch,
+                                          message=ch.msgs[msg2.id])
         )
         await bot.sweep_games(m.now_utc(), await st.snapshot())
         assert did2 not in (await st.snapshot())["doemups"]
@@ -929,8 +950,11 @@ async def test_doemup_recurring() -> None:
         mid = msg.id
 
         async def press(action, uid, name):
+            # The button rides whichever post is the round's current one.
+            cur = (await st.snapshot())["doemups"][did]["message_id"]
             await bot.handle_doemup_button(
-                did, action, FakeInteraction(user=FakeUser(uid, name), channel=ch)
+                did, action, FakeInteraction(user=FakeUser(uid, name), channel=ch,
+                                             message=ch.msgs[cur])
             )
 
         await press("plus", 42, "Pat")
@@ -1041,7 +1065,8 @@ async def test_doemup_recurring_limit_rolls_on() -> None:
         )
         for _ in range(3):  # the 3rd ➕ hits the cap
             await bot.handle_doemup_button(
-                did, "plus", FakeInteraction(user=FakeUser(42, "Pat"), channel=ch)
+                did, "plus", FakeInteraction(user=FakeUser(42, "Pat"), channel=ch,
+                                             message=ch.msgs[msg.id])
             )
         snap = await st.snapshot()
         assert did in snap["doemups"], "a capped round does NOT end a recurring series"
@@ -1076,7 +1101,8 @@ async def test_delete_live_game() -> None:
             ch, guild_id=1, creator_id=1, brief="Weeds", description=None,
             points_each=1, deadline=None, point_limit=None, now=now,
         )
-        await bot.handle_doemup_button(did, "plus", FakeInteraction(user=FakeUser(7, "Bo"), channel=ch))
+        await bot.handle_doemup_button(did, "plus", FakeInteraction(
+            user=FakeUser(7, "Bo"), channel=ch, message=ch.msgs[dmsg.id]))
         inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
         await bot.deletetask.callback(inter, did)
         snap = await st.snapshot()
@@ -1568,7 +1594,8 @@ async def test_game_claps() -> None:
 
         async def press(action, uid, name):
             await bot.handle_doemup_button(
-                did, action, FakeInteraction(user=FakeUser(uid, name), channel=ch)
+                did, action, FakeInteraction(user=FakeUser(uid, name), channel=ch,
+                                             message=ch.msgs[dmid])
             )
 
         for _ in range(3):
@@ -2084,7 +2111,7 @@ async def test_shush() -> None:
         snap = await st.snapshot()
         assert snap["tasks"][tid]["no_nag"] is True, "🤫 never un-shushes"
         assert len(ch.msgs) == posted_before, "a same-direction press posts nothing"
-        assert stale.response.ephemeral, "the refusal is whispered, not public"
+        assert whispered(stale)["ephemeral"], "the refusal is whispered, not public"
         async with st.txn() as data:
             data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
         posted_before = len(ch.msgs)
@@ -2196,13 +2223,15 @@ async def test_task_buttons() -> None:
         posted_before = len(ch.msgs)
         info = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[barn_mid])
         await bot.handle_task_button("barn", "info", info)
-        assert info.response.ephemeral and "corners" in info.response.content
+        w = whispered(info)
+        assert w["ephemeral"] and "corners" in w["content"]
         assert len(ch.msgs) == posted_before, "info is a whisper, not a post"
 
         # The bounty's creator is whispered off their own ✅.
         own = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch, message=ch.msgs[gate_mid])
         await bot.handle_task_button("gate", "done", own)
-        assert own.response.ephemeral and "your" in own.response.content
+        w = whispered(own)
+        assert w["ephemeral"] and "your" in w["content"]
         assert (await st.snapshot())["tasks"]["gate"]["pending"] is not None
         assert st.read_completions() == []
 
@@ -2221,8 +2250,45 @@ async def test_task_buttons() -> None:
         # A stale ✅ press on the resolved post refuses with a whisper.
         stale = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[barn_mid])
         await bot.handle_task_button("barn", "done", stale)
-        assert stale.response.ephemeral and "no longer live" in stale.response.content
+        w = whispered(stale)
+        assert w["ephemeral"] and "no longer live" in w["content"]
         assert len(st.read_completions()) == 1, "a stale press completes nothing"
+
+
+async def test_done_race_whisper() -> None:
+    """Two ✅ racing for one chore: the loser's handler passed the stale-press
+    guard on a pre-completion snapshot, but the txn finds the occurrence gone —
+    they're told so (ephemerally) instead of getting dead air, and nothing is
+    completed twice."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        tid = "race"
+        async with st.txn() as data:
+            data["tasks"][tid] = {
+                "id": tid, "guild_id": 1, "brief": "Feed the pigs", "description": None,
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": now.astimezone(tz).strftime("%H:%M"),
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+        await bot.fire_task(tid, ch, cfg)
+        stale_task = (await st.snapshot())["tasks"][tid]  # Sam's world-view
+        mid = stale_task["pending"]["message_ids"][0]
+
+        # Pat's ✅ lands first, the ordinary way.
+        await bot.handle_task_button(tid, "done", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid]))
+        assert len(st.read_completions()) == 1
+
+        # Sam's concurrent ✅ reaches the shared handler with the old snapshot.
+        sam = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid])
+        await bot._handle_done(tid, stale_task, cfg, tz, bot.Press.from_interaction(sam))
+        assert len(st.read_completions()) == 1, "the raced press completes nothing"
+        w = whispered(sam)
+        assert w["ephemeral"] and "beat you" in w["content"]
 
 
 async def test_snooze_numpad() -> None:
@@ -2251,8 +2317,9 @@ async def test_snooze_numpad() -> None:
         posted_before = len(ch.msgs)
         ffwd = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
         await bot.handle_task_button(tid, "ffwd", ffwd)
-        assert ffwd.response.ephemeral and "hours" in ffwd.response.content
-        pad = ffwd.response.view
+        w = whispered(ffwd)
+        assert w["ephemeral"] and "hours" in w["content"]
+        pad = w["view"]
         assert pad is not None and len(ch.msgs) == posted_before, "the numpad is ephemeral"
         assert (await st.snapshot())["snooze_panels"] == {}, "no persisted panel for buttons"
 
@@ -2327,10 +2394,12 @@ async def test_post_buttons() -> None:
         # A participant's own 👏 and a repeat 👏 are whispered off.
         own = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
         await bot.handle_clap_button(own)
-        assert own.response.ephemeral and "your own" in own.response.content
+        w = whispered(own)
+        assert w["ephemeral"] and "your own" in w["content"]
         again = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid])
         await bot.handle_clap_button(again)
-        assert again.response.ephemeral and "Once per person" in again.response.content
+        w = whispered(again)
+        assert w["ephemeral"] and "Once per person" in w["content"]
         assert len([r for r in st.read_completions() if r["kind"] == "clap"]) == 1
 
         # 🔄 re-fires right now; the old post's row re-derives to ↩️/👏 only.
@@ -3551,7 +3620,8 @@ async def test_puntobomb_explodes() -> None:
 
         late = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
         await bot.handle_task_button("boom1", "done", late)
-        assert late.response.ephemeral and "Too late" in late.response.content
+        w = whispered(late)
+        assert w["ephemeral"] and "Too late" in w["content"]
         assert len(st.read_completions()) == 3, "a late ✅ defuses nothing"
 
         assert await bot.explode_puntobomb("boom1", ch, cfg)
@@ -3760,7 +3830,8 @@ async def test_list_lifecycle() -> None:
 
         # Sam can't untick Pat's item; Pat can (and then re-ticks it).
         other = await tick(7, "Sam", 0)
-        assert other.response.ephemeral and "already ticked" in other.response.content
+        w = whispered(other)
+        assert w["ephemeral"] and "already ticked" in w["content"]
         assert (await st.snapshot())["tasks"][tid]["pending"]["ticks"]["0"]["user_id"] == 42
         await tick(42, "Pat", 0)
         assert "0" not in (await st.snapshot())["tasks"][tid]["pending"]["ticks"]
@@ -3881,6 +3952,7 @@ def main() -> None:
     asyncio.run(test_nag_tally())
     asyncio.run(test_shush())
     asyncio.run(test_task_buttons())
+    asyncio.run(test_done_race_whisper())
     test_parse_items()
     test_list_view_layout()
     asyncio.run(test_list_lifecycle())

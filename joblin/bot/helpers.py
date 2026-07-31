@@ -31,6 +31,7 @@ from ..models import (
 from .core import (
     NO_PINGS,
     bot,
+    log,
     store,
 )
 
@@ -106,9 +107,16 @@ class Press:
     Only the verbs that differ live here: ``retract`` pulls the clicker's emoji
     back off (a no-op for buttons, which leave nothing behind), ``whisper``
     sends a just-for-you note (ephemeral for buttons, a channel reply for
-    reactions), ``ack`` answers a button press inside Discord's 3s deadline
-    before slow work, and ``edit_pressed`` restyles the pressed message (riding
-    the free interaction response when one is still open)."""
+    reactions), ``ack`` answers a button press inside Discord's 3s deadline,
+    and ``edit_pressed`` restyles the pressed message.
+
+    Every *button* entry point calls ``ack()`` as its first act — before any
+    store or Discord work — because the 3s deadline is unforgiving when the
+    gateway hiccups: the free interaction response is spent on the ack, and
+    every visible reply then goes out as a followup or a plain message edit.
+    A response that still fails is logged, never swallowed silently — a dead
+    interaction (error 10062) is the fingerprint of a press that reached us
+    too late, and that must be visible in the log."""
 
     def __init__(
         self, *, user_id: int, mention: str, display: str, message_id: int,
@@ -158,25 +166,29 @@ class Press:
         if self.interaction is not None and not self.interaction.response.is_done():
             try:
                 await self.interaction.response.defer()
-            except discord.HTTPException:
-                pass
+            except discord.HTTPException as e:
+                hint = (" — the press arrived >3s late (gateway lag or a replay)"
+                        if getattr(e, "code", None) == 10062 else "")
+                log.warning("press ack failed on message %s (user %s): %s%s",
+                            self.message_id, self.user_id, e, hint)
 
     async def retract(self) -> None:
         if self.payload is not None:
             await _remove_user_reaction(self.message, self.payload)
 
-    async def whisper(self, text: str) -> None:
+    async def whisper(self, text: str, **kw) -> None:
         try:
             if self.interaction is None:
                 await self.channel.send(
-                    text, reference=self.message, allowed_mentions=NO_PINGS
+                    text, reference=self.message, allowed_mentions=NO_PINGS, **kw
                 )
             elif self.interaction.response.is_done():
-                await self.interaction.followup.send(text, ephemeral=True)
+                await self.interaction.followup.send(text, ephemeral=True, **kw)
             else:
-                await self.interaction.response.send_message(text, ephemeral=True)
-        except discord.HTTPException:
-            pass
+                await self.interaction.response.send_message(text, ephemeral=True, **kw)
+        except discord.HTTPException as e:
+            log.warning("whisper failed on message %s (user %s): %s",
+                        self.message_id, self.user_id, e)
 
     async def edit_pressed(self, **kw) -> None:
         try:
@@ -184,8 +196,8 @@ class Press:
                 await self.interaction.response.edit_message(**kw)
             else:
                 await self.message.edit(**kw)
-        except discord.HTTPException:
-            pass
+        except discord.HTTPException as e:
+            log.warning("press edit failed on message %s: %s", self.message_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -378,8 +390,8 @@ async def refresh_post_view(channel: discord.abc.Messageable, mid: int) -> None:
     snap = await store.snapshot()
     try:
         await channel.get_partial_message(mid).edit(view=post_view_for(snap, mid))
-    except discord.HTTPException:
-        pass
+    except discord.HTTPException as e:
+        log.warning("post view refresh failed on message %s: %s", mid, e)
 
 
 async def _tidy_stale(
@@ -438,8 +450,8 @@ async def rerender_live_post(task: dict) -> None:
             view=make_task_view(task["id"], task),
             allowed_mentions=NO_PINGS,
         )
-    except discord.HTTPException:
-        pass
+    except discord.HTTPException as e:
+        log.warning("live post re-render failed for task %s: %s", task.get("id"), e)
 
 
 async def safe_delete(message: Optional[discord.Message]) -> None:
@@ -502,8 +514,9 @@ async def finalize_messages(
     last = channel.get_partial_message(message_ids[-1])
     try:
         await last.edit(content=status, view=view, allowed_mentions=NO_PINGS)
-    except discord.HTTPException:
-        pass
+    except discord.HTTPException as e:
+        # The resolution happened but the post won't show it — worth a trace.
+        log.warning("status edit failed on message %s: %s", message_ids[-1], e)
     for mid in message_ids:
         pm = channel.get_partial_message(mid)
         if legacy:

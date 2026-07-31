@@ -38,6 +38,7 @@ from ..models import (
 from .core import (
     NO_PINGS,
     bot,
+    log,
     store,
 )
 from .helpers import (
@@ -164,6 +165,7 @@ async def handle_task_button(tid: str, action: str, interaction: discord.Interac
     """Route a TaskButton press — the button-age twin of on_raw_reaction_add's
     task branch, dispatching to the same per-action handlers."""
     press = Press.from_interaction(interaction)
+    await press.ack()  # first act: beat the 3s deadline; replies follow up
     snap = await store.snapshot()
     task = snap["tasks"].get(tid)
     # The tid rides in the custom_id, so unlike a reaction the press doesn't
@@ -176,6 +178,7 @@ async def handle_task_button(tid: str, action: str, interaction: discord.Interac
         return
     cfg = guild_config(snap, task["guild_id"])
     if not config_ready(cfg):
+        await press.whisper("Joblin isn't configured for this server yet — run /joblinconfig first.")
         return
     tz = ZoneInfo(cfg["timezone"])
     if action == "info":
@@ -197,6 +200,7 @@ async def handle_list_button(tid: str, idx: int, interaction: discord.Interactio
     punto. A part-done tick costs exactly one API call: the free interaction
     response re-renders just the pressed post's buttons."""
     press = Press.from_interaction(interaction)
+    await press.ack()  # first act: beat the 3s deadline; replies follow up
     snap = await store.snapshot()
     task = snap["tasks"].get(tid)
     # Same stale-press guard as handle_task_button: the custom_id proves the
@@ -207,6 +211,7 @@ async def handle_list_button(tid: str, idx: int, interaction: discord.Interactio
         return
     cfg = guild_config(snap, task["guild_id"])
     if not config_ready(cfg):
+        await press.whisper("Joblin isn't configured for this server yet — run /joblinconfig first.")
         return
 
     outcome = None  # "ticked" | "unticked" | "complete" | "taken" | "stale"
@@ -256,6 +261,7 @@ async def handle_list_button(tid: str, idx: int, interaction: discord.Interactio
 async def handle_post_button(action: str, interaction: discord.Interaction) -> None:
     """Route a resolved post's ↩️/🔄 PostButton press (👏 routes to claps.py)."""
     press = Press.from_interaction(interaction)
+    await press.ack()  # first act: beat the 3s deadline; replies follow up
     if action == "undo":
         await _handle_undo(press)
     elif action == "requeue":
@@ -362,8 +368,8 @@ async def _announce_snooze(
         await channel.get_partial_message(anchor_id).edit(
             content=status, view=view, allowed_mentions=NO_PINGS
         )
-    except discord.HTTPException:
-        pass
+    except discord.HTTPException as e:
+        log.warning("snooze stamp failed on message %s: %s", anchor_id, e)
 
 
 class SnoozeView(discord.ui.View):
@@ -411,19 +417,28 @@ class SnoozeView(discord.ui.View):
         async def pick(interaction: discord.Interaction) -> None:
             unit = self.unit
             self.stop()
+            # Ack the digit before the store work (the txn fsyncs); the numpad
+            # is ephemeral, so the confirmation edit must ride the interaction's
+            # webhook (@original) — a channel edit can't reach it.
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException as e:
+                log.warning("snooze pick ack failed (user %s): %s",
+                            interaction.user.id, e)
             applied = await _apply_snooze(self.tid, n, unit)
             if applied is None:
-                await interaction.response.edit_message(
-                    content="↩️ Too late — that occurrence was already resolved.",
-                    view=None,
-                )
+                confirm = "↩️ Too late — that occurrence was already resolved."
+            else:
+                before, remind, amount = applied
+                confirm = (f"⏩ Snoozed **{self.brief}** {amount} — next reminder "
+                           f"{discord_ts(remind, 'R')}.")
+            try:
+                await interaction.edit_original_response(content=confirm, view=None)
+            except discord.HTTPException as e:
+                log.warning("snooze confirm edit failed (user %s): %s",
+                            interaction.user.id, e)
+            if applied is None:
                 return
-            before, remind, amount = applied
-            await interaction.response.edit_message(
-                content=f"⏩ Snoozed **{self.brief}** {amount} — next reminder "
-                        f"{discord_ts(remind, 'R')}.",
-                view=None,
-            )
             await _announce_snooze(
                 self.tid, before, remind, amount, interaction.user.mention,
                 self.anchor_id, interaction.channel,
@@ -450,12 +465,7 @@ async def _handle_ffwd(tid, task, press: Press) -> None:
         return  # occurrence already resolved — nothing to snooze
     if press.interaction is not None:
         numpad = SnoozeView(tid, task["brief"], press.message_id)
-        try:
-            await press.interaction.response.send_message(
-                numpad.content(), view=numpad, ephemeral=True
-            )
-        except discord.HTTPException:
-            pass
+        await press.whisper(numpad.content(), view=numpad)
         return
     # ⏩ reaction on a pre-button post: the legacy public, persisted panel.
     channel = press.channel
@@ -616,61 +626,71 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
     doers: list[dict] = []
     items: list = []
     legacy = True
+    raced = False
     async with store.txn() as data:
         live = data["tasks"].get(tid)
         p = live.get("pending") if live else None
         if not p:
-            return
-        before = json.loads(json.dumps(live))  # snapshot for undo
-        legacy = p.get("ui") != "buttons"
-        due = from_iso(p["due_at"])
-        message_ids = list(p["message_ids"])
-        for mid in message_ids:
-            data["messages"].pop(str(mid), None)
-        panels = _take_task_panels(data, tid)
-        items = live.get("items") or []
-        if items:
-            # A ✅ on a part-done 🧾 list means "the rest is done too" — the
-            # unticked remainder is swept as the presser's. Every distinct
-            # ticker is a doer and earns their own punto (never a bounty, so
-            # no doubling; a solo doer is the plain 1-chore-1-punto case).
-            ticks = p.setdefault("ticks", {})
-            for i in range(len(items)):
-                ticks.setdefault(str(i), {"user_id": press.user_id,
-                                          "user_name": press.display})
-            seen: set = set()
-            for i in range(len(items)):
-                t = ticks[str(i)]
-                if t["user_id"] not in seen:
-                    seen.add(t["user_id"])
-                    doers.append({"user_id": t["user_id"], "user_name": t["user_name"]})
+            raced = True  # resolved between our snapshot and this txn
         else:
-            doers = [{"user_id": press.user_id, "user_name": press.display}]
-        # A 🧾 row's kind can't carry once-vs-recurring like a plain chore's
-        # does, so it says so explicitly (the once/recurring badge tally reads it).
-        extra = {"recurring": bool(task["recurring"])} if items else {}
-        records = [{
-            "id": new_id(),  # lets an undo void exactly these log entries
-            "ts": to_iso(completed),
-            "month": completed.astimezone(tz).strftime("%Y-%m"),  # local-tz bucket
-            "guild_id": task["guild_id"],
-            "task_id": tid,
-            "brief": task["brief"],
-            "user_id": d["user_id"],
-            "user_name": d["user_name"],
-            "kind": ("puntobomb" if task.get("puntobomb")
-                     else "list" if items
-                     else "recurring" if task["recurring"] else "once"),
-            "points": 2 if task.get("bounty") else 1,  # a defusal is the plain 1
-            "due_at": p["due_at"],
-            "late_seconds": max(0, int((completed - due).total_seconds())),
-            **extra,
-        } for d in doers]
-        if live["recurring"]:
-            live["pending"] = None
-            live["next_due"] = to_iso(next_due(recurrence_of(live), tz, due, completed))
-        else:
-            data["tasks"].pop(tid, None)
+            before = json.loads(json.dumps(live))  # snapshot for undo
+            legacy = p.get("ui") != "buttons"
+            due = from_iso(p["due_at"])
+            message_ids = list(p["message_ids"])
+            for mid in message_ids:
+                data["messages"].pop(str(mid), None)
+            panels = _take_task_panels(data, tid)
+            items = live.get("items") or []
+            if items:
+                # A ✅ on a part-done 🧾 list means "the rest is done too" — the
+                # unticked remainder is swept as the presser's. Every distinct
+                # ticker is a doer and earns their own punto (never a bounty, so
+                # no doubling; a solo doer is the plain 1-chore-1-punto case).
+                ticks = p.setdefault("ticks", {})
+                for i in range(len(items)):
+                    ticks.setdefault(str(i), {"user_id": press.user_id,
+                                              "user_name": press.display})
+                seen: set = set()
+                for i in range(len(items)):
+                    t = ticks[str(i)]
+                    if t["user_id"] not in seen:
+                        seen.add(t["user_id"])
+                        doers.append({"user_id": t["user_id"], "user_name": t["user_name"]})
+            else:
+                doers = [{"user_id": press.user_id, "user_name": press.display}]
+            # A 🧾 row's kind can't carry once-vs-recurring like a plain chore's
+            # does, so it says so explicitly (the once/recurring badge tally reads it).
+            extra = {"recurring": bool(task["recurring"])} if items else {}
+            records = [{
+                "id": new_id(),  # lets an undo void exactly these log entries
+                "ts": to_iso(completed),
+                "month": completed.astimezone(tz).strftime("%Y-%m"),  # local-tz bucket
+                "guild_id": task["guild_id"],
+                "task_id": tid,
+                "brief": task["brief"],
+                "user_id": d["user_id"],
+                "user_name": d["user_name"],
+                "kind": ("puntobomb" if task.get("puntobomb")
+                         else "list" if items
+                         else "recurring" if task["recurring"] else "once"),
+                "points": 2 if task.get("bounty") else 1,  # a defusal is the plain 1
+                "due_at": p["due_at"],
+                "late_seconds": max(0, int((completed - due).total_seconds())),
+                **extra,
+            } for d in doers]
+            if live["recurring"]:
+                live["pending"] = None
+                live["next_due"] = to_iso(next_due(recurrence_of(live), tz, due, completed))
+            else:
+                data["tasks"].pop(tid, None)
+
+    if raced:
+        # Two people going for the same chore — the loser deserves a word, not
+        # dead air (the winner's status edit is already landing on the post).
+        # A racing legacy *reaction* stays silent, as it always has.
+        if press.interaction is not None:
+            await press.whisper("Already sorted — someone beat you to this one.")
+        return
 
     if records:
         for record in records:
@@ -747,22 +767,28 @@ async def _handle_skip_or_delete(tid, task, tz, press: Press) -> None:
         live = data["tasks"].get(tid)
         p = live.get("pending") if live else None
         if not p:
-            return
-        before = json.loads(json.dumps(live))  # snapshot for undo
-        legacy = p.get("ui") != "buttons"
-        message_ids = list(p["message_ids"])
-        for mid in message_ids:
-            data["messages"].pop(str(mid), None)
-        panels = _take_task_panels(data, tid)
-        if live["recurring"]:
-            due = from_iso(p["due_at"])
-            live["pending"] = None
-            live["next_due"] = to_iso(next_due(recurrence_of(live), tz, due, now_utc()))
-            mode = "skip"
+            mode = "raced"  # resolved between our snapshot and this txn
         else:
-            data["tasks"].pop(tid, None)
-            mode = "delete"
+            before = json.loads(json.dumps(live))  # snapshot for undo
+            legacy = p.get("ui") != "buttons"
+            message_ids = list(p["message_ids"])
+            for mid in message_ids:
+                data["messages"].pop(str(mid), None)
+            panels = _take_task_panels(data, tid)
+            if live["recurring"]:
+                due = from_iso(p["due_at"])
+                live["pending"] = None
+                live["next_due"] = to_iso(next_due(recurrence_of(live), tz, due, now_utc()))
+                mode = "skip"
+            else:
+                data["tasks"].pop(tid, None)
+                mode = "delete"
 
+    if mode == "raced":
+        # Same courtesy as a raced ✅: the press landed, the chore had moved on.
+        if press.interaction is not None:
+            await press.whisper("Already sorted — someone beat you to this one.")
+        return
     if mode == "skip":
         status = f"**{task['brief']}**\n⏭️ Skipped this time by {press.mention} — back next cycle."
     elif mode == "delete":
@@ -889,8 +915,8 @@ async def _restore_anchor(
             view=make_task_view(tid, task),
             allowed_mentions=NO_PINGS,
         )
-    except discord.HTTPException:
-        pass
+    except discord.HTTPException as e:
+        log.warning("undo restore edit failed on message %s: %s", msg_id, e)
     if legacy_record or (task.get("pending") or {}).get("ui") != "buttons":
         try:
             await pm.clear_reactions()  # needs Manage Messages; best effort
@@ -939,35 +965,39 @@ async def _handle_undo(press: Press) -> None:
     clap_log_ids: list[str] = []
     async with store.txn() as data:
         rec = data["undo"].get(str(press.message_id))
-        if not rec:
-            return  # a concurrent ↩️ beat us to it
-        action = rec["action"]
-        before = rec["before"]
-        # Newer records carry the list; pre-list ones a single completion_id.
-        completion_ids = list(rec.get("completion_ids") or [])
-        if rec.get("completion_id"):
-            completion_ids.append(rec["completion_id"])
-        tid = rec["task_id"]
-        legacy_record = rec.get("ui") != "buttons"
-        if can_undo(action, before, data["tasks"].get(tid)):
-            data["tasks"][tid] = json.loads(json.dumps(before))
-            pending = before.get("pending") or {}
-            for mid in pending.get("message_ids", []):
-                data["messages"][str(mid)] = tid
-            outcome = "ok"
-        else:
-            outcome = "refused"
-        data["undo"].pop(str(press.message_id), None)
-        # Undoing a ✅ turns its post back into a live occurrence, so the 🔄
-        # requeue and 👏 claps we armed on that same post no longer apply. Any
-        # bonus puntos the claps already paid are retracted below — but only when
-        # the undo actually takes (a refused ↩️ leaves the completion, and its
-        # claps, standing).
-        data["requeue"].pop(str(press.message_id), None)
-        clap = data["claps"].pop(str(press.message_id), None)
-        if clap:
-            clap_log_ids = list(clap.get("log_ids", []))
+        if rec:
+            action = rec["action"]
+            before = rec["before"]
+            # Newer records carry the list; pre-list ones a single completion_id.
+            completion_ids = list(rec.get("completion_ids") or [])
+            if rec.get("completion_id"):
+                completion_ids.append(rec["completion_id"])
+            tid = rec["task_id"]
+            legacy_record = rec.get("ui") != "buttons"
+            if can_undo(action, before, data["tasks"].get(tid)):
+                data["tasks"][tid] = json.loads(json.dumps(before))
+                pending = before.get("pending") or {}
+                for mid in pending.get("message_ids", []):
+                    data["messages"][str(mid)] = tid
+                outcome = "ok"
+            else:
+                outcome = "refused"
+            data["undo"].pop(str(press.message_id), None)
+            # Undoing a ✅ turns its post back into a live occurrence, so the 🔄
+            # requeue and 👏 claps we armed on that same post no longer apply. Any
+            # bonus puntos the claps already paid are retracted below — but only when
+            # the undo actually takes (a refused ↩️ leaves the completion, and its
+            # claps, standing).
+            data["requeue"].pop(str(press.message_id), None)
+            clap = data["claps"].pop(str(press.message_id), None)
+            if clap:
+                clap_log_ids = list(clap.get("log_ids", []))
 
+    if outcome is None:
+        # A concurrent ↩️ beat us to it — say so instead of going quiet.
+        if press.interaction is not None:
+            await press.whisper("Nothing left to undo here.")
+        return
     if outcome == "ok":
         if action == "done":
             for cid in completion_ids:  # one row, or one per 🧾 ticker
@@ -1032,40 +1062,49 @@ async def _handle_requeue(press: Press) -> None:
         return  # a 🔄 on something we don't track — ignore
     await press.ack()
 
-    outcome = None  # "fired" | "busy" | "gone"
+    outcome = None  # "fired" | "busy" | "gone" | "unconfigured" (None = raced)
     tid = cfg = brief = None
     legacy_record = False
     async with store.txn() as data:
         rec = data["requeue"].get(str(press.message_id))
-        if not rec:
-            return  # a concurrent 🔄 beat us to it
-        tid = rec["task_id"]
-        legacy_record = rec.get("ui") != "buttons"
-        cfg = guild_config(snap, rec["guild_id"])
-        if not config_ready(cfg):
-            return
-        live = data["tasks"].get(tid)
-        if live is not None and live.get("pending"):
-            outcome = "busy"  # an occurrence is already live — finish that one
-        elif live is not None:
-            live["next_due"] = to_iso(now_utc())  # fire on the spot below
-            brief = live.get("brief")
-            outcome = "fired"
-        elif rec.get("before") is not None:
-            # The task is gone (a completed one-off, or it was deleted): rebuild
-            # it from the saved snapshot as a fresh, due-now occurrence.
-            restored = json.loads(json.dumps(rec["before"]))
-            restored["pending"] = None
-            restored["next_due"] = to_iso(now_utc())
-            data["tasks"][tid] = restored
-            brief = restored.get("brief")
-            outcome = "fired"
-        else:
-            outcome = "gone"
-        if outcome == "fired":
-            # This completed post is spent; the fresh occurrence carries its own
-            # buttons. Drop the record so a second tap can't double-fire.
-            data["requeue"].pop(str(press.message_id), None)
+        if rec:
+            tid = rec["task_id"]
+            legacy_record = rec.get("ui") != "buttons"
+            cfg = guild_config(snap, rec["guild_id"])
+            live = data["tasks"].get(tid)
+            if not config_ready(cfg):
+                outcome = "unconfigured"
+            elif live is not None and live.get("pending"):
+                outcome = "busy"  # an occurrence is already live — finish that one
+            elif live is not None:
+                live["next_due"] = to_iso(now_utc())  # fire on the spot below
+                brief = live.get("brief")
+                outcome = "fired"
+            elif rec.get("before") is not None:
+                # The task is gone (a completed one-off, or it was deleted): rebuild
+                # it from the saved snapshot as a fresh, due-now occurrence.
+                restored = json.loads(json.dumps(rec["before"]))
+                restored["pending"] = None
+                restored["next_due"] = to_iso(now_utc())
+                data["tasks"][tid] = restored
+                brief = restored.get("brief")
+                outcome = "fired"
+            else:
+                outcome = "gone"
+            if outcome == "fired":
+                # This completed post is spent; the fresh occurrence carries its own
+                # buttons. Drop the record so a second tap can't double-fire.
+                data["requeue"].pop(str(press.message_id), None)
+
+    if outcome is None:
+        # A concurrent 🔄 beat us to it — say so instead of going quiet.
+        if press.interaction is not None:
+            await press.whisper("This post's 🔄 has been retired.")
+        return
+    if outcome == "unconfigured":
+        if press.interaction is not None:
+            await press.whisper("Joblin isn't configured for this server yet — run /joblinconfig first.")
+        return
 
     pm = press.message
     if outcome == "fired":
