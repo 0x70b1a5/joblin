@@ -557,8 +557,9 @@ class FakeFollowup:
     def __init__(self) -> None:
         self.sent = []  # {"content", "ephemeral", "view"} records
 
-    async def send(self, content=None, *, ephemeral=False, view=None, **kw) -> None:
-        self.sent.append({"content": content, "ephemeral": ephemeral, "view": view})
+    async def send(self, content=None, *, ephemeral=False, view=None, embed=None, **kw) -> None:
+        self.sent.append({"content": content, "ephemeral": ephemeral, "view": view,
+                          "embed": embed})
 
 
 class FakeInteraction:
@@ -2569,6 +2570,31 @@ async def test_listtasks_pagination() -> None:
             assert f"t{i:02d}" in allpages, f"id t{i:02d} must be reachable"
 
 
+async def test_joblinhelp() -> None:
+    """/joblinhelp sends two ephemeral pages that respect Discord's embed caps
+    (1024/field value, 256/name, 25 fields, 6000/message — it once breached the
+    field cap and 400-failed), and its badge legend names every title
+    /leaderboard can award, with the exact BADGE_EMOJI glyph."""
+    inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+    await joblin.bot.joblinhelp.callback(inter)
+
+    embeds = [inter.response.embed] + [s["embed"] for s in inter.followup.sent]
+    assert len(embeds) == 2 and all(e is not None for e in embeds), "two embed pages"
+    assert inter.response.ephemeral and all(s["ephemeral"] for s in inter.followup.sent)
+    for e in embeds:
+        total = len(e.title or "") + len(e.description or "") + len(e.footer.text or "")
+        assert len(e.fields) <= 25
+        for f in e.fields:
+            assert f.name and len(f.name) <= 256, f.name
+            assert len(f.value) <= 1024, (f.name, len(f.value))
+            total += len(f.name) + len(f.value)
+        assert total <= 6000, (e.title, total)
+
+    alltext = "".join(f.value for e in embeds for f in e.fields)
+    for title, emoji in joblin.bot.scoring.BADGE_EMOJI.items():
+        assert f"{emoji} **{title}**" in alltext, f"badge legend missing {title}"
+
+
 async def test_edit_games() -> None:
     """/edit pitchin|doemup: retiming a dormant recurring game moves its slot and
     next round; editing a live game re-renders its post; a schedule change to a
@@ -3962,6 +3988,7 @@ def main() -> None:
     asyncio.run(test_done_arming_batch())
     asyncio.run(test_listopen())
     asyncio.run(test_listtasks_pagination())
+    asyncio.run(test_joblinhelp())
     asyncio.run(test_lifecycle_and_snooze())
     asyncio.run(test_legacy_migration())
     asyncio.run(test_requeue())

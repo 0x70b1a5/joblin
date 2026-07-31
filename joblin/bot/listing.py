@@ -326,6 +326,8 @@ async def listopen(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="joblinhelp", description="How to use Joblin — commands, scheduling, and reactions")
 async def joblinhelp(interaction: discord.Interaction) -> None:
+    # Two ephemeral messages, not one: Discord caps an embed field at 1024
+    # chars and a message's embeds at 6000 total — the full help outgrew both.
     embed = discord.Embed(
         title="🚜 Joblin help",
         description=(
@@ -388,19 +390,24 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
-    embed.add_field(
+    embed.set_footer(
+        text="e.g.  /newtask brief:Trash out at:19:00 repeat:mon,thu   ·   "
+        "/pitchin brief:Laundry bonanza expires:tonight"
+    )
+
+    glory = discord.Embed(title="🏆 Puntos, titles & trinkets", color=0x6B8E23)
+    glory.add_field(
         name="💰 Bounties & ⭐ stars",
         value=(
             "Mark a chore you can't do yourself with `bounty:true`: it's worth "
             "**2 puntos** and only **someone else** can tap ✅ on it. Every completed "
             "chore is a punto (bounties two); whoever leads the month's `/leaderboard` "
-            "earns a permanent **⭐ star** shown there for keeps. Title badges "
-            "(Punctualist, Bounty Hunter, …) are derived from the log for the same "
-            "scope and sit under each name; pass `all_time:true` for the lifetime board."
+            "earns a permanent **⭐ star** shown there for keeps. Pass `all_time:true` "
+            "for the lifetime board."
         ),
         inline=False,
     )
-    embed.add_field(
+    glory.add_field(
         name=f"{EMOJI_LIST} Lists",
         value=(
             "Give `/newtask` an `items:` checklist — `items: dishes away; wipe "
@@ -414,7 +421,7 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
-    embed.add_field(
+    glory.add_field(
         name=f"{EMOJI_BOMB} Puntobombs",
         value=(
             "`/puntobomb brief:\"unclog the gutter\" expires:tonight` plants a "
@@ -428,31 +435,69 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
-    embed.add_field(
-        name="Pitch-ins & do-em-ups (bonus puntos 🏆)",
+    glory.add_field(
+        name=f"{EMOJI_HANDSHAKE} Pitch-ins (bonus puntos 🏆)",
         value=(
-            "• `/pitchin brief:\"laundry bonanza\"` — everyone who taps ✅ before it "
+            "`/pitchin brief:\"laundry bonanza\"` — everyone who taps ✅ before it "
             "closes earns a punto. Optional `expires` (default 24h), `puntos` each, "
             "and `max_scorers` (only the first N score). 🏁 ends it early.\n"
-            "• Add `repeat:` to either (same as a chore — `daily`, `weekdays`, "
-            "`mon,thu`, `monthly on the 1st`) and it re-posts a fresh round each "
-            "slot. 🏁 just closes the current round (it rolls on); stop the whole "
-            "series with `/deletetask`.\n"
-            "• Add `at:` to either to set the slot — e.g. `/pitchin … at:06:00 "
-            "expires:06:05 repeat:daily` opens 06:00–06:05 every day. The first round "
-            "waits for that time instead of posting the moment you create it.\n"
-            "• `/doemup brief:\"thistle bush removed\"` — tap ➕ once per one you did "
-            "(➖ to fix); the tally updates live. Optional `puntos` each, `deadline`, "
-            "and `point_limit` (auto-closes at that total). 🏁 ends it.\n"
-            "• Change one later with `/edit pitchin` / `/edit doemup` — retime (`at`), "
-            "rename, or adjust puntos/cap; a schedule change applies from the next "
-            "round.\n"
-            "Puntos from both feed the `/leaderboard` — and a closed round grows a "
-            "👏 anyone who sat it out can tap to tip every scorer a bonus punto."
+            "Add `repeat:` (same forms as a chore) and it re-posts a fresh round "
+            "each slot — 🏁 then closes just the current round; stop the whole "
+            "series with `/deletetask`. Add `at:` to set the slot — e.g. `at:06:00 "
+            "expires:06:05 repeat:daily` opens 06:00–06:05 every day, and the first "
+            "round waits for that time instead of posting the moment you create it."
         ),
         inline=False,
     )
-    embed.add_field(
+    glory.add_field(
+        name=f"{EMOJI_FLEX} Do-em-ups",
+        value=(
+            "`/doemup brief:\"thistle bush removed\"` — tap ➕ once per one you did "
+            "(➖ to fix); the tally updates live. Optional `puntos` each, `deadline`, "
+            "and `point_limit` (auto-closes at that total); `repeat:` and `at:` work "
+            "as for pitch-ins. 🏁 ends it.\n"
+            "Change either later with `/edit pitchin` / `/edit doemup` — retime "
+            "(`at`), rename, or adjust puntos/cap; a schedule change applies from "
+            "the next round. Puntos from both feed the `/leaderboard` — and a closed "
+            "round grows a 👏 anyone who sat it out can tap to tip every scorer a "
+            "bonus punto."
+        ),
+        inline=False,
+    )
+    glory.add_field(
+        name="🎖️ Title badges",
+        value=(
+            "Sit under names on the `/leaderboard`, re-judged from the completion "
+            "log for the board's scope (the month shown, or lifetime with "
+            "`all_time:true`) — ties share a title.\n"
+            "⏰ **Punctualist** — most ✅s within the hour of due\n"
+            "🐦 **Early Bird** — most ✅s landed 04:00–08:59\n"
+            "🦉 **Night Owl** — most ✅s landed 21:00–03:59\n"
+            "🥷 **Bounty Hunter** — most bounties claimed\n"
+            "💣 **Bomb Squad** — most puntobombs defused\n"
+            "🤝 **Pitcher-Inner** — most pitch-ins scored\n"
+            "⚒️ **Unit Crusher** — most do-em-up puntos\n"
+            "👑 **Crowd Favorite** — most 👏 claps received"
+        ),
+        inline=False,
+    )
+    glory.add_field(
+        name="​",  # zero-width space: a nameless continuation row
+        value=(
+            "🃏 **Jack of All Chores** — most different chores done\n"
+            "🚂 **One-Track Mind** — most ✅s on one single chore\n"
+            "🚪 **Closer** — most one-off chores finished\n"
+            "👹 **Recurring Nightmare** — most recurring ✅s\n"
+            "🧟 **The Reanimator** — most 🔄 requeues\n"
+            "⚽ **Team Player** — biggest slice of their puntos from pitch-ins & "
+            "do-em-ups\n"
+            "🐺 **Lone Wolf** — biggest slice from solo chores *(either slice "
+            "needs 10+ puntos in scope)*\n"
+            "🧾 **Archaeologist** — unearthed the longest-overdue chore"
+        ),
+        inline=False,
+    )
+    glory.add_field(
         name="🖼️ Trinkets & the vitrine",
         value=(
             "Clear the month's **bar** of puntos (default **25**, set with "
@@ -468,11 +513,8 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
-    embed.set_footer(
-        text="e.g.  /newtask brief:Trash out at:19:00 repeat:mon,thu   ·   "
-        "/pitchin brief:Laundry bonanza expires:tonight"
-    )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=glory, ephemeral=True)
 
 
 __all__ = [
