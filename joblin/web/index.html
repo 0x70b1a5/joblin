@@ -458,7 +458,7 @@ function rows(items, { urgent = false } = {}) {
     const bar = h("button", {
       class: "bar",
       onclick: () => { S.open = S.open === it.id ? null : it.id; render(); },
-    }, it.brief, icons ? h("span", { class: "icons" }, " " + icons) : null);
+    }, it.title || it.brief, icons ? h("span", { class: "icons" }, " " + icons) : null);
     const mix = freqMix(it);
     if (mix > 0.02) bar.style.setProperty("--fmix", Math.round(mix * 100) + "%");
     const row = h("div", { class: "row" + (urgent ? " urgent" : "") + (S.open === it.id ? " expanded" : "") },
@@ -603,6 +603,9 @@ function gamePanel(it) { // the game editor — mirrors /edit pitchin | /edit do
   const isPitchin = it.kind === "pitchin";
   const noun = isPitchin ? "pitch-in" : "do-em-up";
   const brief = h("input", { type: "text", value: it.brief, maxLength: 200 });
+  // Do-em-ups only: the title verb ("pull" → pull-'em-up: <brief>). Required
+  // on new ones, so an emptied field is ignored server-side, never cleared.
+  const verb = isPitchin ? null : h("input", { type: "text", value: it.verb || "", maxLength: 40 });
   const at = h("input", { type: "text", value: it.at_input });
   const repeat = h("input", { type: "text", value: it.repeat_input });
   const closeInput = it.close_input || "";
@@ -617,6 +620,7 @@ function gamePanel(it) { // the game editor — mirrors /edit pitchin | /edit do
   save.addEventListener("click", async () => {
     const changed = {};
     if (brief.value.trim() !== it.brief) changed.brief = brief.value.trim();
+    if (verb && verb.value.trim() && verb.value.trim() !== it.verb) changed.verb = verb.value.trim();
     if (desc.value.trim() !== it.description) changed.description = desc.value.trim();
     // `at`/`repeat`/`close` only when touched — an untouched save must never
     // re-anchor the schedule (mirrors /edit pitchin|doemup omitted options).
@@ -638,7 +642,7 @@ function gamePanel(it) { // the game editor — mirrors /edit pitchin | /edit do
   });
   const del = h("button", { class: "btn danger" }, "Delete");
   del.addEventListener("click", async () => {
-    if (!confirm(`Delete the ${noun} “${it.brief}” for good? A live round is cancelled — no puntos.`)) return;
+    if (!confirm(`Delete the ${noun} “${it.title || it.brief}” for good? A live round is cancelled — no puntos.`)) return;
     try {
       await api(`/api/guilds/${S.gid}/games/${it.kind}/${it.id}`, { method: "DELETE" });
       S.open = null;
@@ -661,6 +665,7 @@ function gamePanel(it) { // the game editor — mirrors /edit pitchin | /edit do
   return h("div", { class: "panel" },
     h("div", { class: "meta" }, meta.join(" · ")),
     field("What", brief),
+    verb ? field("Verb", verb, "the post title reads (verb)-'em-up: (what)") : null,
     field("When", at, "next open — 06:00 · tomorrow 8am" + (it.recurring ? " (the recurring slot)" : "")),
     field("Repeat", repeat, REPEAT_HINT),
     field(isPitchin ? "Closes" : "Deadline", close,

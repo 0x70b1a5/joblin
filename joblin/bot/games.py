@@ -326,11 +326,12 @@ async def post_doemup(
     description: Optional[str], points_each: int, deadline: Optional[str],
     point_limit: Optional[int], now: dt.datetime,
     recurrence: Optional[dict] = None, duration_secs: Optional[int] = None,
+    verb: Optional[str] = None,
 ) -> tuple[str, discord.Message]:
     did = new_id()
     d = {
         "id": did, "guild_id": guild_id, "channel_id": getattr(channel, "id", None),
-        "message_id": None, "brief": brief, "description": description,
+        "message_id": None, "brief": brief, "verb": verb, "description": description,
         "created_by": creator_id, "created_at": to_iso(now),
         "points_each": points_each, "deadline": deadline, "point_limit": point_limit,
         "tallies": {}, "ended": False,
@@ -348,7 +349,7 @@ async def schedule_doemup(
     *, guild_id: int, creator_id: int, channel_id: int, brief: str,
     description: Optional[str], points_each: int, point_limit: Optional[int],
     now: dt.datetime, recurrence: Optional[dict], duration_secs: Optional[int],
-    starts_at: dt.datetime,
+    starts_at: dt.datetime, verb: Optional[str] = None,
 ) -> str:
     """Create a do-em-up whose first round is deferred to ``starts_at`` — the
     do-em-up analogue of :func:`schedule_pitchin`. It sits dormant (no post) until
@@ -356,7 +357,7 @@ async def schedule_doemup(
     did = new_id()
     d = {
         "id": did, "guild_id": guild_id, "channel_id": channel_id,
-        "message_id": None, "brief": brief, "description": description,
+        "message_id": None, "brief": brief, "verb": verb, "description": description,
         "created_by": creator_id, "created_at": to_iso(now),
         "points_each": points_each, "deadline": None, "point_limit": point_limit,
         "tallies": {}, "ended": False,

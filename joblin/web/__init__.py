@@ -68,6 +68,7 @@ from ..models import (
     _ordinal,
     clean_items,
     describe_repeat,
+    doemup_title,
     duration_input,
     from_iso,
     new_id,
@@ -283,6 +284,10 @@ def _game_item(g: dict, kind: str, tz: ZoneInfo) -> dict:
         "kind": kind,  # "pitchin" | "doemup"
         "id": g["id"],
         "brief": g["brief"],
+        # Display title ("<verb>-'em-up: <brief>" for a verbed do-em-up); the
+        # editable fields stay split so a save can't fold the verb into brief.
+        "title": doemup_title(g) if kind == "doemup" else g["brief"],
+        "verb": g.get("verb") or "",
         "description": g.get("description") or "",
         "recurring": bool(g.get("recurring")),
         "schedule_label": label,
@@ -573,8 +578,9 @@ async def delete_game(guild_id: int, kind: str, eid: str) -> Optional[dict]:
         channel = (core.bot.get_channel(int(removed["channel_id"]))
                    if removed.get("channel_id") else None)
         if channel is not None:
+            name = doemup_title(removed) if kind == "doemup" else removed["brief"]
             await _cancel_game_message(
-                channel, removed["brief"], live_mid,
+                channel, name, live_mid,
                 sweep_reactions=(kind == "pitchin"
                                  and removed.get("ui") != "buttons"))
     return removed

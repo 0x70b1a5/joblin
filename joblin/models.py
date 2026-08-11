@@ -891,6 +891,11 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
 # {
 #     …same id/guild_id/channel_id/message_id/brief/description/created_by/
 #       created_at/points_each/ended fields as above…
+#     "verb":        str | None,     # required on new do-em-ups: the display
+#                                    #   title reads "<verb>-'em-up: <brief>"
+#                                    #   (see doemup_title). None on rows from
+#                                    #   before verbs existed — they read with
+#                                    #   the generic "do" swapped in.
 #     "deadline":    str | None,     # ISO-8601 UTC auto-close, or None (open /
 #                                    #   dormant between rounds)
 #     "point_limit": int | None,     # optional total-puntos cap
@@ -1000,9 +1005,18 @@ def doemup_apply(d: dict, action: str, user_id: int, user_name: str) -> dict:
     return {"changed": False, "final": False, "error": "unknown"}
 
 
+def doemup_title(d: dict) -> str:
+    """A do-em-up's display title: ``<verb>-'em-up: <brief>``. New do-em-ups
+    must carry a verb; rows from before verbs existed fall back to the generic
+    "do" — a literal do-'em-up. The verb is presentation only — the stored
+    ``brief`` (and every completion-log row) stays the bare task title."""
+    verb = (d.get("verb") or "").strip() or "do"
+    return f"{verb}-'em-up: {d['brief']}"
+
+
 def render_doemup(d: dict, *, final: bool = False) -> str:
     """The do-em-up post body — live (with the ➕/➖ tally) or finalized."""
-    brief = d["brief"]
+    title = doemup_title(d)
     pe = d.get("points_each", 1)
     per = f"+{pe} each" if pe != 1 else "+1 each"
     parts = [
@@ -1016,10 +1030,10 @@ def render_doemup(d: dict, *, final: bool = False) -> str:
     if final:
         if parts:
             return (
-                f"{EMOJI_FLEX} ~~**{brief}**~~ — done!\n"
+                f"{EMOJI_FLEX} ~~**{title}**~~ — done!\n"
                 f"{tally_line}  —  **{_plural(total, 'punto')}** logged"
             )
-        return f"{EMOJI_FLEX} ~~**{brief}**~~ — closed with nothing tallied."
+        return f"{EMOJI_FLEX} ~~**{title}**~~ — closed with nothing tallied."
 
     limit = d.get("point_limit")
     head = f"{total}/{limit} puntos" if limit else f"**{_plural(total, 'punto')}**"
@@ -1027,7 +1041,7 @@ def render_doemup(d: dict, *, final: bool = False) -> str:
     closes = f" — closes {discord_ts(from_iso(dl), 'R')}" if dl else ""
     desc = f"\n{d['description']}" if d.get("description") else ""
     return (
-        f"{EMOJI_FLEX} **{brief}**  ·  {per}{closes}{desc}\n"
+        f"{EMOJI_FLEX} **{title}**  ·  {per}{closes}{desc}\n"
         f"Tap ➕ each time you finish one (➖ to fix).\n"
         f"**Tally:** {tally_line}  —  {head}"
     )

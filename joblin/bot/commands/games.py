@@ -16,6 +16,7 @@ from discord import app_commands
 from ...models import (
     describe_repeat,
     discord_ts,
+    doemup_title,
     first_due,
     format_duration,
     from_iso,
@@ -169,7 +170,8 @@ async def pitchin(
     description="Start a do-em-up: tap ➕ for each one you do; puntos tally live",
 )
 @app_commands.describe(
-    brief="What's being done one-at-a-time, e.g. 'thistle bush removed' (required)",
+    brief="What's being done one-at-a-time, e.g. 'thistle bushes' (required)",
+    verb="The doing word — 'pull' titles the post pull-'em-up: <brief> (required)",
     at="When the first round opens — now, 06:00, tomorrow 8am. Recurring? sets the daily slot (default: now)",
     puntos="Puntos per ➕ (default: 1)",
     deadline="Optional auto-close time — tonight, in 3h, tomorrow 18:00",
@@ -180,6 +182,7 @@ async def pitchin(
 async def doemup(
     interaction: discord.Interaction,
     brief: app_commands.Range[str, 1, 200],
+    verb: app_commands.Range[str, 1, 40],
     at: Optional[str] = None,
     puntos: app_commands.Range[int, 1, 100] = 1,
     deadline: Optional[str] = None,
@@ -195,6 +198,8 @@ async def doemup(
         )
         return
     tz, now = ZoneInfo(cfg["timezone"]), now_utc()
+    verb = str(verb).strip()
+    title = doemup_title({"verb": verb, "brief": str(brief)})
     try:
         recurrence = _game_recurrence_from(repeat, tz, now, at)
     except ValueError as e:
@@ -246,7 +251,7 @@ async def doemup(
     if deferred:
         await schedule_doemup(
             guild_id=interaction.guild_id, creator_id=interaction.user.id,
-            channel_id=channel.id, brief=str(brief),
+            channel_id=channel.id, brief=str(brief), verb=verb,
             description=(description[:1000] if description else None),
             points_each=int(puntos),
             point_limit=(int(point_limit) if point_limit else None), now=now,
@@ -257,14 +262,15 @@ async def doemup(
         else:
             when = f"opens {discord_ts(start, 'R')} · open until 🏁"
         await interaction.response.send_message(
-            f"💪 Scheduled **{brief}** in <#{cfg['channel_id']}> — {when}{rep}.",
+            f"💪 Scheduled **{title}** in <#{cfg['channel_id']}> — {when}{rep}.",
             ephemeral=True,
         )
         return
 
     await post_doemup(
         channel, guild_id=interaction.guild_id, creator_id=interaction.user.id,
-        brief=str(brief), description=(description[:1000] if description else None),
+        brief=str(brief), verb=verb,
+        description=(description[:1000] if description else None),
         points_each=int(puntos), deadline=deadline_iso,
         point_limit=(int(point_limit) if point_limit else None), now=now,
         recurrence=recurrence, duration_secs=duration_secs,
@@ -275,7 +281,7 @@ async def doemup(
     else:
         closes = rep if rep else ""
     await interaction.response.send_message(
-        f"💪 Posted **{brief}** in <#{cfg['channel_id']}> — tap ➕ as you go{closes}.",
+        f"💪 Posted **{title}** in <#{cfg['channel_id']}> — tap ➕ as you go{closes}.",
         ephemeral=True,
     )
 

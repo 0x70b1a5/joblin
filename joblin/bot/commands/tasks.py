@@ -17,6 +17,7 @@ from ...models import (
     PUNTOBOMB_MIN_FUSE_SECS,
     PUNTOBOMB_PENALTY,
     discord_ts,
+    doemup_title,
     first_due,
     format_duration,
     new_id,
@@ -289,6 +290,7 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
     snap = await store.snapshot()
     found = _find_task(snap, interaction.guild_id, task)
     removed = None
+    shown = None  # display title when it differs from the brief (do-em-ups)
     panels: list = []
     if found:
         async with store.txn() as data:
@@ -330,12 +332,14 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
                         if rec.get("task_id") == game["id"]:
                             data["claps"].pop(mid, None)
                     removed = data[section].pop(game["id"], None)
+            if removed and kind == "doemup":
+                shown = doemup_title(removed)
             if removed and live_mid:
                 ch = (bot.get_channel(int(removed["channel_id"]))
                       if removed.get("channel_id") else None)
                 if ch is not None:
                     await _cancel_game_message(
-                        ch, removed["brief"], live_mid,
+                        ch, shown or removed["brief"], live_mid,
                         sweep_reactions=(kind == "pitchin"
                                          and removed.get("ui") != "buttons"),
                     )
@@ -348,7 +352,7 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
             )
         else:
             await interaction.response.send_message(
-                f"🗑️ Deleted **{removed['brief']}**.", ephemeral=True
+                f"🗑️ Deleted **{shown or removed['brief']}**.", ephemeral=True
             )
     else:
         await interaction.response.send_message(

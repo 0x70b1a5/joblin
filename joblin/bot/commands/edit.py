@@ -22,6 +22,7 @@ from ...models import (
     UTC,
     describe_repeat,
     discord_ts,
+    doemup_title,
     format_duration,
     from_iso,
     now_utc,
@@ -263,7 +264,9 @@ async def apply_game_edit(
     """Edit a pitch-in / do-em-up ("pitchin" | "doemup") by id: the engine
     behind /edit pitchin, /edit doemup, and the web UI. Key *presence* in
     ``fields`` is intent (brief, description — empty clears, at, repeat,
-    close, puntos, cap), mirroring the web's task edit. A schedule change
+    close, puntos, cap, and — do-em-ups only — the title verb, which is
+    required so empty is ignored, not cleared), mirroring the web's task
+    edit. A schedule change
     recomputes the next open slot for a scheduled/dormant round; for a live
     round it applies from the next round (the open post is left alone except
     for an explicit close-time change, and is re-rendered so any text/puntos
@@ -275,7 +278,7 @@ async def apply_game_edit(
     if not event or str(event["guild_id"]) != str(guild_id):
         return None, None, f"{noun.capitalize()} not found."
     if not any(k in fields for k in
-               ("brief", "description", "at", "repeat", "close", "puntos", "cap")):
+               ("brief", "verb", "description", "at", "repeat", "close", "puntos", "cap")):
         return None, None, "Nothing to change — set at least one field."
 
     puntos = cap = None
@@ -360,6 +363,10 @@ async def apply_game_edit(
                     brief = str(fields["brief"] or "").strip()[:200]
                     if brief:
                         g["brief"] = brief
+                if kind == "doemup" and "verb" in fields:
+                    verb = str(fields["verb"] or "").strip()[:40]
+                    if verb:
+                        g["verb"] = verb
                 if "description" in fields:
                     desc = str(fields["description"] or "").strip()
                     g["description"] = desc[:1000] if desc else None
@@ -411,6 +418,7 @@ async def _apply_game_edit(
     brief: Optional[str], at: Optional[str], repeat: Optional[str],
     description: Optional[str], clear_description: bool,
     close: Optional[str], puntos: Optional[int], cap: Optional[int],
+    verb: Optional[str] = None,
 ) -> None:
     """Interaction front-end for /edit pitchin and /edit doemup: resolve the
     free-text event, translate the options into :func:`apply_game_edit`'s
@@ -426,6 +434,8 @@ async def _apply_game_edit(
     fields: dict = {}
     if brief is not None:
         fields["brief"] = str(brief)
+    if verb is not None:
+        fields["verb"] = str(verb)
     if clear_description:
         fields["description"] = ""
     elif description is not None:
@@ -478,8 +488,9 @@ async def _apply_game_edit(
                 tail += f" · open {format_duration(left)}"
         if rec_changed:
             tail += " · live now — the new schedule applies from the next round"
+    name = doemup_title(updated) if kind == "doemup" else updated["brief"]
     await interaction.response.send_message(
-        f"✏️ Updated **{updated['brief']}** ({sched}){tail}.",
+        f"✏️ Updated **{name}** ({sched}){tail}.",
         ephemeral=True, allowed_mentions=NO_PINGS)
 
 
@@ -518,6 +529,7 @@ async def edit_pitchin(
 @app_commands.describe(
     event="The do-em-up to edit — pick from the list, or paste its id",
     brief="New short text (optional)",
+    verb="New title verb — 'pull' titles the post pull-'em-up: <brief> (optional)",
     at="New open time / recurring slot — 06:00, tonight, tomorrow 8am (optional)",
     repeat="New repeat — once, daily, weekdays, mon/thu, monthly on the 1st (optional)",
     description="New extra details (optional)",
@@ -530,6 +542,7 @@ async def edit_doemup(
     interaction: discord.Interaction,
     event: str,
     brief: Optional[app_commands.Range[str, 1, 200]] = None,
+    verb: Optional[app_commands.Range[str, 1, 40]] = None,
     at: Optional[str] = None,
     repeat: Optional[str] = None,
     description: Optional[str] = None,
@@ -540,7 +553,7 @@ async def edit_doemup(
 ) -> None:
     await _apply_game_edit(
         interaction, kind="doemup", section="doemups", event_text=event,
-        brief=brief, at=at, repeat=repeat, description=description,
+        brief=brief, verb=verb, at=at, repeat=repeat, description=description,
         clear_description=clear_description, close=deadline, puntos=puntos, cap=point_limit,
     )
 

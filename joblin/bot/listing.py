@@ -13,6 +13,7 @@ from ..models import (
     PUNTOBOMB_PENALTY,
     describe_repeat,
     discord_ts,
+    doemup_title,
     from_iso,
     now_utc,
     recurrence_of,
@@ -175,8 +176,9 @@ async def listtasks(interaction: discord.Interaction) -> None:
             else:
                 when, state = now_utc(), "—"
             info = " ℹ️" if g.get("description") else ""
+            name = doemup_title(g) if section == "doemups" else g["brief"]
             game_rows.append(
-                (when, f"• `{g['id']}` {icon} **{g['brief']}**{info} — {sched} · {state}")
+                (when, f"• `{g['id']}` {icon} **{name}**{info} — {sched} · {state}")
             )
     rows.extend(row for _, row in sorted(game_rows, key=lambda x: x[0]))
 
@@ -290,7 +292,7 @@ async def listopen(interaction: discord.Interaction) -> None:
             if str(g["guild_id"]) != str(gid) or g.get("ended") or not g.get("message_id"):
                 continue
             link = message_link(g["guild_id"], g.get("channel_id") or fallback_ch, g["message_id"])
-            label = _safe_link_label(g["brief"])
+            label = _safe_link_label(doemup_title(g) if section == "doemups" else g["brief"])
             head = f"[{label}]({link})" if link else f"**{label}**"
             when = g.get(key)
             sort_at = from_iso(when) if when else now_utc()
@@ -343,7 +345,8 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "2-punto bounty, `items:` for a 🧾 list)\n"
             "• `/puntobomb` — plant a chore with a fuse: defuse it or everyone pays 💣\n"
             "• `/pitchin` — group task: everyone who ✅s before it closes scores\n"
-            "• `/doemup` — per-unit task: tap ➕ for each one you do\n"
+            "• `/doemup` — per-unit task: tap ➕ for each one you do "
+            "(its `verb:` titles the post, e.g. pull-'em-up)\n"
             "• `/listtasks` — list chores with their ids (paged; 🔔×n = times nagged)\n"
             "• `/listopen` — post what's open right now, each a tap-through link to its post\n"
             "• `/edit` — change a task, pitch-in, or do-em-up (`/edit task|pitchin|doemup`)\n"
@@ -452,7 +455,8 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
     glory.add_field(
         name=f"{EMOJI_FLEX} Do-em-ups",
         value=(
-            "`/doemup brief:\"thistle bush removed\"` — tap ➕ once per one you did "
+            "`/doemup verb:\"pull\" brief:\"thistle bushes\"` — posts as "
+            "**pull-'em-up: thistle bushes**; tap ➕ once per one you did "
             "(➖ to fix); the tally updates live. Optional `puntos` each, `deadline`, "
             "and `point_limit` (auto-closes at that total); `repeat:` and `at:` work "
             "as for pitch-ins. 🏁 ends it.\n"

@@ -25,6 +25,7 @@ from ...models import (
     UTC,
     describe_close_phrase,
     describe_repeat,
+    doemup_title,
     now_utc,
     parse_items,
     parse_repeat,
@@ -69,13 +70,18 @@ def _find_game(snap: dict, guild_id: int, text: str) -> tuple[Optional[str], Opt
              if str(g["guild_id"]) == str(guild_id)]
     games += [("doemup", g) for g in snap["doemups"].values()
               if str(g["guild_id"]) == str(guild_id)]
-    for matcher in (
-        lambda g: g["id"].lower() == needle or g["brief"].strip().lower() == needle,
-        lambda g: bool(needle) and needle in g["brief"].lower(),
-    ):
-        for kind, g in games:
-            if matcher(g):
-                return kind, g
+    # Match against the composed display title too (a do-em-up posts as
+    # "<verb>-'em-up: <brief>", so that's what people read and re-type); the
+    # brief is a substring of its title, so the substring pass covers both.
+    titled = [(kind, g, doemup_title(g) if kind == "doemup" else g["brief"])
+              for kind, g in games]
+    for kind, g, title in titled:
+        if (g["id"].lower() == needle or g["brief"].strip().lower() == needle
+                or title.strip().lower() == needle):
+            return kind, g
+    for kind, g, title in titled:
+        if needle and needle in title.lower():
+            return kind, g
     return None, None
 
 
@@ -87,12 +93,15 @@ def _find_game_in(snap: dict, guild_id: int, section: str, text: str) -> Optiona
     if g and str(g["guild_id"]) == str(guild_id):
         return g
     needle = (text or "").strip().lower()
-    mine = [g for g in snap[section].values() if str(g["guild_id"]) == str(guild_id)]
-    for g in mine:
-        if g["id"].lower() == needle or g["brief"].strip().lower() == needle:
+    titled = [(g, doemup_title(g) if section == "doemups" else g["brief"])
+              for g in snap[section].values()
+              if str(g["guild_id"]) == str(guild_id)]
+    for g, title in titled:
+        if (g["id"].lower() == needle or g["brief"].strip().lower() == needle
+                or title.strip().lower() == needle):
             return g
-    for g in mine:
-        if needle and needle in g["brief"].lower():
+    for g, title in titled:
+        if needle and needle in title.lower():
             return g
     return None
 
@@ -282,7 +291,8 @@ async def delete_autocomplete(interaction: discord.Interaction, current: str):
             if str(g["guild_id"]) != str(interaction.guild_id):
                 continue
             sched = describe_repeat(recurrence_of(g)) if g.get("recurring") else "one-off"
-            label = f"{icon} {g['brief']} ({sched})"
+            name = doemup_title(g) if section == "doemups" else g["brief"]
+            label = f"{icon} {name} ({sched})"
             if cur in label.lower() or cur in gid.lower():
                 out.append(app_commands.Choice(name=label[:100], value=gid))
     return out[:25]
@@ -299,7 +309,8 @@ def _game_event_autocomplete(section: str, icon: str):
             if str(g["guild_id"]) != str(interaction.guild_id):
                 continue
             sched = describe_repeat(recurrence_of(g)) if g.get("recurring") else "one-off"
-            label = f"{icon} {g['brief']} ({sched})"
+            name = doemup_title(g) if section == "doemups" else g["brief"]
+            label = f"{icon} {name} ({sched})"
             if cur in label.lower() or cur in gid.lower():
                 out.append(app_commands.Choice(name=label[:100], value=gid))
             if len(out) >= 25:

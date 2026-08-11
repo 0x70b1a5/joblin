@@ -1012,7 +1012,8 @@ async def test_doemup_at_deferred() -> None:
         # Recurring daily with a 90-minute window, deferred to its slot.
         inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
         await bot.doemup.callback(
-            inter, brief="Dawn reps", at=slot, deadline="in 90 minutes", repeat="daily"
+            inter, brief="Dawn reps", verb="do", at=slot, deadline="in 90 minutes",
+            repeat="daily"
         )
         snap = await st.snapshot()
         rec = next(iter(snap["doemups"].values()))
@@ -1033,7 +1034,7 @@ async def test_doemup_at_deferred() -> None:
 
         # A one-off `at` with no deadline: deferred, then open until 🏁 (no auto-close).
         inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
-        await bot.doemup.callback(inter, brief="Later, open-ended", at="in 1 hour")
+        await bot.doemup.callback(inter, brief="Later, open-ended", verb="do", at="in 1 hour")
         one = next(q for q in (await st.snapshot())["doemups"].values()
                    if q["brief"] == "Later, open-ended")
         assert not one["recurring"] and one["message_id"] is None
@@ -1046,8 +1047,52 @@ async def test_doemup_at_deferred() -> None:
 
         # A past explicit `at` is rejected.
         inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
-        await bot.doemup.callback(inter, brief="Too late", at="2000-01-01 00:00")
+        await bot.doemup.callback(inter, brief="Too late", verb="do", at="2000-01-01 00:00")
         assert "past" in inter.response.content
+
+
+async def test_doemup_verb_title() -> None:
+    """A do-em-up's required verb heads its display title — "<verb>-'em-up:
+    <brief>" — on the live post, after an /edit doemup verb: fix, and on the
+    finalized post. Rows from before verbs existed read with the generic "do"
+    swapped in, and the completion log keeps the bare brief either way."""
+    assert m.doemup_title({"verb": "pull", "brief": "thistle bushes"}) \
+        == "pull-'em-up: thistle bushes"
+    assert m.doemup_title({"brief": "old row"}) == "do-'em-up: old row", \
+        "pre-verb rows fall back to 'do'"
+    assert "do-'em-up: old row" in m.render_doemup({"brief": "old row", "tallies": {}})
+
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        did, msg = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="the leaves", verb="rake",
+            description=None, points_each=1, deadline=None, point_limit=None,
+            now=m.now_utc(),
+        )
+        assert (await st.snapshot())["doemups"][did]["verb"] == "rake"
+        assert "rake-'em-up: the leaves" in ch.msgs[msg.id].content
+
+        # /edit doemup verb: fixes a typo and re-renders the live post; the
+        # stored brief stays bare (the verb is presentation, not the name).
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.edit_doemup.callback(inter, event=did, verb="RAKE")
+        dd = (await st.snapshot())["doemups"][did]
+        assert dd["verb"] == "RAKE" and dd["brief"] == "the leaves"
+        assert "RAKE-'em-up: the leaves" in ch.msgs[msg.id].content
+        assert "RAKE-'em-up: the leaves" in inter.response.content
+
+        # One ➕ then the creator's End: the finalized post keeps the title,
+        # while the punto row logs the bare brief.
+        await bot.handle_doemup_button(
+            did, "plus", FakeInteraction(user=FakeUser(42, "Pat"), channel=ch,
+                                         message=ch.msgs[msg.id]))
+        await bot.handle_doemup_button(
+            did, "end", FakeInteraction(user=FakeUser(1, "Boss"), channel=ch,
+                                        message=ch.msgs[msg.id]))
+        assert "RAKE-'em-up: the leaves" in ch.msgs[msg.id].content
+        assert "done!" in ch.msgs[msg.id].content
+        recs = st.read_completions()
+        assert len(recs) == 1 and recs[0]["brief"] == "the leaves"
 
 
 async def test_doemup_recurring_limit_rolls_on() -> None:
@@ -1131,7 +1176,7 @@ async def test_game_commands_recurring() -> None:
         assert "🔁" in inter.response.content and "every day" in inter.response.content
 
         inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
-        await bot.doemup.callback(inter, brief="Weekday reps", repeat="weekdays")
+        await bot.doemup.callback(inter, brief="Weekday reps", verb="do", repeat="weekdays")
         dd = next(iter((await st.snapshot())["doemups"].values()))
         assert dd["recurring"] and dd["freq"] == "weekly" and dd["weekdays"] == [0, 1, 2, 3, 4]
         assert dd["next_due"] is None and dd["deadline"] is not None
@@ -1176,17 +1221,21 @@ async def test_game_commands() -> None:
         # /doemup happy path with a deadline + cap -> posts with live buttons.
         inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
         await bot.doemup.callback(
-            inter, brief="Thistle bush removed", deadline="in 3h", point_limit=50
+            inter, brief="thistle bushes", verb="remove", deadline="in 3h", point_limit=50
         )
         snap = await st.snapshot()
         assert len(snap["doemups"]) == 1
         dd = next(iter(snap["doemups"].values()))
         assert dd["point_limit"] == 50 and dd["deadline"] is not None
+        assert dd["verb"] == "remove" and dd["brief"] == "thistle bushes"
+        # The required verb heads the display title everywhere the post shows.
+        assert "remove-'em-up: thistle bushes" in ch.msgs[dd["message_id"]].content
+        assert "remove-'em-up: thistle bushes" in inter.response.content
         assert "💪 Posted" in inter.response.content
 
         # A past deadline is rejected.
         inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
-        await bot.doemup.callback(inter, brief="Nope", deadline="2000-01-01 00:00")
+        await bot.doemup.callback(inter, brief="Nope", verb="do", deadline="2000-01-01 00:00")
         assert "past" in inter.response.content
         assert len((await st.snapshot())["doemups"]) == 1
 
@@ -4004,6 +4053,7 @@ def main() -> None:
     asyncio.run(test_pitchin_at_deferred())
     asyncio.run(test_doemup_recurring())
     asyncio.run(test_doemup_at_deferred())
+    asyncio.run(test_doemup_verb_title())
     asyncio.run(test_doemup_recurring_limit_rolls_on())
     asyncio.run(test_delete_live_game())
     asyncio.run(test_game_commands_recurring())
