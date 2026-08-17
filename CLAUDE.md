@@ -74,7 +74,7 @@ Live posts still key off `store["messages"][message_id] → task_id` — for but
 - **Pitch-in** — a shared call to action posted immediately; everyone who taps ✅ before it closes (expiry / max scorers / 🏁 manual end) earns its punto value.
 - **Do-em-up** — a live unit tally posted immediately with ➕/➖ buttons; scorers earn per unit, closes on deadline / punto limit / manual end. New ones require a **verb**; it heads the display title everywhere ("«verb»-'em-up: «brief»", `models.doemup_title`) while the stored `brief` and every log row stay bare. Pre-verb rows have `verb: None` and read with the generic "do" swapped in.
 - **Clap (👏)** — an outsider tap on a finished post that tips each doer +1 (once per outsider per post).
-- Pitch-ins/do-em-ups live in their own store sections (`pitchins`/`doemups`) and resolve by people clicking rather than the nag machinery, but write to the same `completions.jsonl` so one leaderboard totals everything.
+- Pitch-ins/do-em-ups live in their own store sections (`pitchins`/`doemups`) and resolve by people clicking rather than the nag machinery, but write to the same `completions.jsonl` so one leaderboard totals everything. A closed round's post keeps a 🔄 (beside any 👏) that opens a fresh round on the spot — same `requeue` table as chores, records tagged `kind`, handled in `games.py`; a recurring game just plays its next round early, a one-off is rebuilt with its original window.
 
 ## Conventions & gotchas
 

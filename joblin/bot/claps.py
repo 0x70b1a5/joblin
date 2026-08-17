@@ -21,7 +21,6 @@ from .helpers import (
     Press,
     _game_tz,
     _tidy_stale,
-    completed_view,
     post_view_for,
 )
 
@@ -160,21 +159,23 @@ async def _arm_clap(
 
 
 async def _arm_game_clap(
-    event: dict, kind: str, status: str, channel: discord.abc.Messageable
-):
+    event: dict, kind: str, status: str, channel: discord.abc.Messageable,
+    *, tidy: Optional[set] = None,
+) -> None:
     """Arm a 👏 on a just-finalized pitch-in / do-em-up round so an outsider can
-    tip its scorers a bonus punto each, returning the view the closed post
-    should carry (None when the round closed with nobody in, or its post is
-    gone). A recurring game's next round retires this one's 👏 the same way a
-    chore's next completion does — keyed on the shared game id."""
+    tip its scorers a bonus punto each (a round that closed with nobody in arms
+    nothing — the closed post's row is derived from the tables afterwards, so
+    its 🔄 stands alone). A recurring game's next round retires this one's 👏
+    the same way a chore's next completion does — keyed on the shared game id,
+    batched through ``tidy``."""
     participants = _game_participants(event, kind)
     mid = event.get("message_id")
     if not participants or mid is None:
-        return None
+        return
     await _arm_clap(
-        event["id"], mid, channel, event["guild_id"], event["brief"], status, participants
+        event["id"], mid, channel, event["guild_id"], event["brief"], status,
+        participants, tidy=tidy,
     )
-    return completed_view(event["id"], clap=True)
 
 
 async def handle_clap_button(interaction: discord.Interaction) -> None:

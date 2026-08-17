@@ -24,6 +24,8 @@ Lifecycle of a task occurrence
                       bot puts this button on the message showing the result.
      🔄  requeue   -> rides a ✅-completed post; re-fires the chore right now
                       (a fresh occurrence) without waiting for its next slot.
+                      Closed pitch-in / do-em-up rounds carry the same button —
+                      it opens a fresh round on the spot (games.py).
      🤫  shush     -> sets the task's lifetime ``no_nag`` flag: stop the hourly
                       reminders while occurrences keep firing on schedule. A
                       shushed chore's posts carry 🔊 instead.

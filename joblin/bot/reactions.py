@@ -60,6 +60,7 @@ from .claps import (
     _handle_clap,
 )
 from .games import (
+    _handle_game_requeue,
     _handle_pitchin_reaction,
     _handle_pitchin_unreact,
 )
@@ -1026,6 +1027,10 @@ async def _handle_undo(press: Press) -> None:
 # "The Reanimator" title badge is derived from, same recompute-from-log spirit
 # as every other badge. Markers are never voided: undoing the fresh occurrence
 # doesn't un-happen the tap.
+#
+# Closed pitch-in / do-em-up rounds carry the same 🔄: their records live in the
+# same table, tagged ``kind: "pitchin"|"doemup"``, and _handle_requeue hands
+# those presses to games._handle_game_requeue (which opens a fresh round).
 def _arm_requeue_in(
     data: dict,
     tid: str,
@@ -1061,6 +1066,10 @@ async def _handle_requeue(press: Press) -> None:
             await press.whisper("This post's 🔄 has been retired.")
         return  # a 🔄 on something we don't track — ignore
     await press.ack()
+    if snap["requeue"][str(press.message_id)].get("kind") in ("pitchin", "doemup"):
+        # A closed game round's 🔄 — reopening a game is games.py's business.
+        await _handle_game_requeue(press)
+        return
 
     outcome = None  # "fired" | "busy" | "gone" | "unconfigured" (None = raced)
     tid = cfg = brief = None

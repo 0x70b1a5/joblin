@@ -328,9 +328,10 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
                 if g and str(g["guild_id"]) == str(interaction.guild_id):
                     live_mid = g.get("message_id")
                     data["game_messages"].pop(str(live_mid), None)
-                    for mid, rec in list(data["claps"].items()):
-                        if rec.get("task_id") == game["id"]:
-                            data["claps"].pop(mid, None)
+                    for table in ("requeue", "claps"):
+                        for mid, rec in list(data[table].items()):
+                            if rec.get("task_id") == game["id"]:
+                                data[table].pop(mid, None)
                     removed = data[section].pop(game["id"], None)
             if removed and kind == "doemup":
                 shown = doemup_title(removed)

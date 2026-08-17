@@ -387,7 +387,8 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "🔊 **Un-shush** — appears on a shushed chore's posts: turns the "
             "nags back on\n"
             "↩️ **Undo** — appears after ✅/⏩/⏭️/❌ to reverse it\n"
-            "🔄 **Requeue** — appears on a completed chore; re-posts it right now\n"
+            "🔄 **Requeue** — appears on a completed chore or a closed pitch-in / "
+            "do-em-up round; re-runs it right now\n"
             "👏 **Clap** — on a finished chore, pitch-in, or do-em-up; anyone who "
             "*didn't* do it taps to tip every doer a bonus punto (one clap each)"
         ),

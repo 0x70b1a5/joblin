@@ -35,6 +35,8 @@ from .helpers import (
     _clear_bot_reactions,
     _game_tz,
     _remove_user_reaction,
+    post_view_for,
+    refresh_post_view,
     safe_delete,
 )
 from .claps import _arm_game_clap
@@ -131,6 +133,33 @@ def _game_next_round(game: dict, tz: ZoneInfo, now: dt.datetime) -> dt.datetime:
     return next_due(recurrence_of(game), tz, from_iso(game["created_at"]), now)
 
 
+def _arm_game_requeue_in(data: dict, event: dict, kind: str) -> list[int]:
+    """Write, into the close txn's ``data``, how a 🔄 on this just-closed
+    round's post reopens the game — the same table a chore's 🔄 uses, tagged
+    with ``kind`` so _handle_requeue routes the press back here. Arming inside
+    the close txn means the button can never be pressed recordless. Returns the
+    older anchors whose 🔄 this retires (a game's requeue anchors are always
+    button-era) for refresh_post_view."""
+    mid = event.get("message_id")
+    if mid is None:
+        return []
+    gid = event["id"]
+    stale: list[int] = []
+    for old, rec in list(data["requeue"].items()):
+        if rec.get("task_id") == gid and str(old) != str(mid):
+            data["requeue"].pop(old, None)
+            stale.append(int(old))
+    data["requeue"][str(mid)] = {
+        "task_id": gid,
+        "kind": kind,  # routes _handle_requeue to the game path
+        "before": json.loads(json.dumps(event)),  # lets a closed one-off reopen
+        "guild_id": event["guild_id"],
+        "channel_id": event.get("channel_id"),
+        "ui": "buttons",
+    }
+    return stale
+
+
 async def finalize_pitchin(pid: str, channel: discord.abc.Messageable) -> bool:
     """Close a pitch-in round: award every scorer, rewrite the post as a result
     line, and clear its reactions. A recurring pitch-in then rolls on — it goes
@@ -142,6 +171,7 @@ async def finalize_pitchin(pid: str, channel: discord.abc.Messageable) -> bool:
         return False
     tz, now = _game_tz(snap, p0["guild_id"]), now_utc()
     event = nxt = None
+    stale_rq: list[int] = []
     async with store.txn() as data:
         p = data["pitchins"].get(pid)
         if not p or p.get("ended"):
@@ -149,6 +179,7 @@ async def finalize_pitchin(pid: str, channel: discord.abc.Messageable) -> bool:
         p["ended"] = True
         event = json.loads(json.dumps(p))
         data["game_messages"].pop(str(p.get("message_id")), None)
+        stale_rq = _arm_game_requeue_in(data, event, "pitchin")
         if p.get("recurring"):
             nxt = _game_next_round(p, tz, now)
             p.update({"scorers": [], "ended": False, "message_id": None,
@@ -165,13 +196,18 @@ async def finalize_pitchin(pid: str, channel: discord.abc.Messageable) -> bool:
         # A round posted before the button migration self-reacted ✅/🏁 — sweep
         # ours (a member's fun reaction — a 😄, a 🎉 — stays).
         await _clear_bot_reactions(pm, (EMOJI_DONE, EMOJI_END))
-    # One edit closes the round: the result line replaces the live body, and the
-    # 👏 button (armed first, so it can't be pressed recordless) replaces ✅/🏁.
-    view = await _arm_game_clap(event, "pitchin", body, channel)
+    # One edit closes the round: the result line replaces the live body, and
+    # the 🔄/👏 row (armed first, so neither can be pressed recordless — 👏 only
+    # when someone actually pitched in) replaces ✅/🏁.
+    tidy: set = set(stale_rq)
+    await _arm_game_clap(event, "pitchin", body, channel, tidy=tidy)
+    view = post_view_for(await store.snapshot(), event["message_id"])
     try:
         await pm.edit(content=body, view=view, allowed_mentions=NO_PINGS)
     except discord.HTTPException:
         pass
+    for mid in tidy:  # then retire the previous round's dead 🔄/👏
+        await refresh_post_view(channel, mid)
     return True
 
 
@@ -186,6 +222,7 @@ async def finalize_doemup(did: str, channel: discord.abc.Messageable) -> bool:
         return False
     tz, now = _game_tz(snap, d0["guild_id"]), now_utc()
     event = nxt = None
+    stale_rq: list[int] = []
     async with store.txn() as data:
         d = data["doemups"].get(did)
         if not d or d.get("ended"):
@@ -193,6 +230,7 @@ async def finalize_doemup(did: str, channel: discord.abc.Messageable) -> bool:
         d["ended"] = True
         event = json.loads(json.dumps(d))
         data["game_messages"].pop(str(d.get("message_id")), None)
+        stale_rq = _arm_game_requeue_in(data, event, "doemup")
         if d.get("recurring"):
             nxt = _game_next_round(d, tz, now)
             d.update({"tallies": {}, "ended": False, "message_id": None,
@@ -204,14 +242,19 @@ async def finalize_doemup(did: str, channel: discord.abc.Messageable) -> bool:
     body = render_doemup(event, final=True)
     if nxt is not None:
         body += f"\n🔁 Next round {discord_ts(nxt, 'R')}."
-    # One edit closes the round: ➕/➖/End give way to the 👏 (or nothing).
-    view = await _arm_game_clap(event, "doemup", body, channel)
+    # One edit closes the round: ➕/➖/End give way to the 🔄/👏 row (armed
+    # first, so neither can be pressed recordless — 👏 only when someone tallied).
+    tidy: set = set(stale_rq)
+    await _arm_game_clap(event, "doemup", body, channel, tidy=tidy)
+    view = post_view_for(await store.snapshot(), event["message_id"])
     try:
         await channel.get_partial_message(event["message_id"]).edit(
             content=body, view=view, allowed_mentions=NO_PINGS
         )
     except discord.HTTPException:
         pass
+    for mid in tidy:  # then retire the previous round's dead 🔄/👏
+        await refresh_post_view(channel, mid)
     return True
 
 
@@ -269,6 +312,123 @@ async def repost_doemup(did: str, channel: discord.abc.Messageable) -> None:
             data["game_messages"][str(msg.id)] = {"kind": "doemup", "id": did}
     if orphan:
         await safe_delete(msg)
+
+
+# --- Requeue (🔄) on a closed round --------------------------------------
+# Every finalized round's post keeps a 🔄 (next to the 👏, when there is one):
+# pressing it opens a fresh round on the spot. A recurring game simply plays
+# its next round early — the round after that lands back on its usual slot,
+# since the schedule stays anchored on created_at — and a closed one-off is
+# rebuilt from the snapshot its requeue record saved, with its original open
+# window. Records live in the same store["requeue"] table as a chore's 🔄,
+# tagged ``kind`` so reactions._handle_requeue routes the press here, and the
+# tap leaves the same zero-punto "requeue" marker row (The Reanimator's raw
+# material).
+def _reopened_game(before: dict, kind: str, now: dt.datetime) -> dict:
+    """A closed one-off game, rebuilt from its requeue record's saved snapshot
+    into a dormant record due *now* (the repost path opens it). Round state is
+    reset; the round's open window is its original span again (a do-em-up that
+    had none reopens the same way — until 🏁)."""
+    g = json.loads(json.dumps(before))
+    dur = g.get("duration_secs")
+    closes = g.get("expires_at") if kind == "pitchin" else g.get("deadline")
+    if not dur and closes:
+        dur = max(60, int((from_iso(closes) - from_iso(g["created_at"])).total_seconds()))
+    if kind == "pitchin":
+        # A pitch-in round always has a close; the hour is a safety net,
+        # reachable only from a malformed record.
+        g.update({"scorers": [], "expires_at": None, "duration_secs": dur or 3600})
+    else:
+        g.update({"tallies": {}, "deadline": None, "duration_secs": dur})
+    g.update({"ended": False, "message_id": None, "next_due": to_iso(now)})
+    return g
+
+
+async def _handle_game_requeue(press: Press) -> None:
+    """A 🔄 pressed on a closed pitch-in / do-em-up round's post: open a fresh
+    round on the spot. Declines while a round is already open. The reopened
+    game goes through the store as a dormant round due *now* before the repost,
+    so if the repost itself fails the next scheduler tick retries it."""
+    channel = press.channel
+    now = now_utc()
+    outcome = None  # "fired" | "busy" | "gone"  (None = a concurrent 🔄 won)
+    kind = gid = guild_id = brief = None
+    async with store.txn() as data:
+        rec = data["requeue"].get(str(press.message_id))
+        if rec:
+            kind, gid, guild_id = rec.get("kind"), rec["task_id"], rec["guild_id"]
+            table = data["pitchins" if kind == "pitchin" else "doemups"]
+            live = table.get(gid)
+            if live is not None and live.get("message_id"):
+                outcome = "busy"  # a round is already open — resolve that one
+            elif live is not None:
+                # Dormant between rounds: pull its next slot up to right now.
+                live["next_due"] = to_iso(now)
+                brief = live.get("brief")
+                outcome = "fired"
+            elif rec.get("before") is not None:
+                # The game is gone (a closed one-off): rebuild it from the
+                # saved snapshot as a dormant round due now.
+                table[gid] = _reopened_game(rec["before"], kind, now)
+                brief = rec["before"].get("brief")
+                outcome = "fired"
+            else:
+                outcome = "gone"
+            if outcome == "fired":
+                # This closed post is spent; the fresh round carries its own
+                # buttons. Drop the record so a second tap can't double-fire.
+                data["requeue"].pop(str(press.message_id), None)
+
+    if outcome is None:
+        # A concurrent 🔄 beat us to it — say so instead of going quiet.
+        if press.interaction is not None:
+            await press.whisper("This post's 🔄 has been retired.")
+        return
+    if outcome == "busy":
+        # Leave the button so they can requeue once the open round resolves.
+        await press.retract()
+        await press.whisper(
+            f"🔄 {press.mention}, a round of that one is already open — "
+            "finish or end it first."
+        )
+        return
+    if outcome == "gone":
+        await refresh_post_view(channel, press.message_id)
+        if press.interaction is not None:
+            await press.whisper("Nothing left to re-run here.")
+        return
+
+    # The tap itself is on the record: the same zero-punto marker row a chore's
+    # 🔄 leaves (scoring skips it everywhere except The Reanimator tally).
+    tz = _game_tz(await store.snapshot(), guild_id)
+    await store.log_completion({
+        "id": new_id(),
+        "ts": to_iso(now),
+        "month": now.astimezone(tz).strftime("%Y-%m"),  # local-tz bucket
+        "guild_id": guild_id,
+        "task_id": gid,
+        "brief": brief,
+        "user_id": press.user_id,
+        "user_name": press.display,
+        "kind": "requeue",
+        "points": 0,
+    })
+    if kind == "pitchin":
+        await repost_pitchin(gid, channel)
+    else:
+        await repost_doemup(gid, channel)
+    # Tidy the spent 🔄 off the closed post (its 👏 stays) and confirm right
+    # where they tapped — the fresh round may be far down.
+    await press.retract()
+    await refresh_post_view(channel, press.message_id)
+    try:
+        await channel.send(
+            f"🔄 Re-queued by {press.mention} — a fresh round is open below.",
+            reference=press.message,
+            allowed_mentions=NO_PINGS,
+        )
+    except discord.HTTPException:
+        pass
 
 
 async def post_pitchin(
@@ -645,12 +805,15 @@ async def sweep_games(now: dt.datetime, snap: dict) -> None:
 __all__ = [
     "DoEmUpButton",
     "PitchinButton",
+    "_arm_game_requeue_in",
     "_doemup_press",
     "_game_next_round",
     "_game_record",
     "_game_recurrence_fields",
+    "_handle_game_requeue",
     "_handle_pitchin_reaction",
     "_handle_pitchin_unreact",
+    "_reopened_game",
     "_send_doemup",
     "_send_pitchin",
     "finalize_doemup",

@@ -1664,6 +1664,148 @@ async def test_game_claps() -> None:
         assert sorted(r["user_id"] for r in dclaps) == [7, 42], "both talliers tipped once"
 
 
+async def test_game_requeue_pitchin() -> None:
+    """A closed pitch-in round's post keeps a 🔄 beside the 👏: tapping it
+    rebuilds the closed one-off as a fresh round with its original window and
+    logs the zero-punto marker; the spent 🔄 leaves the old post (👏 stays), a
+    second tap is refused, and a round closed with nobody in still offers 🔄
+    (just no 👏)."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        now = m.now_utc()
+        pid, msg = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Laundry bonanza", description=None,
+            expires_at=m.to_iso(now + dt.timedelta(hours=6)), points_each=1,
+            max_scorers=None, now=now,
+        )
+        mid = msg.id
+        await bot.on_raw_reaction_add(FakePayload(mid, "✅", user_id=42, member=FakeMember(42, "Pat")))
+        await bot.on_raw_reaction_add(FakePayload(mid, m.EMOJI_END, user_id=1, member=FakeMember(1, "Boss")))
+        snap = await st.snapshot()
+        assert pid not in snap["pitchins"], "the closed one-off left the store"
+        rec = snap["requeue"].get(str(mid))
+        assert rec and rec["kind"] == "pitchin" and rec["task_id"] == pid, \
+            "the closed round armed a game 🔄"
+        ids = btn_ids(ch.msgs[mid])
+        assert f"post:requeue:{pid}" in ids and f"post:clap:{pid}" in ids
+
+        # 🔄 reopens it: a fresh live round with the original 6h window.
+        rq = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_post_button("requeue", rq)
+        snap = await st.snapshot()
+        assert str(mid) not in snap["requeue"], "the spent 🔄 record is dropped"
+        p = snap["pitchins"].get(pid)
+        assert p and p["message_id"] and p["message_id"] != mid and not p["ended"]
+        assert p["scorers"] == [] and p["next_due"] is None
+        assert snap["game_messages"][str(p["message_id"])] == {"kind": "pitchin", "id": pid}
+        span = (m.from_iso(p["expires_at"]) - m.now_utc()).total_seconds()
+        assert 5.9 * 3600 < span <= 6 * 3600 + 60, "the reopened round got its original window"
+        assert f"post:requeue:{pid}" not in btn_ids(ch.msgs[mid]), "spent 🔄 left the old post"
+        assert f"post:clap:{pid}" in btn_ids(ch.msgs[mid]), "the 👏 stays"
+        markers = [r for r in st.read_completions() if r["kind"] == "requeue"]
+        assert len(markers) == 1 and markers[0]["user_id"] == 7 and markers[0]["points"] == 0
+        assert markers[0]["task_id"] == pid
+        assert any("Re-queued by <@7>" in (msg.content or "") for msg in ch.msgs.values())
+
+        # A second tap on the spent post is refused, and fires nothing.
+        again = FakeInteraction(user=FakeUser(9, "Lee"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_post_button("requeue", again)
+        w = whispered(again)
+        assert w["ephemeral"] and "retired" in w["content"]
+        assert len([r for r in st.read_completions() if r["kind"] == "requeue"]) == 1
+
+        # The fresh round plays like any other; closed with nobody in, its post
+        # still offers 🔄 — just no 👏 to go with it.
+        mid2 = p["message_id"]
+        await bot.on_raw_reaction_add(FakePayload(mid2, m.EMOJI_END, user_id=1, member=FakeMember(1, "Boss")))
+        snap = await st.snapshot()
+        assert pid not in snap["pitchins"]
+        assert snap["requeue"][str(mid2)]["kind"] == "pitchin"
+        ids = btn_ids(ch.msgs[mid2])
+        assert f"post:requeue:{pid}" in ids and f"post:clap:{pid}" not in ids
+
+
+async def test_game_requeue_recurring_doemup() -> None:
+    """On a recurring do-em-up, 🔄 on the closed round's post opens the next
+    round early (the series stays pinned to its slots); while a round is open
+    the armed 🔄 on an older closed post declines instead of double-posting,
+    the next close retires it, and /deletetask sweeps the table."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        rule = {"freq": "days", "interval_days": 1, "weekdays": [], "monthdays": [],
+                "time_of_day": now.astimezone(tz).strftime("%H:%M")}
+        did, msg = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="Daily weeds", description=None,
+            points_each=1, deadline=m.to_iso(now - dt.timedelta(seconds=1)),
+            point_limit=None, now=now, recurrence=rule, duration_secs=6 * 3600,
+        )
+        mid = msg.id
+
+        async def press(action, uid, name):
+            cur = (await st.snapshot())["doemups"][did]["message_id"]
+            await bot.handle_doemup_button(
+                did, action, FakeInteraction(user=FakeUser(uid, name), channel=ch,
+                                             message=ch.msgs[cur]))
+
+        await press("plus", 42, "Pat")
+        await bot.sweep_games(m.now_utc(), await st.snapshot())  # deadline passed
+        snap = await st.snapshot()
+        assert snap["doemups"][did]["message_id"] is None, "round 1 closed -> dormant"
+        assert snap["requeue"][str(mid)]["kind"] == "doemup"
+        assert f"post:requeue:{did}" in btn_ids(ch.msgs[mid])
+
+        # 🔄 opens the next round right now instead of waiting for the slot.
+        rq = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_post_button("requeue", rq)
+        snap = await st.snapshot()
+        dd = snap["doemups"][did]
+        mid2 = dd["message_id"]
+        assert mid2 and mid2 != mid and dd["next_due"] is None and dd["tallies"] == {}
+        win = (m.from_iso(dd["deadline"]) - m.now_utc()).total_seconds()
+        assert 5.9 * 3600 < win < 6.1 * 3600, "the early round keeps its fixed window"
+        assert str(mid) not in snap["requeue"], "the spent 🔄 record is dropped"
+        assert len([r for r in st.read_completions() if r["kind"] == "requeue"]) == 1
+
+        # Close round 2 -> its post arms the next 🔄; the sweep opens round 3 on
+        # schedule with that 🔄 still standing.
+        await press("plus", 7, "Bo")
+        await press("end", 1, "Boss")
+        snap = await st.snapshot()
+        assert snap["requeue"][str(mid2)]["kind"] == "doemup"
+        async with st.txn() as data:
+            data["doemups"][did]["next_due"] = m.to_iso(m.now_utc() - dt.timedelta(seconds=1))
+        await bot.sweep_games(m.now_utc(), await st.snapshot())
+        snap = await st.snapshot()
+        mid3 = snap["doemups"][did]["message_id"]
+        assert mid3 and mid3 != mid2, "round 3 opened on schedule"
+
+        # With round 3 open, the old post's 🔄 declines rather than double-posting.
+        busy = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid2])
+        await bot.handle_post_button("requeue", busy)
+        w = whispered(busy)
+        assert w["ephemeral"] and "already open" in w["content"]
+        snap = await st.snapshot()
+        assert snap["doemups"][did]["message_id"] == mid3, "no double-post while busy"
+        assert str(mid2) in snap["requeue"], "the button stays for later"
+        assert len([r for r in st.read_completions() if r["kind"] == "requeue"]) == 1, \
+            "a declined 🔄 logs no marker"
+
+        # Round 3's close re-arms 🔄 on ITS post and retires round 2's.
+        await press("end", 1, "Boss")
+        snap = await st.snapshot()
+        assert str(mid2) not in snap["requeue"] and str(mid3) in snap["requeue"]
+        assert f"post:requeue:{did}" not in btn_ids(ch.msgs[mid2]), \
+            "the older closed post's 🔄 is retired"
+
+        # /deletetask tears the series down and sweeps its 🔄 with it.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.deletetask.callback(inter, did)
+        snap = await st.snapshot()
+        assert did not in snap["doemups"] and snap["requeue"] == {}
+
+
 async def test_requeue_oneoff() -> None:
     """A completed one-off is gone from the store; 🔄 rebuilds it from the saved
     snapshot and re-fires it."""
@@ -4044,6 +4186,8 @@ def main() -> None:
     asyncio.run(test_requeue_oneoff())
     asyncio.run(test_claps())
     asyncio.run(test_game_claps())
+    asyncio.run(test_game_requeue_pitchin())
+    asyncio.run(test_game_requeue_recurring_doemup())
     asyncio.run(test_pitchin_lifecycle())
     asyncio.run(test_pitchin_cap_and_points())
     asyncio.run(test_pitchin_expiry())

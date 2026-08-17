@@ -560,9 +560,9 @@ async def delete_task(guild_id: int, tid: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 async def delete_game(guild_id: int, kind: str, eid: str) -> Optional[dict]:
     """Delete a pitch-in / do-em-up series exactly as ``/deletetask`` would:
-    pop the row, sweep its reaction routing and claps, and strike through a
-    live post as cancelled (delete ≠ close — no puntos are awarded). Returns
-    the removed game, or None if it wasn't found in this guild."""
+    pop the row, sweep its reaction routing, requeues and claps, and strike
+    through a live post as cancelled (delete ≠ close — no puntos are awarded).
+    Returns the removed game, or None if it wasn't found in this guild."""
     section = "pitchins" if kind == "pitchin" else "doemups"
     removed, live_mid = None, None
     async with core.store.txn() as data:
@@ -570,9 +570,10 @@ async def delete_game(guild_id: int, kind: str, eid: str) -> Optional[dict]:
         if g and str(g["guild_id"]) == str(guild_id):
             live_mid = g.get("message_id")
             data["game_messages"].pop(str(live_mid), None)
-            for mid, rec in list(data["claps"].items()):
-                if rec.get("task_id") == eid:
-                    data["claps"].pop(mid, None)
+            for table in ("requeue", "claps"):
+                for mid, rec in list(data[table].items()):
+                    if rec.get("task_id") == eid:
+                        data[table].pop(mid, None)
             removed = data[section].pop(eid, None)
     if removed and live_mid:  # Discord I/O stays outside the txn
         channel = (core.bot.get_channel(int(removed["channel_id"]))

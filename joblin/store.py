@@ -34,6 +34,7 @@ EMPTY: dict[str, Any] = {
     "messages": {},
     "undo": {},
     "requeue": {},  # completed-post message id -> {task_id, before, guild_id, channel_id}
+    #   (a closed pitch-in / do-em-up round's record adds kind: "pitchin"|"doemup")
     "claps": {},  # completed-post message id -> {task_id, guild_id, channel_id, brief,
     #   status, participants:[{user_id,user_name}], clappers:[user_id], log_ids:[completion id]}
     "snooze_panels": {},  # panel message id -> {task_id, anchor_id, unit, brief}
