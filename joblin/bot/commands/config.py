@@ -23,6 +23,7 @@ from ..scoring import record_bar_change
     timezone="IANA timezone, e.g. Europe/Berlin (autocompletes)",
     reminder_role="Role to ping on overdue hourly reminders (optional)",
     item_bar="Puntos per trinket each month — every multiple earns another (default 25)",
+    declutter="Sweep superseded chore posts automatically — the 📜 Daily Log keeps the record (default On)",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def joblinconfig(
@@ -31,6 +32,7 @@ async def joblinconfig(
     timezone: Optional[str] = None,
     reminder_role: Optional[discord.Role] = None,
     item_bar: Optional[int] = None,
+    declutter: Optional[bool] = None,
 ) -> None:
     if timezone is not None:
         try:
@@ -63,6 +65,8 @@ async def joblinconfig(
             cfg["reminder_role_id"] = reminder_role.id
         if item_bar is not None:
             record_bar_change(cfg, item_bar, now_utc())
+        if declutter is not None:
+            cfg["declutter"] = declutter
         current = dict(cfg)
 
     ch = f"<#{current['channel_id']}>" if current.get("channel_id") else "— *(unset)*"
@@ -74,7 +78,9 @@ async def joblinconfig(
         f"• Channel: {ch}\n"
         f"• Timezone: {tz}\n"
         f"• Reminder role: {role}\n"
-        f"• Trinket bar: **{bar} puntos** each — every multiple earns another 🖼️"
+        f"• Trinket bar: **{bar} puntos** each — every multiple earns another 🖼️\n"
+        f"• Declutter: **{'on' if current.get('declutter', True) else 'off'}** — "
+        "superseded chore posts are swept; the 📜 Daily Log keeps the record"
     )
     if item_bar is not None:
         msg += "\n  ↳ _counts for the month underway and onward; closed months keep the bar they ended under._"

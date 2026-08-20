@@ -385,11 +385,31 @@ def post_view_for(snap: dict, mid: int) -> Optional[discord.ui.View]:
     )
 
 
-async def refresh_post_view(channel: discord.abc.Messageable, mid: int) -> None:
-    """Re-derive and re-apply a resolved post's buttons after a table change."""
+async def refresh_post_view(
+    channel: discord.abc.Messageable, mid: int, *, retire_delete: bool = False
+) -> None:
+    """Re-derive and re-apply a resolved post's buttons after a table change.
+
+    With ``retire_delete`` (the declutter path), a post whose *last* control has
+    just retired is deleted outright instead of left standing button-less — the
+    📜 Daily Log holds the day's record, so a fully spent post is pure clutter.
+    A post a member has reacted to or replied to (``touched``) is always kept,
+    as is anything still registered live in ``messages``."""
     snap = await store.snapshot()
+    view = post_view_for(snap, mid)
+    if (retire_delete and view is None
+            and str(mid) not in snap.get("touched", {})
+            and str(mid) not in snap["messages"]):
+        try:
+            await channel.get_partial_message(mid).delete()
+            return
+        except discord.NotFound:
+            return
+        except discord.HTTPException as e:
+            log.warning("retire delete failed on message %s: %s", mid, e)
+            # fall through: at least strip the dead buttons
     try:
-        await channel.get_partial_message(mid).edit(view=post_view_for(snap, mid))
+        await channel.get_partial_message(mid).edit(view=view)
     except discord.HTTPException as e:
         log.warning("post view refresh failed on message %s: %s", mid, e)
 
@@ -461,6 +481,71 @@ async def safe_delete(message: Optional[discord.Message]) -> None:
         await message.delete()
     except discord.HTTPException:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Declutter: sweeping an occurrence's superseded posts
+# ---------------------------------------------------------------------------
+def declutter_enabled(cfg: Optional[dict]) -> bool:
+    """Is the message-declutter sweep on for this guild? On unless
+    ``/joblinconfig declutter: False`` turned it off (absent = on)."""
+    return cfg is None or bool(cfg.get("declutter", True))
+
+
+def sweep_targets(
+    message_ids: list[int], keep: Optional[int], touched: dict
+) -> list[int]:
+    """Which of an occurrence's posts a declutter sweep may delete: everything
+    except ``keep`` (the post carrying the current status and buttons) and any
+    post a member has reacted to or replied to (the ``touched`` table — their
+    conversation outlives our housekeeping)."""
+    return [m for m in message_ids if m != keep and str(m) not in touched]
+
+
+async def sweep_occurrence_posts(
+    channel: discord.abc.Messageable, tid: str, message_ids: list[int],
+    *, keep: Optional[int],
+) -> list[int]:
+    """Best-effort declutter of a task occurrence's posts (the fire post and its
+    nags): delete every one except ``keep`` and the touched (see
+    :func:`sweep_targets`), then commit the survivors — swept ids are pruned
+    from the live pending, the ``messages``/``touched`` tables, any per-post
+    action records, and every undo snapshot for the task, so a later ↩️ can't
+    resurrect references to deleted posts. Returns the ids actually deleted."""
+    snap = await store.snapshot()
+    targets = sweep_targets(message_ids, keep, snap.get("touched", {}))
+    deleted: list[int] = []
+    for mid in targets:
+        try:
+            await channel.get_partial_message(mid).delete()
+        except discord.NotFound:
+            deleted.append(mid)  # already gone — still drop the references
+        except discord.HTTPException as e:
+            log.warning("declutter delete failed on message %s: %s", mid, e)
+        else:
+            deleted.append(mid)
+    if not deleted:
+        return []
+    gone = set(deleted)
+    async with store.txn() as data:
+        for mid in deleted:
+            data["messages"].pop(str(mid), None)
+            data.get("touched", {}).pop(str(mid), None)
+            # A swept post may anchor a spent action record (e.g. a snooze's ↩️
+            # from earlier in this occurrence) — record and anchor go together.
+            for table in ("undo", "requeue", "claps"):
+                data[table].pop(str(mid), None)
+        live = data["tasks"].get(tid)
+        p = live.get("pending") if live else None
+        if p and p.get("message_ids"):
+            p["message_ids"] = [m for m in p["message_ids"] if m not in gone]
+        for rec in data["undo"].values():
+            if rec.get("task_id") != tid:
+                continue
+            bp = (rec.get("before") or {}).get("pending") or {}
+            if bp.get("message_ids"):
+                bp["message_ids"] = [m for m in bp["message_ids"] if m not in gone]
+    return deleted
 
 
 # The functional reactions the bot self-reacted on chores posted before the
@@ -561,6 +646,7 @@ __all__ = [
     "bounty_tag",
     "completed_view",
     "config_ready",
+    "declutter_enabled",
     "finalize_messages",
     "guild_config",
     "list_tag",
@@ -573,5 +659,7 @@ __all__ = [
     "rerender_live_post",
     "safe_delete",
     "schedule_label",
+    "sweep_occurrence_posts",
+    "sweep_targets",
     "web_base_url",
 ]

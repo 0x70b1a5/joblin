@@ -458,6 +458,8 @@ class FakeMessage:
             self.content = content
         if "view" in kw:
             self.view = kw["view"]
+        if kw.get("embed") is not None:
+            self.embed = kw["embed"]
 
     async def delete(self) -> None:
         self.channel.deleted.append(self.id)
@@ -2348,20 +2350,27 @@ async def test_shush() -> None:
         assert f"task:shush:{tid}" in btn_ids(ch.msgs[fresh]), "un-shush flips the button to 🤫"
         assert f"task:unshush:{tid}" not in btn_ids(ch.msgs[fresh]), "the 🔊 face is retired"
 
-        # Nags flow again once that fresh hour elapses.
+        # Nags flow again once that fresh hour elapses — and the rolling
+        # declutter sweeps the superseded post: the nag is now the only live one.
         async with st.txn() as data:
             data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
         posted_before = len(ch.msgs)
         await bot.send_reminder(tid, ch, cfg)
         assert len(ch.msgs) == posted_before + 1, "un-shushed task nags again"
+        snap = await st.snapshot()
+        assert fresh in ch.deleted, "rolling declutter swept the superseded post"
+        assert snap["tasks"][tid]["pending"]["message_ids"] == [
+            snap["tasks"][tid]["pending"]["message_ids"][-1]
+        ], "only the nag remains on the books"
 
         # A manually-reacted 🤫 (the legacy entry way) still routes and REPLACES
-        # the post's stamp instead of stacking: after 🔊 then 🤫 on `fresh`,
-        # only the latest stamp line remains.
+        # the post's stamp instead of stacking: after 🔊 then 🤫 on the current
+        # post, only the latest stamp line remains.
+        latest = snap["tasks"][tid]["pending"]["message_ids"][-1]
         await bot.on_raw_reaction_add(
-            FakePayload(fresh, m.EMOJI_SHUSH, member=FakeMember(7, "Sam"))
+            FakePayload(latest, m.EMOJI_SHUSH, member=FakeMember(7, "Sam"))
         )
-        body = ch.msgs[fresh].content or ""
+        body = ch.msgs[latest].content or ""
         assert "Shushed by <@7>" in body and "Un-shushed" not in body
         assert body.count("Shushed by") == 1, "one stamp line, not a pile"
 
@@ -2629,10 +2638,15 @@ async def test_done_arming_batch() -> None:
                 "created_by": 1, "created_at": m.to_iso(now), "pending": None,
             }
         await bot.fire_task(tid, ch, cfg)
-        # A nag too, so the completion has an older post to strip.
+        # A nag too, so the completion has an older post to strip. The fire post
+        # is marked touched (someone reacted a 🎉 to it) so the declutter sweeps
+        # keep it around to be stripped.
+        first = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][0]
+        await bot._mark_touched(first)
         async with st.txn() as data:
             data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
         await bot.send_reminder(tid, ch, cfg)
+        assert first not in ch.deleted, "a touched post survives the rolling sweep"
         first, anchor = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"]
 
         flushes = 0
@@ -2645,16 +2659,19 @@ async def test_done_arming_batch() -> None:
         await bot.handle_task_button(tid, "done", FakeInteraction(
             user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[anchor]))
         st._flush = real_flush  # type: ignore[method-assign]
-        assert flushes == 2, f"completion + combined arming = 2 flushes, got {flushes}"
+        # Completion txn + combined arming txn + the 📜 Daily Log's first-post
+        # bookkeeping (later completions of the day just edit the embed).
+        assert flushes == 3, f"completion + arming + daily-log = 3 flushes, got {flushes}"
         snap = await st.snapshot()
         for table in ("undo", "requeue", "claps"):
             assert list(snap[table]) == [str(anchor)], f"{table} armed in the batch"
         assert btn_ids(ch.msgs[anchor]) == [
             f"post:undo:{tid}", f"post:requeue:{tid}", f"post:clap:{tid}"]
-        assert btn_ids(ch.msgs[first]) == [], "the nagged-over post's row is stripped"
+        assert btn_ids(ch.msgs[first]) == [], "the touched nagged-over post's row is stripped"
+        assert first not in ch.deleted, "touched: kept, not swept"
 
-        # The next occurrence completes: the old post's whole row retires (the
-        # tidy-up now runs after the status edit, but it still runs).
+        # The next occurrence completes: the old post's whole row retires — and
+        # with every control gone, the untouched post itself is decluttered away.
         async with st.txn() as data:
             data["tasks"][tid]["next_due"] = m.to_iso(now - dt.timedelta(seconds=1))
         await bot.fire_task(tid, ch, cfg)
@@ -2664,7 +2681,7 @@ async def test_done_arming_batch() -> None:
         snap = await st.snapshot()
         for table in ("undo", "requeue", "claps"):
             assert list(snap[table]) == [str(mid2)], f"{table} moved to the new post"
-        assert btn_ids(ch.msgs[anchor]) == [], "the older completed post's row is retired"
+        assert anchor in ch.deleted, "the fully retired completed post is deleted"
         assert btn_ids(ch.msgs[mid2]) == [
             f"post:undo:{tid}", f"post:requeue:{tid}", f"post:clap:{tid}"]
 
@@ -2696,6 +2713,9 @@ async def test_listopen() -> None:
             }
         await bot.fire_task(tid, ch, cfg)
         orig = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][0]
+        # Touched (someone replied to it), so the rolling declutter keeps the
+        # original around when the nag lands.
+        await bot._mark_touched(orig)
         async with st.txn() as data:
             data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
         await bot.send_reminder(tid, ch, cfg)
@@ -4123,6 +4143,271 @@ async def test_list_edit_and_web() -> None:
         assert not any(i.startswith("task:item:") for i in btn_ids(ch.msgs[mid]))
 
 
+def _log_row(ts: str, uid: int, name: str, brief: str, *, kind="recurring",
+             points=1, task_id="t1", guild=1) -> dict:
+    """A completion-log row shaped like the real writers', for daily-log tests."""
+    return {"id": f"r-{uid}-{ts}", "ts": ts, "month": ts[:7], "guild_id": guild,
+            "task_id": task_id, "brief": brief, "user_id": uid,
+            "user_name": name, "kind": kind, "points": points}
+
+
+def test_daily_log_render() -> None:
+    """The 📜 Daily Log renders strictly chronologically regardless of row order
+    in the file, groups rows written together (a 🧾 list's tickers) into one
+    line, skips zero-punto 🔄 markers, and keeps a kaboom's signed puntos."""
+    import joblin.bot as bot
+
+    tz = ZoneInfo("Europe/Berlin")
+    def at(h, mi=0):
+        return m.to_iso(dt.datetime(2026, 8, 20, h, mi, tzinfo=tz))
+    rows = [  # deliberately out of order
+        _log_row(at(14), 2, "Pat", "Evening feed"),
+        _log_row(at(9), 1, "Sam", "Morning feed"),
+        _log_row(at(11), 1, "Sam", "Ghost row", kind="requeue", points=0),
+        _log_row(at(12), 1, "Sam", "Big shop", kind="list", task_id="shop"),
+        _log_row(at(12), 2, "Pat", "Big shop", kind="list", task_id="shop"),
+        _log_row(at(13), 1, "Sam", "Dishes", kind="kaboom", points=-5, task_id="bomb"),
+        _log_row(at(13), 2, "Pat", "Dishes", kind="kaboom", points=-5, task_id="bomb"),
+        _log_row(at(10), 2, "Pat", "Morning feed", kind="clap"),
+    ]
+    day = bot.log_day(m.from_iso(at(9)), tz)
+    lines = bot.daily_log_lines(rows, 1, day, tz)
+    assert len(lines) == 5, f"grouped into 5 events, got {len(lines)}: {lines}"
+    assert "Ghost row" not in "\n".join(lines), "🔄 markers never appear"
+    order = ["Morning feed", "👏", "Big shop", "💥", "Evening feed"]
+    for a, b in zip(order, order[1:]):
+        joined = "\n".join(lines)
+        assert joined.index(a) < joined.index(b), f"{a!r} must precede {b!r}"
+    listy = next(line for line in lines if "Big shop" in line)
+    assert "<@1>" in listy and "<@2>" in listy and "+1 each" in listy
+    boom = next(line for line in lines if "💥" in line)
+    assert "−5 each" in boom and "<@1>" in boom and "<@2>" in boom
+    # Net day total keeps the kaboom's sign: 1 + 1 + 2 + (−10) + 1 = −5.
+    assert bot.day_puntos(rows, 1, day, tz) == -5
+    # Another guild's log sees none of it.
+    assert bot.daily_log_lines(rows, 2, day, tz) == []
+
+
+def test_daily_log_day_framing() -> None:
+    """The log's day rolls with scoring's nightly frame: 23:59 plus the grace
+    window still belongs to the closing day; a couple of minutes past midnight
+    belongs to the new one."""
+    import joblin.bot as bot
+
+    tz = ZoneInfo("Europe/Berlin")
+    def local(d, h, mi, s=0):
+        return dt.datetime(2026, 8, d, h, mi, s, tzinfo=tz)
+    assert bot.log_day(local(20, 10, 0), tz) == dt.date(2026, 8, 20)
+    assert bot.log_day(local(20, 23, 58), tz) == dt.date(2026, 8, 20)
+    # 00:00:30 is inside the nightly post's grace — still the closing day.
+    assert bot.log_day(local(21, 0, 0, 30), tz) == dt.date(2026, 8, 20)
+    assert bot.log_day(local(21, 0, 2), tz) == dt.date(2026, 8, 21)
+
+
+def test_daily_log_clip() -> None:
+    """A day too long for one embed drops its *oldest* lines under the cap and
+    says how many fell off the top."""
+    import joblin.bot as bot
+
+    lines = [f"line number {i:04d} with some padding text" for i in range(200)]
+    clipped = bot.clip_lines(lines, limit=1000)
+    assert sum(len(line) + 1 for line in clipped) <= 1000
+    assert "earlier line" in clipped[0] and "clipped" in clipped[0]
+    assert clipped[-1] == lines[-1], "the newest line always survives"
+    assert bot.clip_lines(["short"], limit=1000) == ["short"], "under the cap: untouched"
+
+
+async def test_daily_log_lifecycle() -> None:
+    """✅ posts the day's 📜 embed once, later completions edit it in place, an
+    ↩️ undo removes its line, and undoing the day's last event deletes the
+    (now empty) log message."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        for tid, brief in (("eggs", "Collect the eggs"), ("wood", "Split some wood")):
+            async with st.txn() as data:
+                data["tasks"][tid] = {
+                    "id": tid, "guild_id": 1, "brief": brief, "description": None,
+                    "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                    "monthdays": [], "time_of_day": tod,
+                    "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                    "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+                }
+
+        await bot.fire_task("eggs", ch, cfg)
+        mid1 = (await st.snapshot())["tasks"]["eggs"]["pending"]["message_ids"][-1]
+        await bot.handle_task_button("eggs", "done", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid1]))
+        snap = await st.snapshot()
+        book = snap["daily_log"]["1"]
+        assert len(book) == 1, "one day on the books"
+        log_mid = int(next(iter(book.values()))["message_id"])
+        embed = ch.msgs[log_mid].embed
+        assert embed.title.startswith("📜 Daily Log")
+        assert "Collect the eggs" in embed.description and "<@42>" in embed.description
+        assert "1 punto" in embed.footer.text
+
+        # Second completion of the day: same message, edited — no second embed.
+        await bot.fire_task("wood", ch, cfg)
+        mid2 = (await st.snapshot())["tasks"]["wood"]["pending"]["message_ids"][-1]
+        await bot.handle_task_button("wood", "done", FakeInteraction(
+            user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid2]))
+        snap = await st.snapshot()
+        assert len(snap["daily_log"]["1"]) == 1, "still one day, one message"
+        embed = ch.msgs[log_mid].embed
+        assert "Collect the eggs" in embed.description
+        assert "Split some wood" in embed.description
+        assert embed.description.index("eggs") < embed.description.index("wood"), \
+            "chronological: first done first"
+        assert "2 puntos" in embed.footer.text
+
+        # ↩️ the wood: its line leaves the log (derived, not accumulated).
+        await bot.handle_post_button("undo", FakeInteraction(
+            user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid2]))
+        embed = ch.msgs[log_mid].embed
+        assert "Split some wood" not in embed.description
+        assert "Collect the eggs" in embed.description
+
+        # ↩️ the eggs too: an empty day's log message is deleted outright.
+        await bot.handle_post_button("undo", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid1]))
+        snap = await st.snapshot()
+        assert log_mid in ch.deleted, "empty log message removed"
+        assert snap["daily_log"]["1"] == {}, "the day left the books"
+
+
+async def test_declutter_rolling_and_touched() -> None:
+    """Each nag sweeps the superseded untouched posts (one live post per chore);
+    a reacted-on post survives every sweep; and the commit prunes swept ids from
+    the pending, the messages table, and the undo snapshot."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        tid = "fence"
+        async with st.txn() as data:
+            data["tasks"][tid] = {
+                "id": tid, "guild_id": 1, "brief": "Walk the fence line", "description": None,
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+
+        async def nag() -> None:
+            async with st.txn() as data:
+                data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(
+                    now - dt.timedelta(seconds=1))
+            await bot.send_reminder(tid, ch, cfg)
+
+        await bot.fire_task(tid, ch, cfg)
+        fire_mid = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][0]
+        await nag()
+        snap = await st.snapshot()
+        assert fire_mid in ch.deleted, "the fire post is swept when the nag lands"
+        assert str(fire_mid) not in snap["messages"], "…and de-registered"
+        mids = snap["tasks"][tid]["pending"]["message_ids"]
+        assert len(mids) == 1, "one live post per pending chore"
+
+        # A fun reaction on the current nag: it survives the next sweep.
+        await bot.on_raw_reaction_add(
+            FakePayload(mids[0], "🎉", member=FakeMember(7, "Sam")))
+        snap = await st.snapshot()
+        assert str(mids[0]) in snap["touched"], "decoration marks the post touched"
+        keep_mid = mids[0]
+        await nag()
+        snap = await st.snapshot()
+        assert keep_mid not in ch.deleted, "a touched post outlives the sweep"
+        mids = snap["tasks"][tid]["pending"]["message_ids"]
+        assert mids[0] == keep_mid and len(mids) == 2
+
+        # ✅ sweeps nothing extra (only the touched post remained), and the undo
+        # snapshot's message list holds exactly the surviving posts.
+        anchor = mids[-1]
+        await bot.handle_task_button(tid, "done", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[anchor]))
+        snap = await st.snapshot()
+        assert keep_mid not in ch.deleted
+        rec = snap["undo"][str(anchor)]
+        assert rec["before"]["pending"]["message_ids"] == [keep_mid, anchor]
+
+        # A functional emoji is a press, not a comment — ✅ on the next
+        # occurrence's post completes it rather than marking it touched.
+        async with st.txn() as data:
+            data["tasks"][tid]["next_due"] = m.to_iso(now - dt.timedelta(seconds=1))
+        await bot.fire_task(tid, ch, cfg)
+        live = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][-1]
+        await bot.on_raw_reaction_add(
+            FakePayload(live, m.EMOJI_DONE, member=FakeMember(7, "Sam")))
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["pending"] is None, "✅ routed as a completion"
+        assert str(live) not in snap["touched"]
+
+
+async def test_declutter_off() -> None:
+    """/joblinconfig declutter:False turns every sweep off: nags stack, a ✅
+    strips rows but deletes nothing, and a fully retired post keeps standing."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        async with st.txn() as data:
+            data["configs"]["1"]["declutter"] = False
+        cfg = (await st.snapshot())["configs"]["1"]
+        tid = "mulch"
+        async with st.txn() as data:
+            data["tasks"][tid] = {
+                "id": tid, "guild_id": 1, "brief": "Turn the mulch", "description": None,
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+        await bot.fire_task(tid, ch, cfg)
+        async with st.txn() as data:
+            data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
+        await bot.send_reminder(tid, ch, cfg)
+        snap = await st.snapshot()
+        mids = snap["tasks"][tid]["pending"]["message_ids"]
+        assert len(mids) == 2 and ch.deleted == [], "no rolling sweep when off"
+        await bot.handle_task_button(tid, "done", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mids[-1]]))
+        assert ch.deleted == [], "no completion sweep when off"
+        assert btn_ids(ch.msgs[mids[0]]) == [], "the older post's row is still stripped"
+
+
+async def test_reply_marks_touched() -> None:
+    """A member's reply to one of our posts marks it touched (via reference
+    metadata — no content intent needed); bot-authored replies don't count."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        async with st.txn() as data:
+            data["messages"]["4242"] = "sometask"
+
+        class _Ref:
+            message_id = 4242
+
+        class _Author:
+            def __init__(self, is_bot): self.bot = is_bot
+
+        class _Msg:
+            def __init__(self, is_bot):
+                self.author = _Author(is_bot)
+                self.guild = object()
+                self.reference = _Ref()
+
+        await bot.on_message(_Msg(is_bot=True))
+        assert "4242" not in (await st.snapshot())["touched"], "bot replies don't touch"
+        await bot.on_message(_Msg(is_bot=False))
+        assert "4242" in (await st.snapshot())["touched"], "a member's reply touches"
+
+
 def main() -> None:
     test_emoji_key()
     test_time_parsing()
@@ -4209,6 +4494,13 @@ def main() -> None:
     test_web_schedule()
     asyncio.run(test_web_task_crud())
     asyncio.run(test_web_game_crud())
+    test_daily_log_render()
+    test_daily_log_day_framing()
+    test_daily_log_clip()
+    asyncio.run(test_daily_log_lifecycle())
+    asyncio.run(test_declutter_rolling_and_touched())
+    asyncio.run(test_declutter_off())
+    asyncio.run(test_reply_marks_touched())
     print("✅ all smoke tests passed")
 
 

@@ -394,6 +394,17 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
+    embed.add_field(
+        name="📜 The Daily Log (and tidy sweeps)",
+        value=(
+            "Every punto event of the day lands as a line in one growing 📜 embed "
+            "(it corrects itself on ↩️/👏). Superseded chore posts — old nags, "
+            "spent buttons — are swept away automatically, *except* any post "
+            "someone reacted to or replied to, which stays. "
+            "`/joblinconfig declutter:False` turns the sweeps off."
+        ),
+        inline=False,
+    )
     embed.set_footer(
         text="e.g.  /newtask brief:Trash out at:19:00 repeat:mon,thu   ·   "
         "/pitchin brief:Laundry bonanza expires:tonight"

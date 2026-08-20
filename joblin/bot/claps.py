@@ -230,6 +230,9 @@ async def _handle_clap(press: Press) -> None:
         return
     for r in new_records:
         await store.log_completion(r)
+    if new_records:
+        from .daily_log import refresh_daily_log  # runtime import — no cycle
+        await refresh_daily_log(rec0["guild_id"], now)
     if body is not None:
         if rec0.get("ui") == "buttons":
             # One edit bumps both the tally line and the button's ×n label —

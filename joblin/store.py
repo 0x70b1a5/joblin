@@ -38,6 +38,11 @@ EMPTY: dict[str, Any] = {
     "claps": {},  # completed-post message id -> {task_id, guild_id, channel_id, brief,
     #   status, participants:[{user_id,user_name}], clappers:[user_id], log_ids:[completion id]}
     "snooze_panels": {},  # panel message id -> {task_id, anchor_id, unit, brief}
+    "touched": {},  # message id -> ISO instant a member first reacted to / replied
+    #   to one of our posts (the declutter sweeps leave touched posts standing)
+    "daily_log": {},  # guild id -> {"YYYY-MM-DD": {message_id, channel_id}} — the
+    #   📜 Daily Log embed per day-frame; its *content* is always re-derived from
+    #   completions.jsonl, only the message's address persists (recent days kept)
     "pitchins": {},  # pitch-in id -> pitch-in dict (see models.py)
     "doemups": {},  # do-em-up id -> do-em-up dict (see models.py)
     "game_messages": {},  # message id -> {"kind": "pitchin"|"doemup", "id": <game id>}

@@ -35,6 +35,8 @@ from .helpers import (
     _clear_bot_reactions,
     _game_tz,
     _remove_user_reaction,
+    declutter_enabled,
+    guild_config,
     post_view_for,
     refresh_post_view,
     safe_delete,
@@ -186,7 +188,8 @@ async def finalize_pitchin(pid: str, channel: discord.abc.Messageable) -> bool:
                       "expires_at": None, "next_due": to_iso(nxt)})
         else:
             data["pitchins"].pop(pid, None)
-    for rec in game_records(event, "pitchin", tz, now):
+    awarded = game_records(event, "pitchin", tz, now)
+    for rec in awarded:
         await store.log_completion(rec)
     body = render_pitchin(event, final=True)
     if nxt is not None:
@@ -206,8 +209,12 @@ async def finalize_pitchin(pid: str, channel: discord.abc.Messageable) -> bool:
         await pm.edit(content=body, view=view, allowed_mentions=NO_PINGS)
     except discord.HTTPException:
         pass
+    declutter = declutter_enabled(guild_config(snap, event["guild_id"]))
     for mid in tidy:  # then retire the previous round's dead 🔄/👏
-        await refresh_post_view(channel, mid)
+        await refresh_post_view(channel, mid, retire_delete=declutter)
+    if awarded:
+        from .daily_log import refresh_daily_log  # runtime import — no cycle
+        await refresh_daily_log(event["guild_id"], now)
     return True
 
 
@@ -237,7 +244,8 @@ async def finalize_doemup(did: str, channel: discord.abc.Messageable) -> bool:
                       "deadline": None, "next_due": to_iso(nxt)})
         else:
             data["doemups"].pop(did, None)
-    for rec in game_records(event, "doemup", tz, now):
+    awarded = game_records(event, "doemup", tz, now)
+    for rec in awarded:
         await store.log_completion(rec)
     body = render_doemup(event, final=True)
     if nxt is not None:
@@ -253,8 +261,12 @@ async def finalize_doemup(did: str, channel: discord.abc.Messageable) -> bool:
         )
     except discord.HTTPException:
         pass
+    declutter = declutter_enabled(guild_config(snap, event["guild_id"]))
     for mid in tidy:  # then retire the previous round's dead 🔄/👏
-        await refresh_post_view(channel, mid)
+        await refresh_post_view(channel, mid, retire_delete=declutter)
+    if awarded:
+        from .daily_log import refresh_daily_log  # runtime import — no cycle
+        await refresh_daily_log(event["guild_id"], now)
     return True
 
 

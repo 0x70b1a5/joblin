@@ -32,8 +32,14 @@ from ..models import (
     to_iso,
 )
 from .core import NO_PINGS, bot, store
-from .helpers import finalize_messages
+from .helpers import (
+    declutter_enabled,
+    finalize_messages,
+    guild_config,
+    sweep_occurrence_posts,
+)
 from .scoring import puntobomb_casualties
+from .daily_log import refresh_daily_log
 from .reactions import _delete_panels, _take_task_panels
 
 
@@ -109,6 +115,11 @@ async def explode_puntobomb(
     status = render_kaboom(removed, victims)
     if message_ids:
         await finalize_messages(channel, message_ids, status, legacy=legacy, view=None)
+        if declutter_enabled(cfg) and len(message_ids) > 1:
+            # Same declutter as a ✅: the blast anchor tells the story, the
+            # superseded fire post and nags go (touched ones stay).
+            await sweep_occurrence_posts(channel, tid, message_ids,
+                                         keep=message_ids[-1])
     else:
         # Armed but never posted (downtime past both the due and the fuse):
         # the blast still needs announcing.
@@ -117,6 +128,8 @@ async def explode_puntobomb(
         except discord.HTTPException:
             pass
     await _delete_panels(panels)
+    if victims:
+        await refresh_daily_log(removed["guild_id"], now)
     return True
 
 
@@ -136,6 +149,9 @@ async def coward_strike(removed: dict) -> None:
         ch, mids, render_coward(removed["brief"]),
         legacy=p.get("ui") != "buttons", view=None,
     )
+    snap = await store.snapshot()
+    if declutter_enabled(guild_config(snap, removed["guild_id"])) and len(mids) > 1:
+        await sweep_occurrence_posts(ch, removed["id"], mids, keep=mids[-1])
 
 
 __all__ = [

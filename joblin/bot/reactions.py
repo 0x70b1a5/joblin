@@ -13,6 +13,7 @@ from ..models import (
     EMOJI_CLAP,
     EMOJI_DELETE,
     EMOJI_DONE,
+    EMOJI_END,
     EMOJI_FFWD,
     EMOJI_INFO,
     EMOJI_LIST,
@@ -48,13 +49,16 @@ from .helpers import (
     _tidy_stale,
     completed_view,
     config_ready,
+    declutter_enabled,
     finalize_messages,
     guild_config,
     make_task_view,
     post_content,
     refresh_post_view,
     safe_delete,
+    sweep_occurrence_posts,
 )
+from .daily_log import refresh_all_daily_logs, refresh_daily_log
 from .claps import (
     _arm_clap_in,
     _handle_clap,
@@ -66,6 +70,53 @@ from .games import (
 )
 from .scheduler import fire_task
 
+
+
+# ---------------------------------------------------------------------------
+# Touched posts — the declutter sweeps' keep-list
+# ---------------------------------------------------------------------------
+# Emoji that *do* something on our posts (now, or in the reaction era) — a
+# press, not a comment. Anything else a member reacts onto a tracked post is
+# decoration: it marks the post "touched", and every declutter sweep leaves a
+# touched post standing (the family's conversation outlives our housekeeping).
+_FUNCTIONAL_KEYS = frozenset(emoji_key(e) for e in (
+    EMOJI_DONE, EMOJI_FFWD, EMOJI_INFO, EMOJI_SKIP, EMOJI_DELETE,
+    EMOJI_SHUSH, EMOJI_UNSHUSH, EMOJI_UNDO, EMOJI_REQUEUE, EMOJI_CLAP,
+    EMOJI_END,
+))
+
+
+def _is_tracked_post(snap: dict, mid: int) -> bool:
+    """Is this one of our sweepable posts — a live occurrence post or a resolved
+    anchor still carrying ↩️/🔄/👏? (Game posts and snooze panels have their own
+    lifecycles and are never swept, so they don't collect touches.)"""
+    key = str(mid)
+    return (key in snap["messages"] or key in snap["undo"]
+            or key in snap["requeue"] or key in snap["claps"])
+
+
+async def _mark_touched(mid: int) -> None:
+    key = str(mid)
+    snap = await store.snapshot()
+    if key in snap.get("touched", {}):
+        return
+    async with store.txn() as data:
+        data.setdefault("touched", {})[key] = to_iso(now_utc())
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    """The one thing we need from the message stream (no message_content intent
+    — ``reference`` is metadata): a member replying to one of our posts marks it
+    touched, so the declutter sweeps leave their conversation's anchor alone."""
+    if message.author.bot or message.guild is None:
+        return
+    ref = message.reference
+    if ref is None or ref.message_id is None:
+        return
+    snap = await store.snapshot()
+    if _is_tracked_post(snap, ref.message_id):
+        await _mark_touched(ref.message_id)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +160,11 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if str(payload.message_id) in snap["snooze_panels"]:
         await _handle_snooze_panel(payload, channel)
         return
+    if key not in _FUNCTIONAL_KEYS and _is_tracked_post(snap, payload.message_id):
+        # A fun reaction (😄, 🎉, …) on one of our posts — from here on, no
+        # declutter sweep will delete it.
+        await _mark_touched(payload.message_id)
+        return
     game = snap["game_messages"].get(str(payload.message_id))
     if game:
         if game["kind"] == "pitchin":
@@ -134,7 +190,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     elif key == emoji_key(EMOJI_DONE):
         await _handle_done(tid, task, cfg, tz, press)
     elif key in (emoji_key(EMOJI_SKIP), emoji_key(EMOJI_DELETE)):
-        await _handle_skip_or_delete(tid, task, tz, press)
+        await _handle_skip_or_delete(tid, task, cfg, tz, press)
     elif key in (emoji_key(EMOJI_SHUSH), emoji_key(EMOJI_UNSHUSH)):
         await _handle_shush(tid, task, press, shush=key == emoji_key(EMOJI_SHUSH))
 
@@ -189,7 +245,7 @@ async def handle_task_button(tid: str, action: str, interaction: discord.Interac
     elif action == "done":
         await _handle_done(tid, task, cfg, tz, press)
     elif action == "skip":
-        await _handle_skip_or_delete(tid, task, tz, press)
+        await _handle_skip_or_delete(tid, task, cfg, tz, press)
     elif action in ("shush", "unshush"):
         await _handle_shush(tid, task, press, shush=action == "shush")
 
@@ -749,15 +805,24 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
                   if message_ids else None),
         )
         await _delete_panels(panels)
+        declutter = declutter_enabled(cfg)
+        if declutter and len(message_ids) > 1:
+            # Declutter: the anchor now tells the story — the superseded fire
+            # post and nags go (except any a member reacted to or replied on).
+            await sweep_occurrence_posts(channel, tid, message_ids,
+                                         keep=message_ids[-1])
         tidy: set[int] = set()
         await _tidy_stale(channel, stale_undo, EMOJI_UNDO, tidy)
         await _tidy_stale(channel, stale_requeue, EMOJI_REQUEUE, tidy)
         await _tidy_stale(channel, stale_clap, EMOJI_CLAP, tidy)
         for mid in tidy:
-            await refresh_post_view(channel, mid)
+            # A prior anchor whose last control just retired is deleted rather
+            # than left button-less (touched posts stay) — see refresh_post_view.
+            await refresh_post_view(channel, mid, retire_delete=declutter)
+        await refresh_daily_log(task["guild_id"], completed)
 
 
-async def _handle_skip_or_delete(tid, task, tz, press: Press) -> None:
+async def _handle_skip_or_delete(tid, task, cfg, tz, press: Press) -> None:
     channel = press.channel
     await press.ack()
     message_ids: list[int] = []
@@ -810,8 +875,13 @@ async def _handle_skip_or_delete(tid, task, tz, press: Press) -> None:
         view=completed_view(tid, undo=True) if message_ids else None,
     )
     await _delete_panels(panels)
+    declutter = declutter_enabled(cfg)
+    if declutter and len(message_ids) > 1:
+        # Same declutter as a ✅: the skipped/cancelled anchor tells the story.
+        await sweep_occurrence_posts(channel, tid, message_ids,
+                                     keep=message_ids[-1])
     for mid in tidy:
-        await refresh_post_view(channel, mid)
+        await refresh_post_view(channel, mid, retire_delete=declutter)
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1077,10 @@ async def _handle_undo(press: Press) -> None:
             await store.void_completion(lid)
         await _restore_anchor(channel, press.message_id, tid, before,
                               legacy_record=legacy_record)
+        if completion_ids or clap_log_ids:
+            # The voided rows leave the 📜 Daily Log too — every tracked day is
+            # redrawn, since the undo may reach back past the nightly roll.
+            await refresh_all_daily_logs(before["guild_id"])
     elif outcome == "refused":
         await _disarm_undo_button(press, legacy_record)
 
@@ -1190,14 +1264,18 @@ __all__ = [
     "_handle_requeue",
     "_handle_shush",
     "_handle_skip_or_delete",
+    "_FUNCTIONAL_KEYS",
     "_handle_snooze_panel",
     "_handle_undo",
+    "_is_tracked_post",
+    "_mark_touched",
     "_restore_anchor",
     "_take_task_panels",
     "can_undo",
     "handle_list_button",
     "handle_post_button",
     "handle_task_button",
+    "on_message",
     "on_raw_reaction_add",
     "on_raw_reaction_remove",
     "snooze_panel_text",

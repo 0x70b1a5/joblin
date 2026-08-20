@@ -17,9 +17,11 @@ from .core import (
 )
 from .helpers import (
     config_ready,
+    declutter_enabled,
     guild_config,
     post_occurrence,
     safe_delete,
+    sweep_occurrence_posts,
 )
 from .games import sweep_games
 from .backup import run_daily_backups
@@ -109,12 +111,14 @@ async def send_reminder(tid: str, channel: discord.abc.Messageable, cfg: dict) -
     message = await post_occurrence(channel, tid, task, cfg, reminder=True)
 
     orphan = False
+    prior_mids: list[int] = []
     async with store.txn() as data:
         live = data["tasks"].get(tid)
         p = live.get("pending") if live else None
         if not p:
             orphan = True
         else:
+            prior_mids = list(p["message_ids"])
             p["message_ids"].append(message.id)
             p["remind_at"] = to_iso(now_utc() + dt.timedelta(hours=1))
             data["messages"][str(message.id)] = tid
@@ -124,6 +128,11 @@ async def send_reminder(tid: str, channel: discord.abc.Messageable, cfg: dict) -
             live["nag_count"] = live.get("nag_count", 0) + 1
     if orphan:
         await safe_delete(message)
+    elif prior_mids and declutter_enabled(cfg):
+        # Rolling declutter: the fresh nag supersedes the older posts, so the
+        # untouched ones go — the channel holds at most one live post per chore
+        # (plus any post the family has actually reacted to or replied on).
+        await sweep_occurrence_posts(channel, tid, prior_mids, keep=None)
 
 
 __all__ = [

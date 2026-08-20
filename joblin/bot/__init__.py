@@ -50,6 +50,18 @@ live post) through the very same per-action handlers, via the ``Press``
 abstraction in helpers.py. An occurrence's ``pending["ui"]`` says which era it
 fired in, so resolution knows whether an emoji sweep is still needed.
 
+Declutter & the 📜 Daily Log (daily_log.py)
+-------------------------------------------
+Superseded posts are swept away instead of piling up: each nag deletes the
+posts it replaces, resolution deletes everything but the anchor, and a resolved
+post whose last ↩️/🔄/👏 retires is deleted too — *except* any post a member
+has reacted to or replied to (the ``touched`` table, fed by decoration
+reactions and ``on_message`` reply references; no content intent needed).
+The day's record lives in the 📜 Daily Log instead: one embed per guild-day,
+re-derived in full from completions.jsonl on every change (so ↩️/👏 correct
+it), chronological, rolling with scoring's nightly ~23:59 frame. Sweeps are
+per-guild switchable (``/joblinconfig declutter:False``); the log always runs.
+
 Undo
 ----
 Each of the three mutating actions stashes a deep copy of the task *as it was
@@ -73,6 +85,7 @@ from . import helpers
 from . import claps
 from . import games
 from . import scoring
+from . import daily_log
 from . import backup
 from . import month_close
 from . import scheduler
@@ -85,8 +98,9 @@ from . import admin
 # Re-export every submodule's public surface (incl. the ``main`` entry point
 # used by __main__.py) so `import joblin.bot as bot; bot.<name>` and the
 # smoke tests keep resolving exactly as before the split.
-_SUBMODULES = (core, helpers, claps, games, scoring, backup, month_close,
-               scheduler, reactions, bombs, commands, listing, admin)
+_SUBMODULES = (core, helpers, claps, games, scoring, daily_log, backup,
+               month_close, scheduler, reactions, bombs, commands, listing,
+               admin)
 for _mod in _SUBMODULES:
     for _name in getattr(_mod, "__all__", ()):
         globals()[_name] = getattr(_mod, _name)
