@@ -14,8 +14,8 @@ log and the auto-leaderboard can never disagree about what "today" meant.
 Lines are strictly chronological — rows are sorted by their logged instant, and
 rows written together (same instant, task, kind: a 🧾 list's tickers, a
 pitch-in's scorers, one clap's beneficiaries) collapse into a single line.
-Zero-punto 🔄 requeue markers are skipped, like everywhere else outside the
-Reanimator tally.
+Zero-punto marker rows (🔄 requeues, ⏭️ skips) are skipped, like everywhere
+else outside their badge tallies.
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ from .core import (
     store,
 )
 from .helpers import config_ready, guild_config
-from .scoring import _completion_points, _last_post_day
+from .scoring import MARKER_KINDS, _completion_points, _last_post_day
 
 # How many day-frames keep an editable log message on the books (an undo can
 # still redraw a closed day's log while its entry survives; older voids just
@@ -74,7 +74,7 @@ def _day_groups(records: list[dict], guild_id: int, day: dt.date,
     rows written together (same instant, task, kind) form one group."""
     rows: list[tuple[dt.datetime, dict]] = []
     for rec in records:
-        if rec.get("guild_id") != guild_id or rec.get("kind") == "requeue":
+        if rec.get("guild_id") != guild_id or rec.get("kind") in MARKER_KINDS:
             continue
         try:
             at = from_iso(rec["ts"])

@@ -855,7 +855,26 @@ async def _handle_skip_or_delete(tid, task, cfg, tz, press: Press) -> None:
         if press.interaction is not None:
             await press.whisper("Already sorted — someone beat you to this one.")
         return
+    completion_ids: Optional[list[str]] = None
     if mode == "skip":
+        # The skip itself is on the record: a zero-punto marker row (kind
+        # "skip"), same deal as a 🔄's — it feeds the Skipper-dee-doo-dah tally
+        # and nothing else, and an ↩️ voids it along with the restore.
+        skipped_at = now_utc()
+        marker = {
+            "id": new_id(),
+            "ts": to_iso(skipped_at),
+            "month": skipped_at.astimezone(tz).strftime("%Y-%m"),  # local-tz bucket
+            "guild_id": task["guild_id"],
+            "task_id": tid,
+            "brief": task["brief"],
+            "user_id": press.user_id,
+            "user_name": press.display,
+            "kind": "skip",
+            "points": 0,
+        }
+        await store.log_completion(marker)
+        completion_ids = [marker["id"]]
         status = f"**{task['brief']}**\n⏭️ Skipped this time by {press.mention} — back next cycle."
     elif mode == "delete":
         if task.get("puntobomb"):
@@ -869,7 +888,8 @@ async def _handle_skip_or_delete(tid, task, cfg, tz, press: Press) -> None:
     if message_ids:
         # Arm before the status edit lands the ↩️; retiring older posts' rows
         # waits until after it (same order as _handle_done).
-        await _arm_undo(mode, tid, before, message_ids[-1], channel, tidy=tidy)
+        await _arm_undo(mode, tid, before, message_ids[-1], channel,
+                        completion_ids=completion_ids, tidy=tidy)
     await finalize_messages(
         channel, message_ids, status, legacy=legacy,
         view=completed_view(tid, undo=True) if message_ids else None,

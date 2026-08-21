@@ -3123,6 +3123,74 @@ def test_reanimator() -> None:
     assert empty
 
 
+def test_skipper() -> None:
+    """Skipper-dee-doo-dah: ⏭️ marker rows crown the top skipper (ties share,
+    month scope holds) — a skip never mints a punto, seeds no one onto the
+    board, and stays out of the 📜 Daily Log."""
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    from joblin.bot import daily_log as dl
+    from joblin.bot.scoring import (
+        _completion_points,
+        badge_titles,
+        build_leaderboard,
+        monthly_scores,
+        star_counts,
+    )
+
+    g = 1
+
+    def sk(uid, name, month="2026-04"):
+        return {"guild_id": g, "month": month, "user_id": uid, "user_name": name,
+                "kind": "skip", "points": 0, "task_id": "a",
+                "ts": f"{month}-02T12:00:00+00:00"}
+
+    # Worth 0 — even a mangled marker with no points field never falls back to 1.
+    assert _completion_points(sk(1, "Pat")) == 0
+    assert _completion_points({"kind": "skip"}) == 0
+
+    recs = [
+        {"guild_id": g, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "recurring", "points": 1, "task_id": "a", "late_seconds": 0},
+        sk(2, "Sam"), sk(2, "Sam"), sk(1, "Pat"),
+        # Dodger only ever skips — never completes a thing.
+        sk(3, "Dodger"),
+        sk(3, "Dodger", month="2026-05"), sk(3, "Dodger", month="2026-05"),
+    ]
+
+    def holders(month):
+        by: dict[str, set[int]] = {}
+        for uid, names in badge_titles(recs, g, month).items():
+            for n in names:
+                by.setdefault(n, set()).add(uid)
+        return by
+
+    assert holders("2026-04")["Skipper-dee-doo-dah"] == {2}, "Sam's two April ⏭️ beat one"
+    assert badge_titles(recs, g, "2026-05") == {3: ["Skipper-dee-doo-dah"]}
+    assert holders(None)["Skipper-dee-doo-dah"] == {3}, "all-time: Dodger's 3 lead"
+
+    # The economy is untouched: markers score nothing, seed nobody, star nobody.
+    months = monthly_scores(recs, g)
+    assert set(months["2026-04"]) == {1}, "skip-only users never reach the board"
+    assert months["2026-04"][1] == {"points": 1, "chores": 1, "claps": 0, "name": "Pat"}
+    assert "2026-05" not in months, "a month of nothing but markers scores nothing"
+    assert star_counts(recs, g, current_month="2026-06") == {1: 1}
+
+    # A board-listed holder wears the title on the rendered board.
+    text, empty = build_leaderboard(recs, g, None, month="2026-04")
+    assert not empty and "Skipper-dee-doo-dah" not in text  # Pat holds none — Sam isn't listed
+    recs.append(sk(1, "Pat"))
+    text, empty = build_leaderboard(recs, g, None, month="2026-04")
+    assert not empty and "Skipper-dee-doo-dah" in text  # tie pulls Pat in
+
+    # The 📜 Daily Log never shows a skip: a day of only markers has no groups.
+    tz = ZoneInfo("UTC")
+    at = dt.datetime(2026, 4, 2, 12, tzinfo=dt.timezone.utc)
+    day = dl.log_day(at, tz)
+    assert dl._day_groups([sk(2, "Sam")], g, day, tz) == []
+
+
 def test_early_bird_night_owl() -> None:
     """Early Bird / Night Owl: disjoint guild-local clock windows over when a
     solo chore's ✅ landed — the owl's night wraps midnight, window edges land
@@ -4436,6 +4504,7 @@ def main() -> None:
     test_leaderboard_text()
     test_badge_titles()
     test_reanimator()
+    test_skipper()
     test_early_bird_night_owl()
     test_rank_spice()
     asyncio.run(test_daily_backup())
