@@ -106,9 +106,15 @@ async def _mark_touched(mid: int) -> None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    """The one thing we need from the message stream (no message_content intent
-    — ``reference`` is metadata): a member replying to one of our posts marks it
-    touched, so the declutter sweeps leave their conversation's anchor alone."""
+    """Two things we need from the message stream (no message_content intent —
+    type/author/``reference`` are metadata): our own "pinned a message" system
+    notice (the 📜 taking its pin) is deleted as clutter, and a member replying
+    to one of our posts marks it touched, so the declutter sweeps leave their
+    conversation's anchor alone."""
+    if (message.type is discord.MessageType.pins_add
+            and bot.user and message.author.id == bot.user.id):
+        await safe_delete(message)
+        return
     if message.author.bot or message.guild is None:
         return
     ref = message.reference

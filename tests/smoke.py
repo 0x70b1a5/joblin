@@ -15,6 +15,8 @@ import sys
 import tempfile
 from zoneinfo import ZoneInfo
 
+import discord
+
 # Make `joblin` importable when run straight from the repo (the package
 # isn't pip-installed; running a script puts tests/ — not the root — on path).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -464,6 +466,14 @@ class FakeMessage:
     async def delete(self) -> None:
         self.channel.deleted.append(self.id)
 
+    async def pin(self, **kw) -> None:  # absorbs reason=
+        if self.id not in self.channel.pins:
+            self.channel.pins.append(self.id)
+
+    async def unpin(self, **kw) -> None:
+        if self.id in self.channel.pins:
+            self.channel.pins.remove(self.id)
+
 
 class FakeChannel:
     def __init__(self) -> None:
@@ -473,6 +483,7 @@ class FakeChannel:
         self.deleted: list = []
         self.cleared: list = []
         self.cleared_emoji: list = []
+        self.pins: list[int] = []  # currently-pinned message ids, in pin order
         self.files: list = []  # discord.File objects passed to send(file=...)
         self._next = 1000
 
@@ -4317,6 +4328,7 @@ async def test_daily_log_lifecycle() -> None:
         assert embed.title.startswith("📜 Daily Log")
         assert "Collect the eggs" in embed.description and "<@42>" in embed.description
         assert "1 punto" in embed.footer.text
+        assert log_mid in ch.pins, "the open day's log rides pinned"
 
         # Second completion of the day: same message, edited — no second embed.
         await bot.fire_task("wood", ch, cfg)
@@ -4345,6 +4357,55 @@ async def test_daily_log_lifecycle() -> None:
         snap = await st.snapshot()
         assert log_mid in ch.deleted, "empty log message removed"
         assert snap["daily_log"]["1"] == {}, "the day left the books"
+
+
+async def test_daily_log_pin_cycle() -> None:
+    """The open day's 📜 pins on first post; the nightly unpin takes it down
+    and clears the flag; a later same-frame refresh edits without re-pinning
+    (only a first post pins)."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        for tid, brief in (("eggs", "Collect the eggs"), ("wood", "Split some wood")):
+            async with st.txn() as data:
+                data["tasks"][tid] = {
+                    "id": tid, "guild_id": 1, "brief": brief, "description": None,
+                    "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                    "monthdays": [], "time_of_day": tod,
+                    "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                    "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+                }
+
+        await bot.fire_task("eggs", ch, cfg)
+        mid1 = (await st.snapshot())["tasks"]["eggs"]["pending"]["message_ids"][-1]
+        await bot.handle_task_button("eggs", "done", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid1]))
+        snap = await st.snapshot()
+        entry = next(iter(snap["daily_log"]["1"].values()))
+        log_mid = int(entry["message_id"])
+        assert entry["pinned"] is True and ch.pins == [log_mid]
+
+        # The nightly roll: pin down, flag cleared; a second sweep is a no-op.
+        await bot.unpin_day_logs(1)
+        snap = await st.snapshot()
+        entry = next(iter(snap["daily_log"]["1"].values()))
+        assert ch.pins == [] and "pinned" not in entry
+        await bot.unpin_day_logs(1)
+        assert ch.pins == []
+
+        # A straggler completion still in the same frame edits the existing
+        # message — no repost, so no pin comes back.
+        await bot.fire_task("wood", ch, cfg)
+        mid2 = (await st.snapshot())["tasks"]["wood"]["pending"]["message_ids"][-1]
+        await bot.handle_task_button("wood", "done", FakeInteraction(
+            user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid2]))
+        snap = await st.snapshot()
+        assert len(snap["daily_log"]["1"]) == 1
+        assert "Split some wood" in ch.msgs[log_mid].embed.description
+        assert ch.pins == [], "an unpinned frame stays unpinned"
 
 
 async def test_declutter_rolling_and_touched() -> None:
@@ -4452,7 +4513,9 @@ async def test_declutter_off() -> None:
 
 async def test_reply_marks_touched() -> None:
     """A member's reply to one of our posts marks it touched (via reference
-    metadata — no content intent needed); bot-authored replies don't count."""
+    metadata — no content intent needed); bot-authored replies don't count; and
+    our own "pinned a message" system notice is deleted as clutter while a
+    member's pin notice is left alone."""
     with tempfile.TemporaryDirectory() as d:
         bot, st, ch = await _game_setup(d)
         async with st.txn() as data:
@@ -4462,18 +4525,34 @@ async def test_reply_marks_touched() -> None:
             message_id = 4242
 
         class _Author:
-            def __init__(self, is_bot): self.bot = is_bot
+            def __init__(self, is_bot, uid=1): self.bot = is_bot; self.id = uid
 
         class _Msg:
-            def __init__(self, is_bot):
-                self.author = _Author(is_bot)
+            def __init__(self, is_bot, uid=1, mtype=discord.MessageType.default):
+                self.author = _Author(is_bot, uid)
                 self.guild = object()
                 self.reference = _Ref()
+                self.type = mtype
+                self.deleted = False
+
+            async def delete(self): self.deleted = True
 
         await bot.on_message(_Msg(is_bot=True))
         assert "4242" not in (await st.snapshot())["touched"], "bot replies don't touch"
         await bot.on_message(_Msg(is_bot=False))
         assert "4242" in (await st.snapshot())["touched"], "a member's reply touches"
+
+        # Pin notices: ours (the 📜 taking its pin) vanishes, a member's stays.
+        bot.bot._connection.user = FakeUser(9, "Joblin")
+        try:
+            ours = _Msg(is_bot=True, uid=9, mtype=discord.MessageType.pins_add)
+            await bot.on_message(ours)
+            assert ours.deleted, "our own pin notice is swept"
+            theirs = _Msg(is_bot=False, uid=1, mtype=discord.MessageType.pins_add)
+            await bot.on_message(theirs)
+            assert not theirs.deleted, "a member's pin notice is left alone"
+        finally:
+            bot.bot._connection.user = None
 
 
 def main() -> None:
@@ -4567,6 +4646,7 @@ def main() -> None:
     test_daily_log_day_framing()
     test_daily_log_clip()
     asyncio.run(test_daily_log_lifecycle())
+    asyncio.run(test_daily_log_pin_cycle())
     asyncio.run(test_declutter_rolling_and_touched())
     asyncio.run(test_declutter_off())
     asyncio.run(test_reply_marks_touched())

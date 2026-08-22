@@ -5,7 +5,13 @@ from ``completions.jsonl`` (the same recompute-from-log spirit as ⭐ stars), so
 an ↩️ undo or a late 👏 corrects the picture exactly the way the leaderboard
 corrects its scores, and a restart loses nothing. Only the log message's
 address persists (``store["daily_log"][guild_id][day] -> {message_id,
-channel_id}``, pruned to the last few days).
+channel_id, pinned?}``, pruned to the last few days).
+
+The *open* day's log rides 📌-pinned — chore posts bury it in the scrollback,
+but the pin keeps it one tap away — and the pin comes down at the nightly
+~23:59 roll (:func:`unpin_day_logs`, called from the backup routine at the
+same instant the day-frame closes). Our own "pinned a message" system notice
+is deleted by ``on_message``; a closed day's log never re-pins.
 
 The "day" is scoring's nightly frame, not calendar midnight: it rolls at the
 ~23:59 nightly post (grace-adjusted via :func:`scoring._last_post_day`), so the
@@ -220,6 +226,40 @@ async def refresh_all_daily_logs(guild_id: int) -> None:
         log.exception("daily log refresh failed for guild %s", guild_id)
 
 
+async def unpin_day_logs(guild_id: int) -> None:
+    """Take down every 📌 the guild's day logs still hold — the closing half of
+    the pin lifecycle, called at the nightly roll. Sweeping *all* flagged
+    entries (not just the closing day's) makes it self-healing: a pin a crashed
+    night left behind comes down the next one. Never raises."""
+    try:
+        async with _guild_lock(guild_id):
+            snap = await store.snapshot()
+            book = snap.get("daily_log", {}).get(str(guild_id)) or {}
+            done: list[str] = []
+            for key, entry in book.items():
+                if not entry.get("pinned"):
+                    continue
+                channel = bot.get_channel(int(entry["channel_id"]))
+                if channel is None:
+                    continue  # cache cold — keep the flag so tomorrow retries
+                try:
+                    await channel.get_partial_message(
+                        int(entry["message_id"])).unpin()
+                except discord.HTTPException:
+                    pass  # unpinned by hand, or the message itself is gone
+                done.append(key)
+            if done:
+                async with store.txn() as data:
+                    gbook = (data.get("daily_log", {}).get(str(guild_id))
+                             or {})
+                    for key in done:
+                        entry = gbook.get(key)
+                        if entry:
+                            entry.pop("pinned", None)
+    except Exception:
+        log.exception("daily log unpin failed for guild %s", guild_id)
+
+
 async def _guild_day_context(
     guild_id: int, at: dt.datetime
 ) -> Optional[tuple[ZoneInfo, dt.date]]:
@@ -280,9 +320,19 @@ async def _refresh_day(guild_id: int, tz: ZoneInfo, day: dt.date) -> None:
     except discord.HTTPException as e:
         log.warning("daily log post failed for guild %s: %s", guild_id, e)
         return
+    pinned = False
+    if day == log_day(now_utc(), tz):
+        # Only the frame open *now* takes the pin — refresh_all_daily_logs can
+        # repost a closed day's hand-deleted log, and that one stays down.
+        try:
+            await message.pin()
+            pinned = True
+        except discord.HTTPException as e:
+            log.warning("daily log pin failed for guild %s: %s", guild_id, e)
     async with store.txn() as data:
         book = data.setdefault("daily_log", {}).setdefault(str(guild_id), {})
-        book[key] = {"message_id": message.id, "channel_id": channel.id}
+        book[key] = {"message_id": message.id, "channel_id": channel.id,
+                     "pinned": pinned}
         cutoff = day - dt.timedelta(days=LOG_KEEP_DAYS)
         for old in list(book):
             try:
@@ -314,4 +364,5 @@ __all__ = [
     "log_day",
     "refresh_all_daily_logs",
     "refresh_daily_log",
+    "unpin_day_logs",
 ]

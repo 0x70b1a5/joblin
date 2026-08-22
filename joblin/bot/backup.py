@@ -40,6 +40,7 @@ import discord
 
 from ..models import _next_clock, from_iso, to_iso
 from .core import NIGHTLY_HOUR, NIGHTLY_MINUTE, NO_PINGS, bot, log, store
+from .daily_log import unpin_day_logs
 from .helpers import config_ready
 from .scoring import build_leaderboard
 
@@ -134,6 +135,10 @@ async def _do_backup(guild_id: int, cfg: dict, channel: discord.abc.Messageable,
             return
         c["next_backup_at"] = _next_backup_at(now, tz)
         prev_sig = c.get("last_backup_sig")
+
+    # The day-frame is closing: the 📜's pin comes down now, whether or not
+    # tonight turns out to have anything to post.
+    await unpin_day_logs(guild_id)
 
     store_bytes, log_bytes = _read_state()
     cur_sig = _log_sig(log_bytes)
