@@ -35,6 +35,7 @@ bar — to gamify the family chores.
   | Reaction | Action |
   |---|---|
   | ✅ | **Complete** — logs *who* completed it. Recurring tasks roll to their next slot; one-offs are removed. |
+  | 🎁 | **Award** — credit someone else: an ephemeral picker of household chips (everyone in the completion log) plus a Discord user picker. The chore's punto goes to them; you show up as the witness. On a crowded row (described nag) it shares a button with 🤫/🔊. |
   | ⏩ | **Snooze** — opens a small **number-pad panel** (a separate message): tap a number, with an ⏱️ hours / 📅 days toggle, or ❌ to cancel. |
   | ℹ️ | **Info** — replies with the full description. *(Only shown if the task has one.)* |
   | ❌ | **Skip** — skips just *this* occurrence of a recurring task (it returns next cycle); deletes a one-off. To remove a recurring task entirely, use `/deletetask`. |

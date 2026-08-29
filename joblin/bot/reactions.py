@@ -15,6 +15,7 @@ from ..models import (
     EMOJI_DONE,
     EMOJI_END,
     EMOJI_FFWD,
+    EMOJI_GIFT,
     EMOJI_INFO,
     EMOJI_LIST,
     EMOJI_REQUEUE,
@@ -254,6 +255,8 @@ async def handle_task_button(tid: str, action: str, interaction: discord.Interac
         await _handle_skip_or_delete(tid, task, cfg, tz, press)
     elif action in ("shush", "unshush"):
         await _handle_shush(tid, task, press, shush=action == "shush")
+    elif action == "award":
+        await _open_award(tid, task, cfg, tz, press)
 
 
 async def handle_list_button(tid: str, idx: int, interaction: discord.Interaction) -> None:
@@ -599,13 +602,297 @@ async def _handle_snooze_panel(
         await _announce_snooze(tid, before, remind, amount, mention, anchor_id, channel)
 
 
-async def _handle_shush(tid, task, press: Press, *, shush: bool) -> None:
-    """🤫 sets the task's lifetime no-nag flag, 🔊 clears it: a shushed chore
-    still fires on schedule, but the hourly reminders stop until someone taps
-    🔊 on a live post. Nag posts carry the 🤫 button and a shushed chore's
-    posts carry 🔊 (either emoji added manually on a live pre-button post
-    routes here too). A tap that matches the current state (🤫 on an
-    already-shushed chore, or vice versa) is a no-op."""
+# ---------------------------------------------------------------------------
+# Award (🎁) — complete this occurrence as someone else
+# ---------------------------------------------------------------------------
+# 🎁 on the live row opens an ephemeral picker (family chips from the
+# completion log, plus a User Select for anyone else). The presser is the
+# witness; the picked person gets the punto. On a described nag the quiet
+# face shares slot 5 (🤫🎁 / 🔊🎁) and this same panel carries 🤫/🔊 so the
+# extra tap isn't a second hop. Not persisted: a dead panel is a fresh 🎁
+# tap away, like the snooze numpad.
+AWARD_CHIP_LIMIT = 10
+
+
+def award_chips(records: list[dict], guild_id: int, *, exclude_id: int,
+                limit: int = AWARD_CHIP_LIMIT) -> list[dict]:
+    """Recent-first household chips: unique users in this guild's completion
+    log, most-recent appearance first, excluding ``exclude_id`` (the presser —
+    self-award is ✅). Latest ``user_name`` wins. Same roster source as a
+    puntobomb's casualties; the log is the family without a members intent."""
+    names: dict[int, str] = {}
+    order: list[int] = []
+    for rec in reversed(records):
+        if rec.get("guild_id") != guild_id:
+            continue
+        uid = rec.get("user_id")
+        if uid is None:
+            continue
+        uid = int(uid)
+        if uid == exclude_id or uid in names:
+            continue
+        names[uid] = rec.get("user_name") or str(uid)
+        order.append(uid)
+        if len(order) >= limit:
+            break
+    return [{"user_id": uid, "user_name": names[uid]} for uid in order]
+
+
+class AwardView(discord.ui.View):
+    """The 🎁 picker as an ephemeral button grid: family chips, optional
+    🤫/🔊 (when this press came from a combo face), a User Select, and ❌.
+    Private to the presser and transient — after a restart it goes dead."""
+
+    def __init__(
+        self, tid: str, brief: str, anchor_id: int,
+        channel: discord.abc.Messageable, *,
+        presser_id: int, presser_mention: str,
+        chips: list[dict], show_shush: bool, no_nag: bool,
+        cfg: dict, tz: ZoneInfo,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.tid = tid
+        self.brief = brief
+        self.anchor_id = anchor_id
+        self.channel = channel
+        self.presser_id = presser_id
+        self.presser_mention = presser_mention
+        self.chips = chips
+        self.show_shush = show_shush
+        self.no_nag = no_nag
+        self.cfg = cfg
+        self.tz = tz
+        self._select: Optional[discord.ui.UserSelect] = None
+        self._build()
+
+    def content(self) -> str:
+        return f"🎁 **Award {self.brief}** — who did it?"
+
+    def _build(self) -> None:
+        self.clear_items()
+        for i, chip in enumerate(self.chips):
+            name = (chip["user_name"] or "").strip() or str(chip["user_id"])
+            button = discord.ui.Button(
+                label=name[:80], style=discord.ButtonStyle.secondary, row=i // 5,
+            )
+            button.callback = self._picker(chip)
+            self.add_item(button)
+        ctrl_row = 2 if len(self.chips) > 5 else (1 if self.chips else 0)
+        if self.show_shush:
+            quiet = discord.ui.Button(
+                emoji=EMOJI_UNSHUSH if self.no_nag else EMOJI_SHUSH,
+                style=discord.ButtonStyle.secondary, row=ctrl_row,
+            )
+            quiet.callback = self._quiet
+            self.add_item(quiet)
+        cancel = discord.ui.Button(
+            emoji=EMOJI_DELETE, style=discord.ButtonStyle.secondary, row=ctrl_row,
+        )
+        cancel.callback = self._cancel
+        self.add_item(cancel)
+        select = discord.ui.UserSelect(
+            placeholder="or anyone else", min_values=1, max_values=1,
+            row=ctrl_row + 1,
+        )
+        select.callback = self._on_select
+        self._select = select
+        self.add_item(select)
+
+    def _picker(self, chip: dict):
+        async def pick(interaction: discord.Interaction) -> None:
+            await self._award(
+                interaction, chip["user_id"], chip["user_name"],
+                f"<@{chip['user_id']}>",
+            )
+        return pick
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        user = (self._select.values[0] if self._select is not None
+                and self._select.values else None)
+        if user is None:
+            return
+        if getattr(user, "bot", False):
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException as e:
+                log.warning("award select ack failed (user %s): %s",
+                            interaction.user.id, e)
+            try:
+                await interaction.followup.send(
+                    "🎁 Pick a person, not a bot.", ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return
+        await self._award(
+            interaction, user.id, user.display_name, user.mention,
+        )
+
+    async def _award(self, interaction: discord.Interaction,
+                     user_id: int, user_name: str, mention: str) -> None:
+        if user_id == self.presser_id:
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException as e:
+                log.warning("award self ack failed (user %s): %s",
+                            interaction.user.id, e)
+            try:
+                await interaction.followup.send(
+                    "That's what ✅ is for — tap Done to claim it yourself.",
+                    ephemeral=True)
+            except discord.HTTPException as e:
+                log.warning("award self whisper failed (user %s): %s",
+                            interaction.user.id, e)
+            return
+        self.stop()
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException as e:
+            log.warning("award pick ack failed (user %s): %s",
+                        interaction.user.id, e)
+        snap = await store.snapshot()
+        task = snap["tasks"].get(self.tid)
+        cfg = guild_config(snap, (task or {}).get("guild_id") or 0) or self.cfg
+        if not task or not task.get("pending") or not config_ready(cfg):
+            result = "raced"
+        else:
+            user = interaction.user
+            press = Press(
+                user_id=user.id,
+                mention=user.mention,
+                display=user.display_name,
+                message_id=self.anchor_id,
+                channel=interaction.channel or self.channel,
+                interaction=interaction,
+            )
+            result = await _handle_done(
+                self.tid, task, cfg, self.tz, press,
+                awardee={"user_id": user_id, "user_name": user_name,
+                         "mention": mention},
+            )
+        if result == "ok":
+            text = f"🎁 Awarded **{self.brief}** to {mention}."
+        elif result == "bounty":
+            text = (f"💰 That's **their** bounty — they can't collect it "
+                    "(it's worth 2 puntos!).")
+        elif result == "bomb":
+            text = "💥 Too late — this puntobomb has already gone off."
+        else:
+            text = "Already sorted — someone beat you to this one."
+        try:
+            await interaction.edit_original_response(content=text, view=None)
+        except discord.HTTPException as e:
+            log.warning("award confirm edit failed (user %s): %s",
+                        interaction.user.id, e)
+
+    async def _quiet(self, interaction: discord.Interaction) -> None:
+        """🤫/🔊 on the combo panel: flip the flag, stamp the chore post, keep
+        the picker so you can still award."""
+        shush = not self.no_nag
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException as e:
+            log.warning("award quiet ack failed (user %s): %s",
+                        interaction.user.id, e)
+        changed = await _apply_shush(self.tid, shush=shush)
+        if not changed:
+            try:
+                await interaction.followup.send(
+                    "Already sorted — this chore is in that state.",
+                    ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return
+        self.no_nag = shush
+        snap = await store.snapshot()
+        task = snap["tasks"].get(self.tid)
+        if task is not None:
+            line = _shush_line(self.presser_mention, shush=shush)
+            pm = self.channel.get_partial_message(self.anchor_id)
+            try:
+                full = await pm.fetch()
+                content = full.content or ""
+            except discord.HTTPException:
+                content = getattr(pm, "content", None) or ""
+            try:
+                await pm.edit(
+                    content=_shush_stamp(content, line),
+                    view=make_task_view(self.tid, {**task, "no_nag": shush},
+                                        reminder=True),
+                    allowed_mentions=NO_PINGS,
+                )
+            except discord.HTTPException as e:
+                log.warning("award quiet stamp failed on message %s: %s",
+                            self.anchor_id, e)
+        self._build()
+        try:
+            await interaction.edit_original_response(
+                content=self.content(), view=self)
+        except discord.HTTPException as e:
+            log.warning("award quiet redraw failed (user %s): %s",
+                        interaction.user.id, e)
+
+    async def _cancel(self, interaction: discord.Interaction) -> None:
+        self.stop()
+        await interaction.response.edit_message(
+            content="🎁 Award cancelled.", view=None)
+
+
+def _award_combo_pressed(press: Press, tid: str) -> bool:
+    """Was this 🎁 the crowded-row combo (🤫🎁 / 🔊🎁)? The label is the
+    signal — a standalone gift has none. After a declutter sweep the nag may
+    be the only ``message_ids`` entry, so ``mid != mids[0]`` is not enough;
+    the face on the pressed post is."""
+    custom_id = f"task:award:{tid}"
+    msg = getattr(press.interaction, "message", None) if press.interaction else None
+    if msg is None:
+        return False
+    view = getattr(msg, "view", None)
+    if view is not None:
+        for c in view.children:
+            inner = getattr(c, "item", c)
+            if getattr(inner, "custom_id", None) == custom_id:
+                return bool(getattr(inner, "label", None))
+    for row in getattr(msg, "components", None) or []:
+        kids = (getattr(row, "children", None)
+                or getattr(row, "components", None) or [])
+        for child in kids:
+            if getattr(child, "custom_id", None) == custom_id:
+                return bool(getattr(child, "label", None))
+    return False
+
+
+async def _open_award(tid: str, task: dict, cfg: dict, tz: ZoneInfo,
+                     press: Press) -> None:
+    """🎁 on a live post: whisper the picker. Hidden on puntobombs."""
+    if task.get("puntobomb"):
+        await press.whisper(
+            "🎁 A puntobomb has to be defused in person — that's what ✅ is.")
+        return
+    mids = (task.get("pending") or {}).get("message_ids") or []
+    reminder = bool(mids) and press.message_id != mids[0]
+    # The combo face is the only time 🤫/🔊 isn't already on the post, so
+    # that's the only time the panel carries it. Prefer the pressed face
+    # (survives a sweep that left the nag as the sole live post).
+    show_shush = bool(
+        _award_combo_pressed(press, tid)
+        or (task.get("description") and (task.get("no_nag") or reminder))
+    )
+    chips = award_chips(
+        store.read_completions(), task["guild_id"], exclude_id=press.user_id,
+    )
+    view = AwardView(
+        tid, task["brief"], press.message_id, press.channel,
+        presser_id=press.user_id, presser_mention=press.mention,
+        chips=chips, show_shush=show_shush,
+        no_nag=bool(task.get("no_nag")), cfg=cfg, tz=tz,
+    )
+    await press.whisper(view.content(), view=view)
+
+
+async def _apply_shush(tid: str, *, shush: bool) -> bool:
+    """Set or clear ``no_nag``. Returns True if the flag actually changed.
+    Un-shushing restarts the hourly cadence so a stale ``remind_at`` doesn't
+    nag on the next tick."""
     changed = False
     async with store.txn() as data:
         live = data["tasks"].get(tid)
@@ -614,9 +901,31 @@ async def _handle_shush(tid, task, press: Press, *, shush: bool) -> None:
             live["no_nag"] = shush
             p = live.get("pending")
             if not shush and p:
-                # Un-shushing: remind_at is stale (often long past), so restart
-                # the hourly cadence fresh instead of nagging on the next tick.
                 p["remind_at"] = to_iso(now_utc() + dt.timedelta(hours=1))
+    return changed
+
+
+def _shush_stamp(content: str, line: str) -> str:
+    """Replace any earlier 🤫/🔊 stamp so repeated toggles never stack."""
+    stamps = (f"{EMOJI_SHUSH} Shushed by ", f"{EMOJI_UNSHUSH} Un-shushed by ")
+    kept = [ln for ln in (content or "").split("\n") if ln and not ln.startswith(stamps)]
+    return "\n".join(kept + [line])
+
+
+def _shush_line(mention: str, *, shush: bool) -> str:
+    if shush:
+        return f"{EMOJI_SHUSH} Shushed by {mention} — reminders off."
+    return f"{EMOJI_UNSHUSH} Un-shushed by {mention} — reminders back on."
+
+
+async def _handle_shush(tid, task, press: Press, *, shush: bool) -> None:
+    """🤫 sets the task's lifetime no-nag flag, 🔊 clears it: a shushed chore
+    still fires on schedule, but the hourly reminders stop until someone taps
+    🔊 on a live post. Nag posts carry the 🤫 button and a shushed chore's
+    posts carry 🔊 (either emoji added manually on a live pre-button post
+    routes here too). A tap that matches the current state (🤫 on an
+    already-shushed chore, or vice versa) is a no-op."""
+    changed = await _apply_shush(tid, shush=shush)
     await press.retract()
     if not changed:
         # Task vanished under us, or already in the asked-for state.
@@ -627,18 +936,13 @@ async def _handle_shush(tid, task, press: Press, *, shush: bool) -> None:
     # flipped the switch, replacing any earlier stamp so repeated toggles on
     # one post never stack up. The button/emoji face flips with it so the post
     # always shows the *next* action — the two directions never share a face.
-    if shush:
-        line = f"{EMOJI_SHUSH} Shushed by {press.mention} — reminders off."
-    else:
-        line = f"{EMOJI_UNSHUSH} Un-shushed by {press.mention} — reminders back on."
-    stamps = (f"{EMOJI_SHUSH} Shushed by ", f"{EMOJI_UNSHUSH} Un-shushed by ")
+    line = _shush_line(press.mention, shush=shush)
     if press.interaction is not None:
         # One edit does it all: restamp the content and flip the action row
         # (reminder=True keeps a shush face on the post in both directions).
         content = press.interaction.message.content or ""
-        kept = [ln for ln in content.split("\n") if ln and not ln.startswith(stamps)]
         await press.edit_pressed(
-            content="\n".join(kept + [line]),
+            content=_shush_stamp(content, line),
             view=make_task_view(tid, {**task, "no_nag": shush}, reminder=True),
             allowed_mentions=NO_PINGS,
         )
@@ -656,30 +960,41 @@ async def _handle_shush(tid, task, press: Press, *, shush: bool) -> None:
         pass
     try:
         content = (await reacted.fetch()).content or ""
-        kept = [ln for ln in content.split("\n") if ln and not ln.startswith(stamps)]
-        await reacted.edit(content="\n".join(kept + [line]), allowed_mentions=NO_PINGS)
+        await reacted.edit(content=_shush_stamp(content, line), allowed_mentions=NO_PINGS)
     except discord.HTTPException:
         pass
 
 
-async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
+async def _handle_done(tid, task, cfg, tz, press: Press,
+                      *, awardee: Optional[dict] = None) -> str:
+    """Complete the pending occurrence. ``awardee`` (user_id/user_name/mention)
+    credits someone else — the presser is recorded as ``awarded_by`` and gets
+    no punto. Returns ``"ok"`` on success, or ``"bounty"`` / ``"bomb"`` /
+    ``"raced"`` when it refuses (the ✅ path whispers; the 🎁 path lets the
+    award panel report)."""
     channel = press.channel
+    doer_id = awardee["user_id"] if awardee else press.user_id
+    doer_name = awardee["user_name"] if awardee else press.display
+    doer_mention = awardee["mention"] if awardee else press.mention
     # A bounty is a chore the creator has put up for *someone else*: it's worth
-    # double, and they can't claim it themselves.
-    if task.get("bounty") and press.user_id == task.get("created_by"):
+    # double, and they can't collect it. The check is against the *doer* (the
+    # awardee, when 🎁 credited someone), so the creator can still award it.
+    if task.get("bounty") and doer_id == task.get("created_by"):
         await press.retract()
-        await press.whisper(
-            f"💰 {press.mention}, this is **your** bounty — someone else has to claim it "
-            "(it's worth 2 puntos!)."
-        )
-        return
+        if awardee is None:
+            await press.whisper(
+                f"💰 {press.mention}, this is **your** bounty — someone else has to claim it "
+                "(it's worth 2 puntos!)."
+            )
+        return "bounty"
     # A puntobomb past its fuse can't be defused — the tick that blows it may
     # simply not have come round yet. Let the sweep do its grim work.
     if (task.get("puntobomb") and task.get("explodes_at")
             and now_utc() >= from_iso(task["explodes_at"])):
         await press.retract()
-        await press.whisper("💥 Too late — this puntobomb has already gone off.")
-        return
+        if awardee is None:
+            await press.whisper("💥 Too late — this puntobomb has already gone off.")
+        return "bomb"
 
     await press.ack()
     completed = now_utc()
@@ -706,13 +1021,14 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
             items = live.get("items") or []
             if items:
                 # A ✅ on a part-done 🧾 list means "the rest is done too" — the
-                # unticked remainder is swept as the presser's. Every distinct
-                # ticker is a doer and earns their own punto (never a bounty, so
-                # no doubling; a solo doer is the plain 1-chore-1-punto case).
+                # unticked remainder is swept as the presser's (or the awardee's,
+                # when 🎁 credited someone). Every distinct ticker is a doer and
+                # earns their own punto (never a bounty, so no doubling; a solo
+                # doer is the plain 1-chore-1-punto case).
                 ticks = p.setdefault("ticks", {})
                 for i in range(len(items)):
-                    ticks.setdefault(str(i), {"user_id": press.user_id,
-                                              "user_name": press.display})
+                    ticks.setdefault(str(i), {"user_id": doer_id,
+                                              "user_name": doer_name})
                 seen: set = set()
                 for i in range(len(items)):
                     t = ticks[str(i)]
@@ -720,27 +1036,33 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
                         seen.add(t["user_id"])
                         doers.append({"user_id": t["user_id"], "user_name": t["user_name"]})
             else:
-                doers = [{"user_id": press.user_id, "user_name": press.display}]
+                doers = [{"user_id": doer_id, "user_name": doer_name}]
             # A 🧾 row's kind can't carry once-vs-recurring like a plain chore's
             # does, so it says so explicitly (the once/recurring badge tally reads it).
             extra = {"recurring": bool(task["recurring"])} if items else {}
-            records = [{
-                "id": new_id(),  # lets an undo void exactly these log entries
-                "ts": to_iso(completed),
-                "month": completed.astimezone(tz).strftime("%Y-%m"),  # local-tz bucket
-                "guild_id": task["guild_id"],
-                "task_id": tid,
-                "brief": task["brief"],
-                "user_id": d["user_id"],
-                "user_name": d["user_name"],
-                "kind": ("puntobomb" if task.get("puntobomb")
-                         else "list" if items
-                         else "recurring" if task["recurring"] else "once"),
-                "points": 2 if task.get("bounty") else 1,  # a defusal is the plain 1
-                "due_at": p["due_at"],
-                "late_seconds": max(0, int((completed - due).total_seconds())),
-                **extra,
-            } for d in doers]
+            records = []
+            for d in doers:
+                rec = {
+                    "id": new_id(),  # lets an undo void exactly these log entries
+                    "ts": to_iso(completed),
+                    "month": completed.astimezone(tz).strftime("%Y-%m"),  # local-tz bucket
+                    "guild_id": task["guild_id"],
+                    "task_id": tid,
+                    "brief": task["brief"],
+                    "user_id": d["user_id"],
+                    "user_name": d["user_name"],
+                    "kind": ("puntobomb" if task.get("puntobomb")
+                             else "list" if items
+                             else "recurring" if task["recurring"] else "once"),
+                    "points": 2 if task.get("bounty") else 1,  # a defusal is the plain 1
+                    "due_at": p["due_at"],
+                    "late_seconds": max(0, int((completed - due).total_seconds())),
+                    **extra,
+                }
+                if awardee and d["user_id"] == doer_id:
+                    rec["awarded_by"] = press.user_id
+                    rec["awarded_by_name"] = press.display
+                records.append(rec)
             if live["recurring"]:
                 live["pending"] = None
                 live["next_due"] = to_iso(next_due(recurrence_of(live), tz, due, completed))
@@ -751,15 +1073,16 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
         # Two people going for the same chore — the loser deserves a word, not
         # dead air (the winner's status edit is already landing on the post).
         # A racing legacy *reaction* stays silent, as it always has.
-        if press.interaction is not None:
+        if press.interaction is not None and awardee is None:
             await press.whisper("Already sorted — someone beat you to this one.")
-        return
+        return "raced"
 
     if records:
         for record in records:
             await store.log_completion(record)
         bonus = " 💰 **+2 puntos**" if task.get("bounty") else ""
         mentions = _join([f"<@{d['user_id']}>" for d in doers])
+        via = f" (via {press.mention})" if awardee else ""
         if task.get("puntobomb"):
             status = (
                 f"~~**{task['brief']}**~~\n"
@@ -770,13 +1093,13 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
             each = " — +1 punto each" if len(doers) > 1 else ""
             status = (
                 f"~~**{task['brief']}**~~\n"
-                f"✅ {EMOJI_LIST} All {len(items)} ticked by {mentions}{each} • "
+                f"✅ {EMOJI_LIST} All {len(items)} ticked by {mentions}{each}{via} • "
                 f"{discord_ts(completed, 't')}"
             )
         else:
             status = (
                 f"~~**{task['brief']}**~~\n"
-                f"✅ Completed by {press.mention}{bonus} • {discord_ts(completed, 't')}"
+                f"✅ Completed by {doer_mention}{via}{bonus} • {discord_ts(completed, 't')}"
             )
         stale_undo: list[tuple[int, bool]] = []
         stale_requeue: list[tuple[int, bool]] = []
@@ -826,6 +1149,7 @@ async def _handle_done(tid, task, cfg, tz, press: Press) -> None:
             # than left button-less (touched posts stay) — see refresh_post_view.
             await refresh_post_view(channel, mid, retire_delete=declutter)
         await refresh_daily_log(task["guild_id"], completed)
+    return "ok"
 
 
 async def _handle_skip_or_delete(tid, task, cfg, tz, press: Press) -> None:
@@ -1275,8 +1599,11 @@ async def _handle_requeue(press: Press) -> None:
 
 
 __all__ = [
+    "AWARD_CHIP_LIMIT",
+    "AwardView",
     "SNOOZE_REACTIONS",
     "SnoozeView",
+    "award_chips",
     "_announce_snooze",
     "_apply_snooze",
     "_arm_requeue_in",
@@ -1284,9 +1611,11 @@ __all__ = [
     "_arm_undo_in",
     "_delete_panels",
     "_disarm_undo_button",
+    "_apply_shush",
     "_handle_done",
     "_handle_ffwd",
     "_handle_info",
+    "_open_award",
     "_handle_requeue",
     "_handle_shush",
     "_handle_skip_or_delete",

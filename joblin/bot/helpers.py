@@ -12,6 +12,7 @@ from ..models import (
     EMOJI_DELETE,
     EMOJI_DONE,
     EMOJI_FFWD,
+    EMOJI_GIFT,
     EMOJI_INFO,
     EMOJI_LIST,
     EMOJI_REQUEUE,
@@ -205,7 +206,7 @@ class Press:
 # ---------------------------------------------------------------------------
 class TaskButton(
     discord.ui.DynamicItem[discord.ui.Button],
-    template=r"task:(?P<action>done|ffwd|info|skip|shush|unshush):(?P<tid>[\w-]+)",
+    template=r"task:(?P<action>done|ffwd|info|skip|shush|unshush|award):(?P<tid>[\w-]+)",
 ):
     """A persistent action button on a live occurrence post — the button-age
     successor of the ✅ ⏩ ℹ️ ⏭️/❌ (🤫/🔊) self-reactions. The task id rides in
@@ -214,7 +215,9 @@ class TaskButton(
     with no per-message bookkeeping."""
 
     # Emoji-only faces (no labels) — phone screens are narrow and the row is
-    # wide; /joblinhelp is the legend.
+    # wide; /joblinhelp is the legend. The one exception is a crowded row's
+    # 🎁, which wears 🤫🎁 / 🔊🎁 (quiet emoji + gift label) so both actions
+    # stay visible in slot 5.
     FACES = {  # action -> (emoji, style)
         "done":    (EMOJI_DONE, discord.ButtonStyle.secondary),
         "ffwd":    (EMOJI_FFWD, discord.ButtonStyle.secondary),
@@ -222,17 +225,18 @@ class TaskButton(
         "skip":    (EMOJI_SKIP, discord.ButtonStyle.secondary),
         "shush":   (EMOJI_SHUSH, discord.ButtonStyle.secondary),
         "unshush": (EMOJI_UNSHUSH, discord.ButtonStyle.secondary),
+        "award":   (EMOJI_GIFT, discord.ButtonStyle.secondary),
     }
     # One-offs aren't skipped, they're cancelled — same action id, harder face.
     CANCEL_FACE = (EMOJI_DELETE, discord.ButtonStyle.secondary)
 
     def __init__(self, tid: str, action: str, *, face: Optional[tuple] = None,
-                 row: Optional[int] = None) -> None:
+                 row: Optional[int] = None, label: Optional[str] = None) -> None:
         self.tid = tid
         self.action = action
         emoji, style = face or self.FACES[action]
         super().__init__(discord.ui.Button(
-            emoji=emoji, style=style,
+            emoji=emoji, style=style, label=label,
             custom_id=f"task:{action}:{tid}", row=row,
         ))
 
@@ -275,12 +279,24 @@ class ListItemButton(
         await handle_list_button(self.tid, self.idx, interaction)
 
 
+def _quiet_action(task: dict, *, reminder: bool) -> Optional[str]:
+    """The 🤫/🔊 action that belongs on this post, or None if neither does."""
+    if task.get("no_nag"):
+        return "unshush"
+    if reminder:
+        return "shush"
+    return None
+
+
 def make_task_view(tid: str, task: dict, *, reminder: bool = False) -> discord.ui.View:
     """The live post's action row — mirrors what the bot used to self-react:
-    ✅ ⏩ (ℹ️ with a description) ⏭️/❌, plus 🔊 on a shushed chore's posts and
-    🤫 on a nag. A 🧾 list stacks an item button per entry above the controls
-    (up to four rows of five; the controls keep the fifth), rendered from the
-    pending occurrence's ticks so every fresh post shows the true state."""
+    ✅ ⏩ (ℹ️ with a description) ⏭️/❌ 🎁, plus 🔊 on a shushed chore's posts and
+    🤫 on a nag. A described nag (or described + shushed post) is five slots
+    already, so 🎁 wears 🤫🎁 / 🔊🎁 and the quiet action rides the award
+    panel. Puntobombs skip 🎁 (defusal isn't transferable). A 🧾 list stacks
+    an item button per entry above the controls (up to four rows of five; the
+    controls keep the fifth), rendered from the pending occurrence's ticks so
+    every fresh post shows the true state."""
     view = discord.ui.View(timeout=None)
     items = task.get("items") or []
     control_row = None
@@ -299,10 +315,21 @@ def make_task_view(tid: str, task: dict, *, reminder: bool = False) -> discord.u
     else:
         view.add_item(TaskButton(tid, "skip", face=TaskButton.CANCEL_FACE,
                                  row=control_row))
-    if task.get("no_nag"):
-        view.add_item(TaskButton(tid, "unshush", row=control_row))
-    elif reminder:
-        view.add_item(TaskButton(tid, "shush", row=control_row))
+    quiet = _quiet_action(task, reminder=reminder)
+    show_gift = not task.get("puntobomb")
+    # Slot 5 is full only when info and a quiet face are both present; merge
+    # them onto 🎁 so the control row never wraps (and a 🧾 list still fits).
+    combo = bool(show_gift and quiet and task.get("description"))
+    if show_gift:
+        if combo:
+            view.add_item(TaskButton(
+                tid, "award", face=TaskButton.FACES[quiet],
+                label=EMOJI_GIFT, row=control_row,
+            ))
+        else:
+            view.add_item(TaskButton(tid, "award", row=control_row))
+    if quiet and not combo:
+        view.add_item(TaskButton(tid, quiet, row=control_row))
     return view
 
 

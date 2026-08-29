@@ -4,8 +4,8 @@ Lifecycle of a task occurrence
 ------------------------------
 1. The scheduler tick (every 30s) notices ``now >= next_due`` and *fires* it:
    posts the brief to the configured channel with an action row of buttons —
-   ✅ Done, ⏩ Snooze, ℹ️ Info (only if the task has a long description), and
-   ⏭️ Skip on recurring tasks / ❌ Cancel on one-offs. The task flips to
+   ✅ Done, ⏩ Snooze, ℹ️ Info (only if the task has a long description),
+   ⏭️ Skip on recurring tasks / ❌ Cancel on one-offs, and 🎁 Award. The task flips to
    "pending" with ``remind_at = due + 1h``; ``next_due`` is cleared so it
    can't re-fire.
 2. While pending, every tick checks ``remind_at``. When it passes, the bot
@@ -15,6 +15,10 @@ Lifecycle of a task occurrence
 3. Buttons resolve or defer the occurrence:
      ✅  done      -> log the completer; recurring tasks roll to the next slot,
                       one-offs are removed.
+     🎁  award     -> ephemeral picker (family chips + User Select) that
+                      completes as someone else; the presser is ``awarded_by``.
+                      On a described nag, 🎁 wears 🤫🎁 / 🔊🎁 and the panel
+                      carries 🤫/🔊 too.
      ⏩  snooze    -> opens an ephemeral numpad (hours/days); 1h, 2h, 4h ...
      ℹ️  info      -> whisper the long description (ephemeral).
      ⏭️  skip      -> recurring only: skip just this occurrence.

@@ -2423,9 +2423,11 @@ async def test_task_buttons() -> None:
         gate_mid = snap["tasks"]["gate"]["pending"]["message_ids"][0]
         assert snap["tasks"]["barn"]["pending"]["ui"] == "buttons"
         assert btn_ids(ch.msgs[barn_mid]) == [
-            "task:done:barn", "task:ffwd:barn", "task:info:barn", "task:skip:barn"]
+            "task:done:barn", "task:ffwd:barn", "task:info:barn", "task:skip:barn",
+            "task:award:barn"]
         assert btn_ids(ch.msgs[gate_mid]) == [
-            "task:done:gate", "task:ffwd:gate", "task:skip:gate"], "no ℹ️ without a description"
+            "task:done:gate", "task:ffwd:gate", "task:skip:gate", "task:award:gate"], \
+            "no ℹ️ without a description"
         gate_skip = btn(ch.msgs[gate_mid], "task:skip:gate")
         assert str(gate_skip.emoji) == m.EMOJI_DELETE, "a one-off's skip face is ❌"
         assert gate_skip.label is None, "buttons are emoji-only"
@@ -2465,6 +2467,242 @@ async def test_task_buttons() -> None:
         w = whispered(stale)
         assert w["ephemeral"] and "no longer live" in w["content"]
         assert len(st.read_completions()) == 1, "a stale press completes nothing"
+
+
+def test_award_chips() -> None:
+    """Family chips are recent-first, drop the presser, cap the list, and keep
+    the latest name for a repeat player. Other guilds don't leak in."""
+    import joblin.bot as bot
+
+    rows = [
+        {"guild_id": 1, "user_id": 7, "user_name": "Sam"},
+        {"guild_id": 1, "user_id": 9, "user_name": "Lee"},
+        {"guild_id": 1, "user_id": 7, "user_name": "Sammy"},
+        {"guild_id": 2, "user_id": 3, "user_name": "Other"},
+        {"guild_id": 1, "user_id": 42, "user_name": "Pat"},
+    ]
+    chips = bot.award_chips(rows, 1, exclude_id=42)
+    assert chips == [
+        {"user_id": 7, "user_name": "Sammy"},
+        {"user_id": 9, "user_name": "Lee"},
+    ]
+    many = [{"guild_id": 1, "user_id": i, "user_name": str(i)} for i in range(20)]
+    capped = bot.award_chips(many, 1, exclude_id=99, limit=10)
+    assert [c["user_id"] for c in capped] == list(range(19, 9, -1))
+    assert bot.award_chips(rows, 2, exclude_id=0) == [
+        {"user_id": 3, "user_name": "Other"}]
+
+
+def test_award_button_layout() -> None:
+    """🎁 sits on the control row; a described nag (or described + shushed post)
+    merges 🤫/🔊 onto it as a labelled combo; puntobombs have no gift."""
+    import joblin.bot as bot
+
+    def ids(view):
+        return [c.custom_id for c in view.children]
+
+    def face(view, custom_id):
+        for c in view.children:
+            if c.custom_id == custom_id:
+                inner = getattr(c, "item", c)
+                return str(inner.emoji), inner.label
+        raise AssertionError(f"missing {custom_id}")
+
+    base = {
+        "id": "t", "brief": "X", "description": None, "recurring": True, "pending": {},
+    }
+    assert ids(bot.make_task_view("t", base)) == [
+        "task:done:t", "task:ffwd:t", "task:skip:t", "task:award:t"]
+    described = {**base, "description": "more"}
+    assert ids(bot.make_task_view("t", described)) == [
+        "task:done:t", "task:ffwd:t", "task:info:t", "task:skip:t", "task:award:t"]
+    nag = bot.make_task_view("t", base, reminder=True)
+    assert ids(nag) == [
+        "task:done:t", "task:ffwd:t", "task:skip:t", "task:award:t", "task:shush:t"]
+    combo = bot.make_task_view("t", described, reminder=True)
+    assert ids(combo) == [
+        "task:done:t", "task:ffwd:t", "task:info:t", "task:skip:t", "task:award:t"]
+    assert face(combo, "task:award:t") == (m.EMOJI_SHUSH, m.EMOJI_GIFT)
+    shushed = bot.make_task_view("t", {**described, "no_nag": True})
+    assert "task:unshush:t" not in ids(shushed)
+    assert face(shushed, "task:award:t") == (m.EMOJI_UNSHUSH, m.EMOJI_GIFT)
+    bomb = bot.make_task_view("t", {**base, "puntobomb": True, "recurring": False})
+    assert "task:award:t" not in ids(bomb)
+
+
+async def test_award() -> None:
+    """🎁 credits someone else: chips from the log, the punto lands on them
+    (awarded_by is the presser), a bounty's creator can award it but not to
+    themselves, self-pick is refused, a described nag's combo panel still
+    shushes, and ↩️ voids the awarded row."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+
+        async def seed(uid, name):
+            await st.log_completion({
+                "id": f"seed-{uid}", "ts": m.to_iso(now), "month": "2026-08",
+                "guild_id": 1, "task_id": "seed", "brief": "seed",
+                "user_id": uid, "user_name": name, "kind": "once", "points": 1,
+            })
+
+        await seed(7, "Sam")
+        await seed(9, "Lee")
+
+        tid = "compost"
+        async with st.txn() as data:
+            data["tasks"][tid] = {
+                "id": tid, "guild_id": 1, "brief": "Take out compost",
+                "description": "The heap by the barn.",
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+        await bot.fire_task(tid, ch, cfg)
+        mid = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][0]
+        assert "task:award:tid".replace("tid", tid) in btn_ids(ch.msgs[mid])
+
+        # Empty-roster hatch: chips name Sam and Lee, not the presser.
+        gift = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_task_button(tid, "award", gift)
+        w = whispered(gift)
+        assert w["ephemeral"] and "who did it" in w["content"]
+        panel = w["view"]
+        labels = [getattr(i, "label", None) for i in panel.children]
+        assert "Sam" in labels and "Lee" in labels and "Pat" not in labels
+        quiet = [i for i in panel.children
+                 if str(getattr(i, "emoji", "")) in (m.EMOJI_SHUSH, m.EMOJI_UNSHUSH)]
+        assert quiet == [], "standalone 🎁 does not carry 🤫 — the row wasn't full"
+
+        sam = next(i for i in panel.children if getattr(i, "label", None) == "Sam")
+        pick = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch)
+        await sam.callback(pick)
+        recs = [r for r in st.read_completions() if r.get("task_id") == tid]
+        assert len(recs) == 1 and recs[0]["user_id"] == 7
+        assert recs[0]["awarded_by"] == 42 and recs[0]["awarded_by_name"] == "Pat"
+        assert recs[0]["points"] == 1
+        body = ch.msgs[mid].content or ""
+        assert "Completed by <@7>" in body and "via <@42>" in body
+        assert pick.response.view is None and "Awarded" in (pick.response.content or "")
+        parts = (await st.snapshot())["claps"][str(mid)]["participants"]
+        assert [p["user_id"] for p in parts] == [7], "👏 tips the awardee, not the witness"
+
+        # ↩️ voids the awarded row.
+        undo = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_post_button("undo", undo)
+        assert [r for r in st.read_completions() if r.get("task_id") == tid] == []
+        assert (await st.snapshot())["tasks"][tid]["pending"] is not None
+
+        # Self-pick is refused; the occurrence stays live.
+        gift = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_task_button(tid, "award", gift)
+        panel = whispered(gift)["view"]
+        # Drive the User Select by stuffing values, the way discord.py would.
+        panel._select._values = [FakeUser(42, "Pat")]
+        self_pick = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch)
+        await panel._on_select(self_pick)
+        w = whispered(self_pick)
+        assert w and "Done" in (w["content"] or "")
+        assert (await st.snapshot())["tasks"][tid]["pending"] is not None
+
+        # Described nag: combo face, panel carries 🤫, tapping it stamps the nag.
+        async with st.txn() as data:
+            data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(
+                now - dt.timedelta(seconds=1))
+        await bot.send_reminder(tid, ch, cfg)
+        nag = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][-1]
+        award_btn = btn(ch.msgs[nag], f"task:award:{tid}")
+        assert str(award_btn.emoji) == m.EMOJI_SHUSH and award_btn.label == m.EMOJI_GIFT
+        assert f"task:shush:{tid}" not in btn_ids(ch.msgs[nag])
+        combo = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[nag])
+        await bot.handle_task_button(tid, "award", combo)
+        panel = whispered(combo)["view"]
+        shush_btn = next(i for i in panel.children
+                         if str(getattr(i, "emoji", "")) == m.EMOJI_SHUSH)
+        hush = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch)
+        await shush_btn.callback(hush)
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["no_nag"] is True
+        assert "Shushed by <@42>" in (ch.msgs[nag].content or "")
+        assert f"task:award:{tid}" in btn_ids(ch.msgs[nag])
+        assert str(btn(ch.msgs[nag], f"task:award:{tid}").emoji) == m.EMOJI_UNSHUSH
+
+        # Bounty: creator 🎁 → Sam collects; 🎁 → creator is refused.
+        btid = "barn"
+        async with st.txn() as data:
+            data["tasks"][btid] = {
+                "id": btid, "guild_id": 1, "brief": "Muck the barn", "description": None,
+                "bounty": True, "recurring": False, "freq": "once", "interval_days": 0,
+                "weekdays": [], "monthdays": [], "time_of_day": None,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+        await bot.fire_task(btid, ch, cfg)
+        bmid = (await st.snapshot())["tasks"][btid]["pending"]["message_ids"][0]
+        own = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch, message=ch.msgs[bmid])
+        await bot.handle_task_button(btid, "award", own)
+        panel = whispered(own)["view"]
+        panel._select._values = [FakeUser(1, "Boss")]
+        to_self = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch)
+        await panel._on_select(to_self)
+        assert (await st.snapshot())["tasks"][btid]["pending"] is not None, \
+            "creator can't award a bounty to themselves"
+        # A bystander awarding the bounty TO the creator is the same loophole.
+        pat = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[bmid])
+        await bot.handle_task_button(btid, "award", pat)
+        panel = whispered(pat)["view"]
+        panel._select._values = [FakeUser(1, "Boss")]
+        to_creator = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch)
+        await panel._on_select(to_creator)
+        assert (await st.snapshot())["tasks"][btid]["pending"] is not None
+        assert "bounty" in (to_creator.response.content or "").lower()
+        # Re-open; chip Sam.
+        own = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch, message=ch.msgs[bmid])
+        await bot.handle_task_button(btid, "award", own)
+        panel = whispered(own)["view"]
+        sam = next(i for i in panel.children if getattr(i, "label", None) == "Sam")
+        pick = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch)
+        await sam.callback(pick)
+        recs = [r for r in st.read_completions() if r.get("task_id") == btid]
+        assert len(recs) == 1 and recs[0]["user_id"] == 7 and recs[0]["points"] == 2
+        assert recs[0]["awarded_by"] == 1
+        assert btid not in (await st.snapshot())["tasks"], "one-off bounty is gone"
+        assert "via <@1>" in (ch.msgs[bmid].content or "")
+
+        # 🧾 remainder: Pat ticked one box, 🎁 Sam sweeps the rest — both score,
+        # only Sam's row carries awarded_by.
+        ltid = "kitchen"
+        async with st.txn() as data:
+            data["tasks"][ltid] = {
+                "id": ltid, "guild_id": 1, "brief": "Kitchen reset", "description": None,
+                "items": ["dishes", "counters", "trash"],
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+        await bot.fire_task(ltid, ch, cfg)
+        lmid = (await st.snapshot())["tasks"][ltid]["pending"]["message_ids"][0]
+        await bot.handle_list_button(ltid, 0, FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[lmid]))
+        gift = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[lmid])
+        await bot.handle_task_button(ltid, "award", gift)
+        panel = whispered(gift)["view"]
+        sam = next(i for i in panel.children if getattr(i, "label", None) == "Sam")
+        pick = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch)
+        await sam.callback(pick)
+        recs = sorted(
+            (r for r in st.read_completions() if r.get("task_id") == ltid),
+            key=lambda r: r["user_id"],
+        )
+        assert [(r["user_id"], r.get("awarded_by")) for r in recs] == [
+            (7, 42), (42, None)]
+        assert "via <@42>" in (ch.msgs[lmid].content or "")
+        assert "<@7>" in (ch.msgs[lmid].content or "") and "<@42>" in (ch.msgs[lmid].content or "")
 
 
 async def test_done_race_whisper() -> None:
@@ -2813,6 +3051,7 @@ async def test_joblinhelp() -> None:
         assert total <= 6000, (e.title, total)
 
     alltext = "".join(f.value for e in embeds for f in e.fields)
+    assert "🎁 **Award**" in alltext
     for title, emoji in joblin.bot.scoring.BADGE_EMOJI.items():
         assert f"{emoji} **{title}**" in alltext, f"badge legend missing {title}"
 
@@ -4086,7 +4325,7 @@ def test_list_view_layout() -> None:
     view = bot.make_task_view("t1", task)
     ids = [c.custom_id for c in view.children]
     assert ids[:7] == [f"task:item:{i}:t1" for i in range(7)]
-    assert "task:done:t1" in ids and "task:skip:t1" in ids
+    assert "task:done:t1" in ids and "task:skip:t1" in ids and "task:award:t1" in ids
     rows = [c.row for c in view.children]
     assert rows[:7] == [0, 0, 0, 0, 0, 1, 1], "items pack five per row"
     assert rows[7:] == [4] * (len(rows) - 7), "the ✅ ⏩ ⏭️ controls keep the bottom row"
@@ -4248,12 +4487,13 @@ def test_daily_log_render() -> None:
         _log_row(at(13), 1, "Sam", "Dishes", kind="kaboom", points=-5, task_id="bomb"),
         _log_row(at(13), 2, "Pat", "Dishes", kind="kaboom", points=-5, task_id="bomb"),
         _log_row(at(10), 2, "Pat", "Morning feed", kind="clap"),
+        {**_log_row(at(15), 1, "Sam", "Compost"), "awarded_by": 2},
     ]
     day = bot.log_day(m.from_iso(at(9)), tz)
     lines = bot.daily_log_lines(rows, 1, day, tz)
-    assert len(lines) == 5, f"grouped into 5 events, got {len(lines)}: {lines}"
+    assert len(lines) == 6, f"grouped into 6 events, got {len(lines)}: {lines}"
     assert "Ghost row" not in "\n".join(lines), "🔄 markers never appear"
-    order = ["Morning feed", "👏", "Big shop", "💥", "Evening feed"]
+    order = ["Morning feed", "👏", "Big shop", "💥", "Evening feed", "Compost"]
     for a, b in zip(order, order[1:]):
         joined = "\n".join(lines)
         assert joined.index(a) < joined.index(b), f"{a!r} must precede {b!r}"
@@ -4261,8 +4501,10 @@ def test_daily_log_render() -> None:
     assert "<@1>" in listy and "<@2>" in listy and "+1 each" in listy
     boom = next(line for line in lines if "💥" in line)
     assert "−5 each" in boom and "<@1>" in boom and "<@2>" in boom
-    # Net day total keeps the kaboom's sign: 1 + 1 + 2 + (−10) + 1 = −5.
-    assert bot.day_puntos(rows, 1, day, tz) == -5
+    compost = next(line for line in lines if "Compost" in line)
+    assert "<@1>" in compost and "via <@2>" in compost
+    # Net day total keeps the kaboom's sign: 1 + 1 + 2 + (−10) + 1 + 1 = −4.
+    assert bot.day_puntos(rows, 1, day, tz) == -4
     # Another guild's log sees none of it.
     assert bot.daily_log_lines(rows, 2, day, tz) == []
 
@@ -4602,6 +4844,9 @@ def main() -> None:
     asyncio.run(test_nag_tally())
     asyncio.run(test_shush())
     asyncio.run(test_task_buttons())
+    test_award_chips()
+    test_award_button_layout()
+    asyncio.run(test_award())
     asyncio.run(test_done_race_whisper())
     test_parse_items()
     test_list_view_layout()

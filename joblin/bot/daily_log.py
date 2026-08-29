@@ -109,6 +109,15 @@ def _mentions(group: list[dict]) -> str:
     return _join(out)
 
 
+def _via(group: list[dict]) -> str:
+    """Witness credit: ``(via <@id>)`` when any row in the group was awarded."""
+    for rec in group:
+        uid = rec.get("awarded_by")
+        if uid:
+            return f" (via <@{uid}>)"
+    return ""
+
+
 def _line(group: list[dict]) -> str:
     """One display line for one event's row group, led by its clock time (a
     Discord timestamp, so every viewer reads their own zone)."""
@@ -131,10 +140,10 @@ def _line(group: list[dict]) -> str:
         return f"{t} {EMOJI_FLEX} **{brief}** — {parts}"
     if kind == "list":
         each = " — +1 each" if len(group) > 1 else ""
-        return f"{t} ✅{EMOJI_LIST} **{brief}** — {who}{each}"
+        return f"{t} ✅{EMOJI_LIST} **{brief}** — {who}{each}{_via(group)}"
     # Plain chore (once/recurring/legacy no-kind); a bounty carries its 💰.
     bounty = " 💰 +2" if _completion_points(rec) >= 2 else ""
-    return f"{t} ✅ **{brief}** — {who}{bounty}"
+    return f"{t} ✅ **{brief}** — {who}{bounty}{_via(group)}"
 
 
 def daily_log_lines(records: list[dict], guild_id: int, day: dt.date,

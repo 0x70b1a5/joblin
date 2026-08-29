@@ -382,6 +382,7 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "ℹ️ **Info** — shows the longer description, if any\n"
             "⏭️ **Skip** — recurring chore: skips just this time\n"
             "❌ **Delete** — one-off chore: cancels it\n"
+            "🎁 **Award** — credit someone else; on a full row shares the 🤫/🔊 slot\n"
             "🤫 **Shush** — appears on a reminder: mutes the hourly nags for that "
             "chore for good (it still posts when due)\n"
             "🔊 **Un-shush** — appears on a shushed chore's posts: turns the "
