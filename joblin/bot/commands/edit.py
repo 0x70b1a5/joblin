@@ -403,7 +403,8 @@ async def apply_game_edit(
                 else:
                     await channel.get_partial_message(int(live_mid)).edit(
                         content=render_doemup(updated),
-                        view=make_doemup_view(updated["id"]), allowed_mentions=NO_PINGS)
+                        view=make_doemup_view(updated["id"], no_nag=bool(updated.get("no_nag"))),
+                        allowed_mentions=NO_PINGS)
             except discord.HTTPException:
                 pass
 

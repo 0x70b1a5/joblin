@@ -10,6 +10,8 @@ import discord
 from ..models import (
     EMOJI_DONE,
     EMOJI_END,
+    EMOJI_SHUSH,
+    EMOJI_UNSHUSH,
     discord_ts,
     doemup_apply,
     emoji_key,
@@ -115,17 +117,134 @@ def _game_recurrence_fields(
 
 
 async def _send_pitchin(channel: discord.abc.Messageable, p: dict) -> discord.Message:
-    """Post a pitch-in's live body with its ✅ Pitch in! / 🏁 End buttons."""
+    """Post a pitch-in's live body with its ✅ Pitch in! / 🏁 End / 🤫 buttons."""
     return await channel.send(
-        render_pitchin(p), view=make_pitchin_view(p["id"]), allowed_mentions=NO_PINGS
+        render_pitchin(p), view=make_pitchin_view(p["id"], no_nag=bool(p.get("no_nag"))),
+        allowed_mentions=NO_PINGS,
     )
 
 
 async def _send_doemup(channel: discord.abc.Messageable, d: dict) -> discord.Message:
-    """Post a do-em-up's live body with its ➕/➖/End buttons."""
+    """Post a do-em-up's live body with its ➕/➖/End/🤫 buttons."""
     return await channel.send(
-        render_doemup(d), view=make_doemup_view(d["id"]), allowed_mentions=NO_PINGS
+        render_doemup(d), view=make_doemup_view(d["id"], no_nag=bool(d.get("no_nag"))),
+        allowed_mentions=NO_PINGS,
     )
+
+
+# --- The bump: live games ride the chore noise -----------------------------
+# A game that runs all day (or all week) would otherwise sink into the
+# scrollback. Rather than make noise of its own, a live round is re-posted at
+# the bottom of the channel *only in the wake of a chore post* — a fire or a
+# nag (``scheduler.fire_task`` / ``send_reminder`` call ``bump_live_games``
+# right after theirs lands). The channel's noise level is exactly what it was;
+# the games just stay under the newest chore. The post a bump supersedes is
+# swept like a chore's rolling nag (a post someone reacted to or replied on
+# survives, and ``/joblinconfig declutter:False`` keeps every old post,
+# stripped of its buttons). A 🤫 on the post sets the game's lifetime
+# ``no_nag`` flag — that game stays put through every fire and nag; 🔊 clears
+# it. No timer, no persisted deadline: nothing to lose on a restart.
+def bump_eligible(game: dict) -> bool:
+    """Does this game's post move when a chore posts? Only a live round (not
+    dormant between rounds, not closed) that hasn't been 🤫'd."""
+    if not game.get("message_id") or game.get("ended") or game.get("next_due"):
+        return False
+    return not game.get("no_nag")
+
+
+async def bump_live_games(guild_id: int, channel: discord.abc.Messageable) -> int:
+    """Re-post every eligible live round of this guild that lives in ``channel``
+    — the chore-post hook. Returns how many moved. One bad game never blocks
+    the rest (or the chore post that triggered it)."""
+    snap = await store.snapshot()
+    ch_id = getattr(channel, "id", None)
+    moved = 0
+    for kind, section in (("pitchin", "pitchins"), ("doemup", "doemups")):
+        for gid, g in list(snap.get(section, {}).items()):
+            if str(g.get("guild_id")) != str(guild_id) or not bump_eligible(g):
+                continue
+            if g.get("channel_id") is not None and ch_id is not None \
+                    and int(g["channel_id"]) != int(ch_id):
+                continue  # posted elsewhere — a bump would move it channels
+            try:
+                if await bump_game(kind, gid, channel):
+                    moved += 1
+            except Exception:
+                log.exception("game bump failed on %s %s", kind, gid)
+    return moved
+
+
+async def bump_game(kind: str, gid: str, channel: discord.abc.Messageable) -> bool:
+    """Re-post a live round at the bottom of the channel and sweep the post it
+    replaces. The fresh post becomes *the* post (``message_id`` /
+    ``game_messages`` swap over, so the stale-press guards and every close/clap/
+    requeue path follow it); the old one is deleted unless touched or declutter
+    is off, in which case it stays with its buttons stripped and a pointer down.
+    Returns False if the round wasn't eligible (or moved on under us)."""
+    section = "pitchins" if kind == "pitchin" else "doemups"
+    snap = await store.snapshot()
+    g0 = snap[section].get(gid)
+    if not g0 or not bump_eligible(g0):
+        return False
+    old_mid = g0["message_id"]
+    send = _send_pitchin if kind == "pitchin" else _send_doemup
+    msg = await send(channel, g0)
+    orphan = False
+    async with store.txn() as data:
+        g = data[section].get(gid)
+        if not g or g.get("ended") or g.get("message_id") != old_mid:
+            orphan = True  # closed / bumped / re-rolled while we were posting
+        else:
+            g["message_id"] = msg.id
+            data["game_messages"].pop(str(old_mid), None)
+            data["game_messages"][str(msg.id)] = {"kind": kind, "id": gid}
+    if orphan:
+        await safe_delete(msg)
+        return False
+    declutter = declutter_enabled(guild_config(snap, g0["guild_id"]))
+    touched = str(old_mid) in snap.get("touched", {})
+    old = channel.get_partial_message(old_mid)
+    if declutter and not touched:
+        try:
+            await old.delete()
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as e:
+            log.warning("game bump delete failed on message %s: %s", old_mid, e)
+        return True
+    # The old post stands (someone's conversation hangs off it, or sweeps are
+    # off): its buttons come down so nobody presses a dead round.
+    render = render_pitchin if kind == "pitchin" else render_doemup
+    try:
+        await old.edit(
+            content=render(g0) + "\n⤵️ Bumped — the live post is further down.",
+            view=None, allowed_mentions=NO_PINGS,
+        )
+    except discord.HTTPException as e:
+        log.warning("game bump strip failed on message %s: %s", old_mid, e)
+    return True
+
+
+async def _game_shush(kind: str, gid: str, press: Press, *, shush: bool) -> None:
+    """🤫 on a live game post sets its lifetime ``no_nag`` flag (the post stays
+    where it is when chores post), 🔊 clears it. The pressed post is re-rendered
+    with the flag's line and its button face flipped; a same-direction press is
+    a whispered no-op."""
+    section = "pitchins" if kind == "pitchin" else "doemups"
+    changed = False
+    body = None
+    async with store.txn() as data:
+        g = data[section].get(gid)
+        if (g and not g.get("ended") and g.get("message_id") == press.message_id
+                and bool(g.get("no_nag", False)) != shush):
+            changed = True
+            g["no_nag"] = shush
+            body = (render_pitchin if kind == "pitchin" else render_doemup)(g)
+    if not changed:
+        await press.whisper("Already sorted — this round is in that state (or has moved on).")
+        return
+    view = (make_pitchin_view if kind == "pitchin" else make_doemup_view)(gid, no_nag=shush)
+    await press.edit_pressed(content=body, view=view, allowed_mentions=NO_PINGS)
 
 
 def _game_next_round(game: dict, tz: ZoneInfo, now: dt.datetime) -> dt.datetime:
@@ -545,28 +664,30 @@ async def schedule_doemup(
 
 class PitchinButton(
     discord.ui.DynamicItem[discord.ui.Button],
-    template=r"pitchin:(?P<action>join|end):(?P<pid>[\w-]+)",
+    template=r"pitchin:(?P<action>join|end|shush|unshush):(?P<pid>[\w-]+)",
 ):
-    """A persistent ✅ Pitch in! / 🏁 End button on a live pitch-in post — the
-    button-age successor of the self-reacted ✅/🏁. ✅ is a *toggle*: pressing
-    again backs you out before the round closes (the reaction era did that via
-    un-reacting). Revived on startup via ``add_dynamic_items``."""
+    """A persistent ✅ Pitch in! / 🏁 End / 🤫 Shush (🔊 once shushed) button on
+    a live pitch-in post — the button-age successor of the self-reacted ✅/🏁.
+    ✅ is a *toggle*: pressing again backs you out before the round closes (the
+    reaction era did that via un-reacting). Revived on startup via
+    ``add_dynamic_items``."""
+
+    FACES = {  # action -> emoji; emoji-only — the post body is the legend
+        "join": EMOJI_DONE,
+        "end": EMOJI_END,
+        "shush": EMOJI_SHUSH,
+        "unshush": EMOJI_UNSHUSH,
+    }
 
     def __init__(self, pid: str, action: str) -> None:
         self.pid = pid
         self.action = action
-        # Emoji-only — the post body is the legend ("Tap ✅ … creator: 🏁").
-        if action == "join":
-            button = discord.ui.Button(
-                emoji=EMOJI_DONE, style=discord.ButtonStyle.secondary,
-                custom_id=f"pitchin:join:{pid}",
+        super().__init__(
+            discord.ui.Button(
+                emoji=self.FACES[action], style=discord.ButtonStyle.secondary,
+                custom_id=f"pitchin:{action}:{pid}",
             )
-        else:
-            button = discord.ui.Button(
-                emoji=EMOJI_END, style=discord.ButtonStyle.secondary,
-                custom_id=f"pitchin:end:{pid}",
-            )
-        super().__init__(button)
+        )
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match, /):  # noqa: ANN001
@@ -576,21 +697,28 @@ class PitchinButton(
         await handle_pitchin_button(self.pid, self.action, interaction)
 
 
-def make_pitchin_view(pid: str) -> discord.ui.View:
+def make_pitchin_view(pid: str, *, no_nag: bool = False) -> discord.ui.View:
+    """✅ 🏁 plus the bump switch: 🤫 on a game that still follows the chores, 🔊 on
+    a shushed one (the two directions never share a face)."""
     view = discord.ui.View(timeout=None)
     view.add_item(PitchinButton(pid, "join"))
     view.add_item(PitchinButton(pid, "end"))
+    view.add_item(PitchinButton(pid, "unshush" if no_nag else "shush"))
     return view
 
 
 async def handle_pitchin_button(
     pid: str, action: str, interaction: discord.Interaction
 ) -> None:
-    """A ✅ toggle (pitch in / back out) or a creator's 🏁 on a pitch-in post.
-    The message-id check refuses a stale button from an already-rolled round."""
+    """A ✅ toggle (pitch in / back out), a creator's 🏁, or a 🤫/🔊 on a
+    pitch-in post. The message-id check refuses a stale button from an
+    already-rolled (or bumped) round."""
     press = Press.from_interaction(interaction)
     await press.ack()  # first act: beat the 3s deadline; replies follow up
     user = interaction.user
+    if action in ("shush", "unshush"):
+        await _game_shush("pitchin", pid, press, shush=action == "shush")
+        return
     if action == "end":
         snap = await store.snapshot()
         p = snap["pitchins"].get(pid)
@@ -604,7 +732,7 @@ async def handle_pitchin_button(
         return
 
     body = None
-    do_finalize = gone = False
+    do_finalize = gone = no_nag = False
     async with store.txn() as data:
         p = data["pitchins"].get(pid)
         if not p or p.get("ended") or p.get("message_id") != interaction.message.id:
@@ -621,12 +749,14 @@ async def handle_pitchin_button(
                     body = render_pitchin(p)
             else:
                 gone = True  # couldn't join (e.g. already at cap) — treat as stale
+        if p:
+            no_nag = bool(p.get("no_nag"))
     if gone:
         await press.whisper("That pitch-in round has already closed.")
     elif do_finalize:
         await finalize_pitchin(pid, interaction.channel)  # edits the post itself
     else:
-        await press.edit_pressed(content=body, view=make_pitchin_view(pid))
+        await press.edit_pressed(content=body, view=make_pitchin_view(pid, no_nag=no_nag))
 
 
 async def _handle_pitchin_reaction(
@@ -701,11 +831,12 @@ async def _doemup_press(did: str, action: str, user_id: int, user_name: str) -> 
     """Apply a do-em-up button press inside a txn and report what to do next:
     ``status`` ∈ {gone, error, changed, final} (+ the new ``body`` when changed).
     ``final`` means the caller should run :func:`finalize_doemup`."""
-    out = {"status": "gone", "body": None}
+    out = {"status": "gone", "body": None, "no_nag": False}
     async with store.txn() as data:
         d = data["doemups"].get(did)
         if not d or d.get("ended"):
             return out
+        out["no_nag"] = bool(d.get("no_nag"))
         res = doemup_apply(d, action, user_id, user_name)
         if res["error"] == "not_creator":
             out["status"] = "error"
@@ -722,6 +853,9 @@ async def handle_doemup_button(
 ) -> None:
     press = Press.from_interaction(interaction)
     await press.ack()  # first act: beat the 3s deadline; replies follow up
+    if action in ("shush", "unshush"):
+        await _game_shush("doemup", did, press, shush=action == "shush")
+        return
     res = await _doemup_press(did, action, interaction.user.id, interaction.user.display_name)
     status = res["status"]
     if status == "gone":
@@ -733,21 +867,25 @@ async def handle_doemup_button(
         # do-em-up rolls on to its next slot (stop the series with /deletetask).
         await finalize_doemup(did, interaction.channel)  # edits the post itself
     else:  # changed — update the live tally in place
-        await press.edit_pressed(content=res["body"], view=make_doemup_view(did))
+        await press.edit_pressed(
+            content=res["body"], view=make_doemup_view(did, no_nag=res["no_nag"]))
 
 
 class DoEmUpButton(
     discord.ui.DynamicItem[discord.ui.Button],
-    template=r"doemup:(?P<action>plus|minus|end):(?P<did>[0-9a-f]+)",
+    template=r"doemup:(?P<action>plus|minus|end|shush|unshush):(?P<did>[0-9a-f]+)",
 ):
-    """A persistent ➕ / ➖ / 🏁End button. The do-em-up id rides in the
-    custom_id, so a single ``add_dynamic_items`` registration on startup revives
-    every do-em-up's buttons after a restart with no per-message bookkeeping."""
+    """A persistent ➕ / ➖ / 🏁End / 🤫 (🔊 once shushed) button. The do-em-up
+    id rides in the custom_id, so a single ``add_dynamic_items`` registration on
+    startup revives every do-em-up's buttons after a restart with no per-message
+    bookkeeping."""
 
     FACES = {  # action -> (emoji, style); emoji-only, like every other row
         "plus": ("➕", discord.ButtonStyle.secondary),
         "minus": ("➖", discord.ButtonStyle.secondary),
         "end": (EMOJI_END, discord.ButtonStyle.secondary),
+        "shush": (EMOJI_SHUSH, discord.ButtonStyle.secondary),
+        "unshush": (EMOJI_UNSHUSH, discord.ButtonStyle.secondary),
     }
 
     def __init__(self, did: str, action: str) -> None:
@@ -769,11 +907,14 @@ class DoEmUpButton(
         await handle_doemup_button(self.did, self.action, interaction)
 
 
-def make_doemup_view(did: str) -> discord.ui.View:
+def make_doemup_view(did: str, *, no_nag: bool = False) -> discord.ui.View:
+    """➕ ➖ 🏁 plus the bump switch: 🤫 on a game that still follows the chores, 🔊
+    on a shushed one."""
     view = discord.ui.View(timeout=None)
     view.add_item(DoEmUpButton(did, "plus"))
     view.add_item(DoEmUpButton(did, "minus"))
     view.add_item(DoEmUpButton(did, "end"))
+    view.add_item(DoEmUpButton(did, "unshush" if no_nag else "shush"))
     return view
 
 
@@ -818,6 +959,10 @@ __all__ = [
     "DoEmUpButton",
     "PitchinButton",
     "_arm_game_requeue_in",
+    "_game_shush",
+    "bump_eligible",
+    "bump_game",
+    "bump_live_games",
     "_doemup_press",
     "_game_next_round",
     "_game_record",

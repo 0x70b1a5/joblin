@@ -131,6 +131,14 @@ worth 1 punto).
   - `/doemup brief:"Thistle bush removed"`
   - `/doemup brief:"Bale stacked" deadline:"tomorrow 18:00" point_limit:200`
 
+While a round is open, its post **follows the chores**: whenever a chore fires
+or a reminder posts, every live round is re-posted right beneath it with its
+buttons and the superseded post is swept (a post someone reacted to or replied
+on stays; `/joblinconfig declutter:False` keeps them all, buttons stripped) —
+so an all-day or all-week game never needs scrolling back to, and the channel
+gets no extra noise for it. Tap **🤫** on the post to shush a game that should
+stay put (a weeks-long tally, say); **🔊** lets it follow again.
+
 When a pitch-in or do-em-up closes, its post is rewritten in place as a one-line
 result (e.g. *"🤝 Laundry bonanza — pitched in! +1 each to Ann, Bo & Cy"*) and its
 puntos are written to the leaderboard. Both **survive restarts** like everything

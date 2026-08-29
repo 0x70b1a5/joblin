@@ -23,7 +23,7 @@ from .helpers import (
     safe_delete,
     sweep_occurrence_posts,
 )
-from .games import sweep_games
+from .games import bump_live_games, sweep_games
 from .backup import run_daily_backups
 from .month_close import run_month_closes
 
@@ -99,6 +99,10 @@ async def fire_task(tid: str, channel: discord.abc.Messageable, cfg: dict) -> No
             data["messages"][str(message.id)] = tid
     if orphan:
         await safe_delete(message)
+        return
+    # Live games ride the noise: now that a chore post has landed, re-post the
+    # open rounds under it so they stay in view (never on a timer of their own).
+    await bump_live_games(task["guild_id"], channel)
 
 
 async def send_reminder(tid: str, channel: discord.abc.Messageable, cfg: dict) -> None:
@@ -128,11 +132,13 @@ async def send_reminder(tid: str, channel: discord.abc.Messageable, cfg: dict) -
             live["nag_count"] = live.get("nag_count", 0) + 1
     if orphan:
         await safe_delete(message)
-    elif prior_mids and declutter_enabled(cfg):
+        return
+    if prior_mids and declutter_enabled(cfg):
         # Rolling declutter: the fresh nag supersedes the older posts, so the
         # untouched ones go — the channel holds at most one live post per chore
         # (plus any post the family has actually reacted to or replied on).
         await sweep_occurrence_posts(channel, tid, prior_mids, keep=None)
+    await bump_live_games(task["guild_id"], channel)  # games ride the nag too
 
 
 __all__ = [

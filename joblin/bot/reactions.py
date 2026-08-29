@@ -88,12 +88,14 @@ _FUNCTIONAL_KEYS = frozenset(emoji_key(e) for e in (
 
 
 def _is_tracked_post(snap: dict, mid: int) -> bool:
-    """Is this one of our sweepable posts — a live occurrence post or a resolved
-    anchor still carrying ↩️/🔄/👏? (Game posts and snooze panels have their own
-    lifecycles and are never swept, so they don't collect touches.)"""
+    """Is this one of our sweepable posts — a live occurrence post, a live
+    game round (swept by its hourly bump), or a resolved anchor still carrying
+    ↩️/🔄/👏? (Snooze panels have their own lifecycle and are never swept, so
+    they don't collect touches.)"""
     key = str(mid)
     return (key in snap["messages"] or key in snap["undo"]
-            or key in snap["requeue"] or key in snap["claps"])
+            or key in snap["requeue"] or key in snap["claps"]
+            or key in snap.get("game_messages", {}))
 
 
 async def _mark_touched(mid: int) -> None:

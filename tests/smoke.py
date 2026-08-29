@@ -728,6 +728,177 @@ async def test_pitchin_expiry() -> None:
         assert len(recs) == 1 and recs[0]["points"] == 1
 
 
+async def test_game_bump() -> None:
+    """Live games ride the chore noise, never a clock: a scheduler tick alone
+    leaves a game post where it is; a chore *fire* or *nag* re-posts every open
+    round beneath it (body + buttons; message_id / game_messages swap so a press
+    on the old post is refused and close/clap follow the moved post); the old
+    post is swept unless touched (then buttons stripped, pointer added) or
+    declutter is off; a 🤫'd game stays put through fires and nags (button flips
+    to 🔊, same-direction press whispers, redraws keep the face); a dormant
+    recurring round or a deferred one never moves."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        tid = "hens"
+        async with st.txn() as data:
+            data["tasks"][tid] = {
+                "id": tid, "guild_id": 1, "brief": "Shut the hens in", "description": None,
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": now.astimezone(tz).strftime("%H:%M"),
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+        pid, msg = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Firewood bonanza", description=None,
+            expires_at=m.to_iso(now + dt.timedelta(days=7)), points_each=1,
+            max_scorers=None, now=now,
+        )
+        first = msg.id
+        assert f"pitchin:shush:{pid}" in btn_ids(ch.msgs[first]), "live post offers 🤫"
+        assert "bump_at" not in (await st.snapshot())["pitchins"][pid], "no clock of its own"
+
+        # Ticks alone never move it — no matter how long it sits.
+        for _ in range(3):
+            await bot.sweep_games(m.now_utc() + dt.timedelta(hours=5), await st.snapshot())
+        assert (await st.snapshot())["pitchins"][pid]["message_id"] == first and ch.deleted == []
+
+        async def fire() -> int:
+            await bot.fire_task(tid, ch, cfg)
+            return (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][-1]
+
+        async def nag() -> int:
+            async with st.txn() as data:
+                data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
+            await bot.send_reminder(tid, ch, cfg)
+            return (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][-1]
+
+        # A chore fires -> the game re-posts *below* the chore post.
+        await bot.on_raw_reaction_add(FakePayload(first, "✅", user_id=42, member=FakeMember(42, "Pat")))
+        chore_mid = await fire()
+        snap = await st.snapshot()
+        second = snap["pitchins"][pid]["message_id"]
+        assert second != first and second > chore_mid, "bumped to a fresh post under the chore"
+        assert first in ch.deleted, "the old post is swept"
+        assert str(first) not in snap["game_messages"] and snap["game_messages"][str(second)]["id"] == pid
+        assert "Pitched in (1):** Pat" in ch.msgs[second].content, "state rides along"
+        assert f"pitchin:join:{pid}" in btn_ids(ch.msgs[second]), "…with its buttons"
+
+        # A press on the swept post is refused; the new post works.
+        stale = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[first])
+        await bot.handle_pitchin_button(pid, "join", stale)
+        assert whispered(stale)["ephemeral"] and len((await st.snapshot())["pitchins"][pid]["scorers"]) == 1
+        await bot.handle_pitchin_button(pid, "join", FakeInteraction(
+            user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[second]))
+        assert len((await st.snapshot())["pitchins"][pid]["scorers"]) == 2
+
+        # A nag moves it too; a touched post (someone reacted 🎉) survives the
+        # sweep, buttons stripped and a pointer added.
+        await bot.on_raw_reaction_add(FakePayload(second, "🎉", member=FakeMember(7, "Sam")))
+        assert str(second) in (await st.snapshot())["touched"], "game posts collect touches"
+        nag_mid = await nag()
+        snap = await st.snapshot()
+        third = snap["pitchins"][pid]["message_id"]
+        assert third != second and third > nag_mid and second not in ch.deleted, "touched post stands"
+        assert btn_ids(ch.msgs[second]) == [] and "Bumped" in ch.msgs[second].content
+
+        # 🤫: flag set, button flips to 🔊, body says so; a second 🤫 whispers;
+        # neither a nag nor a fire moves it now.
+        await bot.handle_pitchin_button(pid, "shush", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[third]))
+        snap = await st.snapshot()
+        assert snap["pitchins"][pid]["no_nag"] is True
+        ids = btn_ids(ch.msgs[third])
+        assert f"pitchin:unshush:{pid}" in ids and f"pitchin:shush:{pid}" not in ids
+        assert "Shushed" in ch.msgs[third].content
+        again = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[third])
+        await bot.handle_pitchin_button(pid, "shush", again)
+        assert whispered(again)["ephemeral"]
+        await nag()
+        assert (await st.snapshot())["pitchins"][pid]["message_id"] == third, "shushed: stays put"
+        # A ✅ redraw keeps the 🔊 face and the shush line.
+        await bot.handle_pitchin_button(pid, "join", FakeInteraction(
+            user=FakeUser(9, "Lee"), channel=ch, message=ch.msgs[third]))
+        assert f"pitchin:unshush:{pid}" in btn_ids(ch.msgs[third]) and "Shushed" in ch.msgs[third].content
+
+        # 🔊: it follows the chores again.
+        await bot.handle_pitchin_button(pid, "unshush", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[third]))
+        snap = await st.snapshot()
+        assert snap["pitchins"][pid]["no_nag"] is False
+        assert f"pitchin:shush:{pid}" in btn_ids(ch.msgs[third]) and "Shushed" not in ch.msgs[third].content
+        await nag()
+        fourth = (await st.snapshot())["pitchins"][pid]["message_id"]
+        assert fourth != third and third in ch.deleted
+
+        # Closing follows the moved post: the 🏁 lands on the current one.
+        await bot.handle_pitchin_button(pid, "end", FakeInteraction(
+            user=FakeUser(1, "Boss"), channel=ch, message=ch.msgs[fourth]))
+        snap = await st.snapshot()
+        assert pid not in snap["pitchins"]
+        assert "pitched in!" in ch.msgs[fourth].content and f"post:clap:{pid}" in btn_ids(ch.msgs[fourth])
+        assert len(st.read_completions()) == 3
+
+        # Do-em-up: the tally rides along; 🤫 works there too; a deferred game
+        # (next_due set, no post) and a dormant recurring round never move.
+        did, dmsg = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="thistle bushes", description=None,
+            points_each=1, deadline=None, point_limit=None, now=now, verb="pull",
+        )
+        await bot.handle_doemup_button(did, "plus", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[dmsg.id]))
+        deferred = await bot.schedule_pitchin(
+            guild_id=1, creator_id=1, channel_id=999, brief="Later", description=None,
+            points_each=1, max_scorers=None, now=now, recurrence=None, duration_secs=3600,
+            starts_at=now + dt.timedelta(days=1))
+        posted = len(ch.msgs)
+        await nag()
+        snap = await st.snapshot()
+        moved = snap["doemups"][did]["message_id"]
+        assert moved != dmsg.id and dmsg.id in ch.deleted
+        assert "Pat ×1" in ch.msgs[moved].content
+        assert len(ch.msgs) == posted + 2, "one nag + one game moved; the deferred one posted nothing"
+        assert snap["pitchins"][deferred]["message_id"] is None
+        assert f"doemup:shush:{did}" in btn_ids(ch.msgs[moved])
+        await bot.handle_doemup_button(did, "shush", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[moved]))
+        assert (await st.snapshot())["doemups"][did]["no_nag"] is True
+        assert f"doemup:unshush:{did}" in btn_ids(ch.msgs[moved])
+        await bot.handle_doemup_button(did, "plus", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[moved]))
+        assert f"doemup:unshush:{did}" in btn_ids(ch.msgs[moved]) and "Pat ×2" in ch.msgs[moved].content
+        await nag()
+        assert (await st.snapshot())["doemups"][did]["message_id"] == moved, "shushed do-em-up stays put"
+
+        # Declutter off: the bump still happens, the old post stays (stripped).
+        async with st.txn() as data:
+            data["configs"]["1"]["declutter"] = False
+            data["doemups"][did]["no_nag"] = False
+        cfg_off = (await st.snapshot())["configs"]["1"]
+        deleted_before = list(ch.deleted)
+        async with st.txn() as data:
+            data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
+        await bot.send_reminder(tid, ch, cfg_off)
+        snap = await st.snapshot()
+        last = snap["doemups"][did]["message_id"]
+        assert last != moved and ch.deleted == deleted_before, "nothing deleted when off"
+        assert btn_ids(ch.msgs[moved]) == [] and "Bumped" in ch.msgs[moved].content
+        assert f"doemup:plus:{did}" in btn_ids(ch.msgs[last])
+
+        # A recurring round gone dormant is not eligible; its next round is.
+        async with st.txn() as data:
+            data["doemups"][did].update({"recurring": True, "freq": "days", "interval_days": 1,
+                                         "weekdays": [], "monthdays": [], "time_of_day": "09:00"})
+        await bot.finalize_doemup(did, ch)
+        assert not bot.bump_eligible((await st.snapshot())["doemups"][did])
+        async with st.txn() as data:
+            data["doemups"][did]["next_due"] = m.to_iso(now - dt.timedelta(seconds=1))
+        await bot.sweep_games(m.now_utc(), await st.snapshot())
+        assert bot.bump_eligible((await st.snapshot())["doemups"][did])
+
+
 async def test_doemup_lifecycle() -> None:
     """Drive the do-em-up buttons: ➕ tallies live, ➖ corrects, a non-creator End
     is refused, the creator End closes it and awards count×puntos, and the puntos
@@ -4870,6 +5041,7 @@ def main() -> None:
     asyncio.run(test_pitchin_cap_and_points())
     asyncio.run(test_pitchin_expiry())
     asyncio.run(test_doemup_lifecycle())
+    asyncio.run(test_game_bump())
     asyncio.run(test_doemup_limit_and_deadline())
     asyncio.run(test_pitchin_recurring())
     asyncio.run(test_pitchin_at_deferred())

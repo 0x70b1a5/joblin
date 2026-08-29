@@ -11,7 +11,11 @@ Lifecycle of a task occurrence
 2. While pending, every tick checks ``remind_at``. When it passes, the bot
    posts a fresh nag (optionally pinging a role) and sets ``remind_at = now+1h``.
    Nags additionally carry a 🤫 Shush button; a task whose ``no_nag`` flag is
-   set is never nagged (it still fires — only the reminders stop).
+   set is never nagged (it still fires — only the reminders stop). Each fire
+   and nag then calls ``games.bump_live_games``: every open pitch-in /
+   do-em-up round is re-posted beneath the chore post (old post swept) so
+   games stay in view without noise of their own; 🤫 on a game sets its own
+   ``no_nag`` to keep it put.
 3. Buttons resolve or defer the occurrence:
      ✅  done      -> log the completer; recurring tasks roll to the next slot,
                       one-offs are removed.

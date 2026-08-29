@@ -176,6 +176,7 @@ async def listtasks(interaction: discord.Interaction) -> None:
             else:
                 when, state = now_utc(), "—"
             info = " ℹ️" if g.get("description") else ""
+            info += " 🤫" if g.get("no_nag") else ""
             name = doemup_title(g) if section == "doemups" else g["brief"]
             game_rows.append(
                 (when, f"• `{g['id']}` {icon} **{name}**{info} — {sched} · {state}")
@@ -383,10 +384,11 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "⏭️ **Skip** — recurring chore: skips just this time\n"
             "❌ **Delete** — one-off chore: cancels it\n"
             "🎁 **Award** — credit someone else; on a full row shares the 🤫/🔊 slot\n"
-            "🤫 **Shush** — appears on a reminder: mutes the hourly nags for that "
-            "chore for good (it still posts when due)\n"
-            "🔊 **Un-shush** — appears on a shushed chore's posts: turns the "
-            "nags back on\n"
+            "🤫 **Shush** — on a reminder: mutes the hourly nags for that chore "
+            "for good (it still posts when due); on a live pitch-in / do-em-up: "
+            "keeps its post put instead of following each chore post down\n"
+            "🔊 **Un-shush** — appears on a shushed chore's or game's posts: turns "
+            "the nags / bumps back on\n"
             "↩️ **Undo** — appears after ✅/⏩/⏭️/❌ to reverse it\n"
             "🔄 **Requeue** — appears on a completed chore or a closed pitch-in / "
             "do-em-up round; re-runs it right now\n"
@@ -477,7 +479,11 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "(`at`), rename, or adjust puntos/cap; a schedule change applies from "
             "the next round. Puntos from both feed the `/leaderboard` — and a closed "
             "round grows a 👏 anyone who sat it out can tap to tip every scorer a "
-            "bonus punto."
+            "bonus punto.\n"
+            "Whenever a chore posts (a due chore or a reminder), every live "
+            "round is re-posted beneath it (the old post swept) so a long game "
+            "never needs scrolling back to — no extra noise; tap 🤫 on one to "
+            "keep it where it is (🔊 lets it follow again)."
         ),
         inline=False,
     )

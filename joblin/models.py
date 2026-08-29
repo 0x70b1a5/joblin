@@ -851,6 +851,15 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
 #   "duration_secs": int | None,   # how long each round stays open. Set from an
 #                                  #   explicit expires/deadline; None means the
 #                                  #   round runs until the next scheduled slot.
+#
+# The bump (bot/games.py ``bump_live_games``)
+# -------------------------------------------
+# Whenever a chore fires or nags, every live round is re-posted beneath it (the
+# old post swept, like a chore's rolling nag) so a long game stays in view
+# without adding noise of its own — no timer, nothing persisted for it:
+#   "no_nag":        bool,         # 🤫 on the post: never bump this game (its
+#                                  #   post stays put). Cleared by 🔊. Lifetime,
+#                                  #   like a chore's flag. Absent means False.
 # When a recurring game's round auto-closes (expiry/deadline/cap) it awards
 # puntos, rewrites its post as a result line, then goes dormant with ``next_due``
 # set; the scheduler re-posts a fresh round at that instant. A creator's 🏁 ends
@@ -962,7 +971,16 @@ def render_pitchin(p: dict, *, final: bool = False) -> str:
         f"Tap ✅ to pitch in — closes {discord_ts(exp, 'R')}.  "
         f"_(creator: {EMOJI_END} to end now)_\n"
         f"**Pitched in ({count}):** {names}"
+        f"{game_shush_line(p)}"
     )
+
+
+def game_shush_line(g: dict) -> str:
+    """The trailing line on a live game post that has been 🤫'd (empty
+    otherwise) — part of the render so every in-place redraw keeps it."""
+    if not g.get("no_nag"):
+        return ""
+    return f"\n{EMOJI_SHUSH} Shushed — stays put ({EMOJI_UNSHUSH} to let it follow the chores again)."
 
 
 # --- Do-em-ups -------------------------------------------------------------
@@ -1045,6 +1063,7 @@ def render_doemup(d: dict, *, final: bool = False) -> str:
         f"{EMOJI_FLEX} **{title}**  ·  {per}{closes}{desc}\n"
         f"Tap ➕ each time you finish one (➖ to fix).\n"
         f"**Tally:** {tally_line}  —  {head}"
+        f"{game_shush_line(d)}"
     )
 
 
