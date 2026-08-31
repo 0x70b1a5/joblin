@@ -52,6 +52,7 @@ bar — to gamify the family chores.
 | Command | Who | What |
 |---|---|---|
 | `/joblinconfig` | Manage Server | Set the post **channel**, **timezone** (IANA, e.g. `Europe/Berlin`), an optional **reminder role**, and the **`item_bar`** — puntos per trinket each month, where every whole multiple earns another (default **25**). Run with no options to view current config. |
+| `/quiettime` | anyone | Hush **fires and nags** (nightly backup / month close / daily log still post). No args **toggles** the switch. `start` / `end` set a daily guild-local window: only `start` runs until 23:59, only `end` starts at 00:00, and a start later than the end **wraps midnight** (e.g. `22:00`–`07:00`). `off` clears the window. |
 | `/newtask` | anyone | `brief`, optional `at` (default **now**), optional `repeat` (default **once**), optional `description`, optional `bounty` (a 2-punto chore the creator can't complete). Both `at` and `repeat` autocomplete with a live preview. Posts a **public** confirmation so the family sees the new chore. |
 | `/pitchin` | anyone | Post a **pitch-in**: `brief`, optional `expires` (default **24h**), `puntos` each (default 1), `max_scorers`, `description`. Everyone who taps ✅ before it closes earns a punto. See [Pitch-ins & do-em-ups](#pitch-ins--do-em-ups). |
 | `/doemup` | anyone | Post a **do-em-up**: `brief`, optional `puntos` per ➕ (default 1), `deadline`, `point_limit`, `description`. Tap ➕ once per thing you did; the tally updates live. See [Pitch-ins & do-em-ups](#pitch-ins--do-em-ups). |

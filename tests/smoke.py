@@ -182,6 +182,101 @@ def test_parse_clock() -> None:
             raise AssertionError(f"{bad!r} should have failed")
 
 
+def test_in_quiet_window() -> None:
+    """Daily window: inclusive start, exclusive end, 23:59 through midnight,
+    start-after-end wraps, equal bounds = all day."""
+    tz = ZoneInfo("Europe/Berlin")
+
+    def at(h, mi=0, day=14):
+        return dt.datetime(2026, 6, day, h, mi, tzinfo=tz).astimezone(UTC)
+
+    # 08:00–17:00, no wrap.
+    assert m.in_quiet_window(at(8, 0), "08:00", "17:00", tz)
+    assert m.in_quiet_window(at(16, 59), "08:00", "17:00", tz)
+    assert not m.in_quiet_window(at(7, 59), "08:00", "17:00", tz)
+    assert not m.in_quiet_window(at(17, 0), "08:00", "17:00", tz), (
+        "end is exclusive so a 17:00 chore can still fire")
+
+    # Only-start default: 22:00–23:59 covers the rest of the day.
+    assert m.in_quiet_window(at(22, 0), "22:00", "23:59", tz)
+    assert m.in_quiet_window(at(23, 59), "22:00", "23:59", tz)
+    assert not m.in_quiet_window(at(0, 0, day=15), "22:00", "23:59", tz)
+
+    # Only-end default: 00:00–07:00.
+    assert m.in_quiet_window(at(0, 0), "00:00", "07:00", tz)
+    assert m.in_quiet_window(at(6, 59), "00:00", "07:00", tz)
+    assert not m.in_quiet_window(at(7, 0), "00:00", "07:00", tz)
+    assert not m.in_quiet_window(at(23, 0), "00:00", "07:00", tz)
+
+    # Start after end wraps midnight (22:00–07:00).
+    assert not m.in_quiet_window(at(21, 59), "22:00", "07:00", tz)
+    assert m.in_quiet_window(at(22, 0), "22:00", "07:00", tz)
+    assert m.in_quiet_window(at(23, 30), "22:00", "07:00", tz)
+    assert m.in_quiet_window(at(0, 0, day=15), "22:00", "07:00", tz)
+    assert m.in_quiet_window(at(6, 59, day=15), "22:00", "07:00", tz)
+    assert not m.in_quiet_window(at(7, 0, day=15), "22:00", "07:00", tz)
+
+    # Equal bounds = all day.
+    assert m.in_quiet_window(at(10, 0), "10:00", "10:00", tz)
+    assert m.in_quiet_window(at(0, 0), "00:00", "00:00", tz)
+    # 00:00–23:59 is also all day (only-start at midnight / only-end at 23:59).
+    assert m.in_quiet_window(at(12, 0), "00:00", "23:59", tz)
+    assert m.in_quiet_window(at(23, 59), "00:00", "23:59", tz)
+
+    assert m.parse_quiet_clock("10pm") == "22:00"
+    assert m.parse_quiet_clock("7:00") == "07:00"
+    assert m.parse_quiet_clock("midnight") == "00:00"
+    assert m.parse_quiet_clock("noon") == "12:00"
+    assert m.format_quiet_window("22:00", "07:00") == "22:00–07:00 · wraps midnight"
+    assert m.format_quiet_window("08:00", "17:00") == "08:00–17:00"
+    assert "all day" in m.format_quiet_window("10:00", "10:00")
+
+
+def test_quiet_tick() -> None:
+    """The window flips the switch on edges; a manual unmute during the
+    window sticks until the next start; first sample inside turns it on."""
+    tz_name = "Europe/Berlin"
+    tz = ZoneInfo(tz_name)
+
+    def at(h, mi=0):
+        return dt.datetime(2026, 6, 14, h, mi, tzinfo=tz).astimezone(UTC)
+
+    # No window: switch is whatever it is, nothing to persist.
+    delta, on = m.quiet_tick({"quiet": True, "timezone": tz_name}, at(12))
+    assert delta == {} and on is True
+    delta, on = m.quiet_tick({"timezone": tz_name}, at(12))
+    assert delta == {} and on is False
+
+    window = {
+        "timezone": tz_name, "quiet_start": "22:00", "quiet_end": "07:00",
+    }
+    # First sample inside the window turns the switch on (and records membership).
+    delta, on = m.quiet_tick({**window, "quiet": False}, at(23))
+    assert delta == {"quiet": True, "quiet_was_in": True} and on is True
+    # First sample outside: just record membership, leave the switch.
+    delta, on = m.quiet_tick({**window, "quiet": True}, at(12))
+    assert delta == {"quiet_was_in": False} and on is True
+
+    # Edge: leaving the window turns it off.
+    delta, on = m.quiet_tick(
+        {**window, "quiet": True, "quiet_was_in": True}, at(7, 0))
+    assert delta == {"quiet": False, "quiet_was_in": False} and on is False
+    # Edge: entering turns it on.
+    delta, on = m.quiet_tick(
+        {**window, "quiet": False, "quiet_was_in": False}, at(22, 0))
+    assert delta == {"quiet": True, "quiet_was_in": True} and on is True
+
+    # Manual unmute during the window: was_in still True, in_win True → no edge,
+    # switch stays off until the next start.
+    delta, on = m.quiet_tick(
+        {**window, "quiet": False, "quiet_was_in": True}, at(23))
+    assert delta == {} and on is False
+    # ...and the next start (after having left) turns it back on.
+    delta, on = m.quiet_tick(
+        {**window, "quiet": False, "quiet_was_in": False}, at(22, 0))
+    assert on is True and delta["quiet"] is True
+
+
 def test_resolve_when() -> None:
     tz = ZoneInfo("Europe/Berlin")
     now = dt.datetime(2026, 6, 19, 13, 5, tzinfo=tz).astimezone(UTC)  # a Friday
@@ -987,6 +1082,174 @@ async def test_hourly_listopen() -> None:
         await bot.run_hourly_listopen(fourth_now)
         assert ch.deleted == kept, "declutter off: previous digest stays"
         assert len(_open_digest_msgs(ch)) >= 3
+
+
+async def test_quiettime_command() -> None:
+    """/quiettime with no args toggles; start/end set a daily window (only-start
+    → 23:59, only-end → 00:00, start after end wraps); off clears the window
+    without flipping the switch; setting a window we're inside turns it on."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        local = now.astimezone(tz)
+        # A window that contains *now*, and one that doesn't.
+        in_start = (local - dt.timedelta(minutes=30)).strftime("%H:%M")
+        in_end = (local + dt.timedelta(minutes=30)).strftime("%H:%M")
+        if in_start > in_end:
+            # Near midnight the 1h span wraps; that's fine for the wrap case
+            # below, but this pair should be a non-wrapping "we're inside" window.
+            in_start, in_end = "00:00", "23:59"
+
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.quiettime.callback(inter)
+        snap = await st.snapshot()
+        assert snap["configs"]["1"]["quiet"] is True
+        assert "on" in inter.response.content.lower()
+        assert not inter.response.ephemeral, "the family should see the hush"
+
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.quiettime.callback(inter)
+        assert (await st.snapshot())["configs"]["1"]["quiet"] is False
+        assert "off" in inter.response.content.lower()
+
+        # Only start → end 23:59.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.quiettime.callback(inter, start="22:00")
+        cfg = (await st.snapshot())["configs"]["1"]
+        assert cfg["quiet_start"] == "22:00" and cfg["quiet_end"] == "23:59"
+        assert "22:00" in inter.response.content and "23:59" in inter.response.content
+
+        # Only end → start 00:00.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.quiettime.callback(inter, end="7am")
+        cfg = (await st.snapshot())["configs"]["1"]
+        assert cfg["quiet_start"] == "00:00" and cfg["quiet_end"] == "07:00"
+
+        # Both, wrapping.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.quiettime.callback(inter, start="22:00", end="07:00")
+        cfg = (await st.snapshot())["configs"]["1"]
+        assert cfg["quiet_start"] == "22:00" and cfg["quiet_end"] == "07:00"
+        assert "wraps" in inter.response.content.lower()
+
+        # A window covering now turns the switch on.
+        async with st.txn() as data:
+            data["configs"]["1"]["quiet"] = False
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.quiettime.callback(inter, start=in_start, end=in_end)
+        cfg = (await st.snapshot())["configs"]["1"]
+        assert cfg["quiet"] is True
+        assert cfg["quiet_was_in"] is True
+        assert "on" in inter.response.content.lower()
+
+        # off clears the window, switch stays.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.quiettime.callback(inter, start="off")
+        cfg = (await st.snapshot())["configs"]["1"]
+        assert cfg["quiet_start"] is None and cfg["quiet_end"] is None
+        assert cfg["quiet"] is True, "clearing the window doesn't unmute"
+        assert "cleared" in inter.response.content.lower()
+
+        # Mixed off + time is refused.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.quiettime.callback(inter, start="off", end="07:00")
+        assert "mix" in inter.response.content.lower()
+        assert inter.response.ephemeral
+
+        # Junk clock is refused.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.quiettime.callback(inter, start="half past banana")
+        assert inter.response.ephemeral
+        assert (await st.snapshot())["configs"]["1"]["quiet_start"] is None
+
+        # Shown on /joblinconfig.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.joblinconfig.callback(inter)
+        assert "Quiet time" in inter.response.content
+
+
+async def test_quiet_blocks_scheduler() -> None:
+    """While the switch is on, the tick skips fires, nags, and the hourly
+    digest; due work is still sitting there and posts the moment quiet lifts.
+    A direct fire_task (🔄) is not gated. Nightly bookkeeping is not under
+    test here — it has its own path and does not consult the switch."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        async with st.txn() as data:
+            data["configs"]["1"]["quiet"] = True
+            data["tasks"]["hens"] = {
+                "id": "hens", "guild_id": 1, "brief": "Shut the hens in",
+                "description": None, "recurring": True, "freq": "days",
+                "interval_days": 1, "weekdays": [], "monthdays": [],
+                "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+            data["tasks"]["eggs"] = {
+                "id": "eggs", "guild_id": 1, "brief": "Collect eggs",
+                "description": None, "recurring": True, "freq": "days",
+                "interval_days": 1, "weekdays": [], "monthdays": [],
+                "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+        await bot.run_scheduler_tick()
+        snap = await st.snapshot()
+        assert snap["tasks"]["hens"]["pending"] is None, "didn't fire while quiet"
+        assert snap["tasks"]["eggs"]["pending"] is None
+        assert snap["tasks"]["hens"]["next_due"] is not None
+        assert ch.msgs == {}, "no fire, nag, or digest posted"
+
+        # Direct fire_task (the 🔄 path) is not gated by the switch.
+        cfg = snap["configs"]["1"]
+        await bot.fire_task("hens", ch, cfg)
+        snap = await st.snapshot()
+        assert snap["tasks"]["hens"]["pending"] is not None
+        assert len(ch.msgs) == 1, "🔄 still posts during quiet"
+
+        # Nag skipped while quiet: due remind_at, tick posts nothing new.
+        async with st.txn() as data:
+            data["tasks"]["hens"]["pending"]["remind_at"] = m.to_iso(
+                now - dt.timedelta(seconds=1))
+        await bot.run_scheduler_tick()
+        assert len(ch.msgs) == 1, "no nag while quiet"
+
+        # Hourly digest skipped too (chore is scheduled this hour and open);
+        # the hour is left unclaimed so it can still land once quiet lifts.
+        await bot.run_hourly_listopen(now)
+        assert not (await st.snapshot()).get("hourly_open", {}).get("1")
+        assert _open_digest_msgs(ch) == []
+
+        # Quiet lifts → hens nags, eggs (never posted) fires.
+        async with st.txn() as data:
+            data["configs"]["1"]["quiet"] = False
+        await bot.run_scheduler_tick()
+        snap = await st.snapshot()
+        assert snap["tasks"]["hens"].get("nag_count", 0) == 1, (
+            "nag catch-up after quiet lifts")
+        assert any("Still pending" in (msg.content or "")
+                   for msg in ch.msgs.values()), "the catch-up nag posted"
+        assert snap["tasks"]["eggs"]["pending"] is not None, (
+            "fire catch-up after quiet lifts")
+
+        # Window edge on a later tick: currently outside a 22:00–07:00 window
+        # with was_in False, then we can't easily freeze now_utc, so drive
+        # sync_quiet_windows with an explicit instant.
+        async with st.txn() as data:
+            data["configs"]["1"]["quiet"] = False
+            data["configs"]["1"]["quiet_start"] = "22:00"
+            data["configs"]["1"]["quiet_end"] = "07:00"
+            data["configs"]["1"]["quiet_was_in"] = False
+        enter = dt.datetime(2026, 6, 14, 22, 0, tzinfo=tz).astimezone(UTC)
+        await bot.sync_quiet_windows(enter)
+        assert (await st.snapshot())["configs"]["1"]["quiet"] is True
+        leave = dt.datetime(2026, 6, 15, 7, 0, tzinfo=tz).astimezone(UTC)
+        await bot.sync_quiet_windows(leave)
+        assert (await st.snapshot())["configs"]["1"]["quiet"] is False
 
 
 async def test_doemup_lifecycle() -> None:
@@ -5062,6 +5325,8 @@ def main() -> None:
     test_emoji_key()
     test_time_parsing()
     test_parse_clock()
+    test_in_quiet_window()
+    test_quiet_tick()
     test_resolve_when()
     test_resolve_close()
     test_parse_repeat()
@@ -5133,6 +5398,8 @@ def main() -> None:
     asyncio.run(test_doemup_lifecycle())
     test_hourly_listopen_hour_math()
     asyncio.run(test_hourly_listopen())
+    asyncio.run(test_quiettime_command())
+    asyncio.run(test_quiet_blocks_scheduler())
     asyncio.run(test_doemup_limit_and_deadline())
     asyncio.run(test_pitchin_recurring())
     asyncio.run(test_pitchin_at_deferred())

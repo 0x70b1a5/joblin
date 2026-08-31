@@ -10,7 +10,8 @@ Layout
 ------
 ``lookup``  — free-text resolution: the task/game finders and the shared
               autocompletes (`at`/`repeat` live previews, task/game pickers).
-``config``  — ``/joblinconfig`` (channel, timezone, reminder role, trinket bar).
+``config``  — ``/joblinconfig`` (channel, timezone, reminder role, trinket bar)
+              and ``/quiettime`` (guild-wide hush on fires & nags).
 ``tasks``   — ``schedule_from_rule``, ``/newtask``, ``/deletetask``.
 ``games``   — ``/pitchin`` and ``/doemup`` (the round engine is ``bot.games``).
 ``edit``    — the ``/edit`` group (task / pitchin / doemup) and its shared

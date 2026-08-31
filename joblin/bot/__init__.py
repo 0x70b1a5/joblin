@@ -2,6 +2,11 @@
 
 Lifecycle of a task occurrence
 ------------------------------
+Guild quiet time (``/quiettime``) hushes steps 1–2: the scheduler skips
+fires, nags, and kabooms while the switch is on (a daily ``start``/``end``
+window flips that switch on its edges). Nightly backup, month close, and
+the 📜 Daily Log still run. A manual 🔄 requeue still posts.
+
 1. The scheduler tick (every 30s) notices ``now >= next_due`` and *fires* it:
    posts the brief to the configured channel with an action row of buttons —
    ✅ Done, ⏩ Snooze, ℹ️ Info (only if the task has a long description),

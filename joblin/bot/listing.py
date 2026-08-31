@@ -394,7 +394,8 @@ async def run_hourly_listopen(now: dt.datetime) -> None:
     open, post the same public /listopen embed the slash command would — then
     sweep the previous hour's digest (declutter on, untouched). 🤫'd games
     are omitted here (they asked not to be kept in view); a manual
-    ``/listopen`` still lists them.
+    ``/listopen`` still lists them. Guild quiet time skips the auto-digest
+    (the hour is left unclaimed, so it can still land once quiet lifts).
 
     Restart-safe via the persisted ``hourly_open[guild].hour`` key: the hour
     is claimed *before* the Discord send so a slow post can't double-fire on
@@ -405,6 +406,8 @@ async def run_hourly_listopen(now: dt.datetime) -> None:
     for gid_str, cfg in list(snap.get("configs", {}).items()):
         if not config_ready(cfg):
             continue
+        if cfg.get("quiet"):
+            continue  # guild quiet time: not a fire/nag, but not EOD/SOD either
         try:
             tz = ZoneInfo(cfg["timezone"])
         except Exception:
@@ -501,6 +504,7 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "• `/deletetask` — remove a chore for good\n"
             "• `/leaderboard` — monthly (or all-time) puntos, title badges & ⭐ stars 🏆\n"
             "• `/covet` — your cabinet of month's-end trinkets 🖼️\n"
+            "• `/quiettime` — hush fires & nags (no args toggles; `start`/`end` a daily window)\n"
             "• `/joblinconfig` — channel, timezone, reminder role, trinket bar *(Manage Server)*\n"
             "• `/joblinhelp` — this message"
         ),

@@ -179,6 +179,116 @@ def normalise_hhmm(s: str) -> str:
     return f"{h:02d}:{mi:02d}"
 
 
+# ---------------------------------------------------------------------------
+# Quiet time — a guild-wide hush on fires & nags (not EOD/SOD bookkeeping)
+# ---------------------------------------------------------------------------
+# Persisted on the guild config:
+#   "quiet":         bool,        # the switch. Scheduler skips fires, nags,
+#                                 # kabooms, and the hourly /listopen digest
+#                                 # while this is True. Manual /quiettime with
+#                                 # no args flips it. Absent means False.
+#   "quiet_start":   str | None,  # "HH:MM" guild-local daily window start
+#   "quiet_end":     str | None,  # "HH:MM" guild-local daily window end.
+#                                 # A start later than the end wraps midnight
+#                                 # (22:00–07:00). Only-start defaults end to
+#                                 # 23:59 (through the rest of the day); only-
+#                                 # end defaults start to 00:00.
+#   "quiet_was_in":  bool | None, # last sampled window membership. The window
+#                                 # *flips the switch on its edges* so a manual
+#                                 # unmute during the window sticks until the
+#                                 # next start, and a nap-time mute lasts until
+#                                 # the next end. None = never sampled.
+#
+# The switch is the source of truth; comparing wall-clock now against the
+# window is restart-safe (no timers). EOD/SOD posts (nightly backup, month
+# close, daily-log pin cycle) do not consult it.
+
+
+def parse_quiet_clock(text: str) -> str:
+    """Parse a daily quiet-window bound into normalised ``HH:MM``.
+
+    Accepts the same clock forms as ``at`` (``22:00``, ``10pm``, ``midnight``,
+    ``noon``) but not dates or relative offsets — it's a wall-clock, every day.
+    """
+    s = (text or "").strip().lower().removeprefix("at ").strip()
+    if not s:
+        raise ValueError("expected a time (e.g. 22:00 or 10pm)")
+    h, mi = _wall_hm(s)
+    return f"{h:02d}:{mi:02d}"
+
+
+def _hhmm_minutes(s: str) -> int:
+    h, mi = parse_hhmm(s)
+    return h * 60 + mi
+
+
+def format_quiet_window(start: str, end: str) -> str:
+    """Human label for a stored ``HH:MM``–``HH:MM`` window."""
+    s, e = _hhmm_minutes(start), _hhmm_minutes(end)
+    if s == e:
+        return f"{start}–{end} · all day"
+    if s > e:
+        return f"{start}–{end} · wraps midnight"
+    return f"{start}–{end}"
+
+
+def in_quiet_window(now: dt.datetime, start: str, end: str, tz: ZoneInfo) -> bool:
+    """True if guild-local ``now`` falls in the daily quiet window.
+
+    Start is inclusive, end exclusive, at minute grain — quiet *finishes at*
+    ``end``, so a 07:00 chore can fire when the window is ``22:00–07:00``.
+    An end of ``23:59`` runs through the last minute of the day (the
+    only-start default). A start later than the end wraps past midnight.
+    Equal start and end is the whole day.
+    """
+    local = now.astimezone(tz)
+    now_min = local.hour * 60 + local.minute
+    s = _hhmm_minutes(start)
+    e = _hhmm_minutes(end)
+    if s == e:
+        return True
+    # 23:59 as end = through end-of-day, otherwise exclusive of the end minute.
+    e_excl = 24 * 60 if e == 23 * 60 + 59 else e
+    if s < e_excl:
+        return s <= now_min < e_excl
+    return now_min >= s or now_min < e_excl
+
+
+def quiet_tick(cfg: dict, now: dt.datetime) -> tuple[dict, bool]:
+    """Apply a daily quiet-window edge to ``cfg``.
+
+    Returns ``(delta, is_quiet)``. ``delta`` is the subset of fields that
+    changed (empty if the switch didn't move) — the caller persists only then.
+    ``cfg`` itself is not mutated.
+
+    The switch (``quiet``) is the source of truth for "are fires/nags
+    suppressed". The window only *flips* that switch when local time crosses
+    ``quiet_start`` / ``quiet_end``. A manual ``/quiettime`` toggle writes the
+    switch directly; the next edge overwrites it, so unmuting during a window
+    lasts until the next start, and a nap-time mute lasts until the next end.
+    """
+    on = bool(cfg.get("quiet"))
+    start, end = cfg.get("quiet_start"), cfg.get("quiet_end")
+    tz_name = cfg.get("timezone")
+    if not (start and end and tz_name):
+        return {}, on
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        return {}, on
+    in_win = in_quiet_window(now, start, end, tz)
+    was = cfg.get("quiet_was_in")
+    if was is None:
+        delta: dict = {"quiet_was_in": in_win}
+        if in_win and not on:
+            delta["quiet"] = True
+            on = True
+        return delta, on
+    if in_win == was:
+        return {}, on
+    return {"quiet": in_win, "quiet_was_in": in_win}, in_win
+
+
 _DATETIME = re.compile(r"^(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})$")
 
 
@@ -858,7 +968,7 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
 # Once per guild-local hour the scheduler posts a public /listopen digest
 # (jump links to every open chore + live round) *iff* a chore is also
 # scheduled for that hour, so a week-long tally is one tap away without
-# adding noise of its own on quiet hours. Restart-safe via the persisted
+# adding noise of its own on empty hours. Restart-safe via the persisted
 # ``hourly_open`` slot (the hour-start key is the once-per-hour gate):
 #   "no_nag":        bool,         # 🤫 on the post: omit this game from the
 #                                  #   auto-posted hourly digest (the post

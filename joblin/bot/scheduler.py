@@ -8,6 +8,7 @@ from discord.ext import tasks
 from ..models import (
     from_iso,
     now_utc,
+    quiet_tick,
     to_iso,
 )
 from .core import (
@@ -33,9 +34,29 @@ from .listing import run_hourly_listopen
 # ---------------------------------------------------------------------------
 # Scheduler tick
 # ---------------------------------------------------------------------------
-@tasks.loop(seconds=30)
-async def scheduler() -> None:
+async def sync_quiet_windows(now: dt.datetime) -> None:
+    """Flip each guild's quiet switch on daily-window edges; persist only
+    when the switch (or the last-sampled membership) actually moved."""
+    snap = await store.snapshot()
+    updates = []
+    for gid, cfg in (snap.get("configs") or {}).items():
+        delta, _ = quiet_tick(cfg, now)
+        if delta:
+            updates.append((gid, delta))
+    if not updates:
+        return
+    async with store.txn() as data:
+        for gid, delta in updates:
+            cfg = (data.get("configs") or {}).get(gid)
+            if cfg is not None:
+                cfg.update(delta)
+
+
+async def run_scheduler_tick() -> None:
+    """One pass of the 30s loop. Extracted so tests can drive it without
+    starting the discord.ext.tasks Loop."""
     now = now_utc()
+    await sync_quiet_windows(now)
     snap = await store.snapshot()
     for tid, task in list(snap["tasks"].items()):
         cfg = guild_config(snap, task["guild_id"])
@@ -45,6 +66,12 @@ async def scheduler() -> None:
         if channel is None:
             continue
         try:
+            # Guild quiet time hushes fires, nags, and kabooms; EOD/SOD
+            # bookkeeping (backup, month close, daily-log pin) still runs
+            # below. A manual 🔄 requeue calls fire_task directly and is
+            # not gated here.
+            if cfg.get("quiet"):
+                continue
             # A puntobomb's fuse outranks everything: past explodes_at it blows —
             # pending, snoozed, shushed, or (after downtime) never even posted.
             if (task.get("puntobomb") and task.get("explodes_at")
@@ -68,6 +95,11 @@ async def scheduler() -> None:
     await run_hourly_listopen(now)
     await run_daily_backups(now, snap)
     await run_month_closes(now, snap)
+
+
+@tasks.loop(seconds=30)
+async def scheduler() -> None:
+    await run_scheduler_tick()
 
 
 @scheduler.before_loop
@@ -145,6 +177,8 @@ async def send_reminder(tid: str, channel: discord.abc.Messageable, cfg: dict) -
 __all__ = [
     "_before_scheduler",
     "fire_task",
+    "run_scheduler_tick",
     "scheduler",
     "send_reminder",
+    "sync_quiet_windows",
 ]
