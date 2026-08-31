@@ -852,14 +852,20 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
 #                                  #   explicit expires/deadline; None means the
 #                                  #   round runs until the next scheduled slot.
 #
-# The bump (bot/games.py ``bump_live_games``)
-# -------------------------------------------
-# Whenever a chore fires or nags, every live round is re-posted beneath it (the
-# old post swept, like a chore's rolling nag) so a long game stays in view
-# without adding noise of its own — no timer, nothing persisted for it:
-#   "no_nag":        bool,         # 🤫 on the post: never bump this game (its
-#                                  #   post stays put). Cleared by 🔊. Lifetime,
-#                                  #   like a chore's flag. Absent means False.
+# Keeping a long game in view (bot/listing.py ``run_hourly_listopen``)
+# -------------------------------------------------------------------
+# Game posts stay put — they are not re-posted when a chore fires or nags.
+# Once per guild-local hour the scheduler posts a public /listopen digest
+# (jump links to every open chore + live round) *iff* a chore is also
+# scheduled for that hour, so a week-long tally is one tap away without
+# adding noise of its own on quiet hours. Restart-safe via the persisted
+# ``hourly_open`` slot (the hour-start key is the once-per-hour gate):
+#   "no_nag":        bool,         # 🤫 on the post: omit this game from the
+#                                  #   auto-posted hourly digest (the post
+#                                  #   itself never moved anyway). Cleared by
+#                                  #   🔊. Lifetime, like a chore's flag.
+#                                  #   Absent means False. Manual /listopen
+#                                  #   still lists it.
 # When a recurring game's round auto-closes (expiry/deadline/cap) it awards
 # puntos, rewrites its post as a result line, then goes dormant with ``next_due``
 # set; the scheduler re-posts a fresh round at that instant. A creator's 🏁 ends
@@ -980,7 +986,8 @@ def game_shush_line(g: dict) -> str:
     otherwise) — part of the render so every in-place redraw keeps it."""
     if not g.get("no_nag"):
         return ""
-    return f"\n{EMOJI_SHUSH} Shushed — stays put ({EMOJI_UNSHUSH} to let it follow the chores again)."
+    return (f"\n{EMOJI_SHUSH} Shushed — left off the hourly open list "
+            f"({EMOJI_UNSHUSH} to include it again).")
 
 
 # --- Do-em-ups -------------------------------------------------------------

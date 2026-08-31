@@ -132,102 +132,19 @@ async def _send_doemup(channel: discord.abc.Messageable, d: dict) -> discord.Mes
     )
 
 
-# --- The bump: live games ride the chore noise -----------------------------
-# A game that runs all day (or all week) would otherwise sink into the
-# scrollback. Rather than make noise of its own, a live round is re-posted at
-# the bottom of the channel *only in the wake of a chore post* — a fire or a
-# nag (``scheduler.fire_task`` / ``send_reminder`` call ``bump_live_games``
-# right after theirs lands). The channel's noise level is exactly what it was;
-# the games just stay under the newest chore. The post a bump supersedes is
-# swept like a chore's rolling nag (a post someone reacted to or replied on
-# survives, and ``/joblinconfig declutter:False`` keeps every old post,
-# stripped of its buttons). A 🤫 on the post sets the game's lifetime
-# ``no_nag`` flag — that game stays put through every fire and nag; 🔊 clears
-# it. No timer, no persisted deadline: nothing to lose on a restart.
-def bump_eligible(game: dict) -> bool:
-    """Does this game's post move when a chore posts? Only a live round (not
-    dormant between rounds, not closed) that hasn't been 🤫'd."""
-    if not game.get("message_id") or game.get("ended") or game.get("next_due"):
-        return False
-    return not game.get("no_nag")
-
-
-async def bump_live_games(guild_id: int, channel: discord.abc.Messageable) -> int:
-    """Re-post every eligible live round of this guild that lives in ``channel``
-    — the chore-post hook. Returns how many moved. One bad game never blocks
-    the rest (or the chore post that triggered it)."""
-    snap = await store.snapshot()
-    ch_id = getattr(channel, "id", None)
-    moved = 0
-    for kind, section in (("pitchin", "pitchins"), ("doemup", "doemups")):
-        for gid, g in list(snap.get(section, {}).items()):
-            if str(g.get("guild_id")) != str(guild_id) or not bump_eligible(g):
-                continue
-            if g.get("channel_id") is not None and ch_id is not None \
-                    and int(g["channel_id"]) != int(ch_id):
-                continue  # posted elsewhere — a bump would move it channels
-            try:
-                if await bump_game(kind, gid, channel):
-                    moved += 1
-            except Exception:
-                log.exception("game bump failed on %s %s", kind, gid)
-    return moved
-
-
-async def bump_game(kind: str, gid: str, channel: discord.abc.Messageable) -> bool:
-    """Re-post a live round at the bottom of the channel and sweep the post it
-    replaces. The fresh post becomes *the* post (``message_id`` /
-    ``game_messages`` swap over, so the stale-press guards and every close/clap/
-    requeue path follow it); the old one is deleted unless touched or declutter
-    is off, in which case it stays with its buttons stripped and a pointer down.
-    Returns False if the round wasn't eligible (or moved on under us)."""
-    section = "pitchins" if kind == "pitchin" else "doemups"
-    snap = await store.snapshot()
-    g0 = snap[section].get(gid)
-    if not g0 or not bump_eligible(g0):
-        return False
-    old_mid = g0["message_id"]
-    send = _send_pitchin if kind == "pitchin" else _send_doemup
-    msg = await send(channel, g0)
-    orphan = False
-    async with store.txn() as data:
-        g = data[section].get(gid)
-        if not g or g.get("ended") or g.get("message_id") != old_mid:
-            orphan = True  # closed / bumped / re-rolled while we were posting
-        else:
-            g["message_id"] = msg.id
-            data["game_messages"].pop(str(old_mid), None)
-            data["game_messages"][str(msg.id)] = {"kind": kind, "id": gid}
-    if orphan:
-        await safe_delete(msg)
-        return False
-    declutter = declutter_enabled(guild_config(snap, g0["guild_id"]))
-    touched = str(old_mid) in snap.get("touched", {})
-    old = channel.get_partial_message(old_mid)
-    if declutter and not touched:
-        try:
-            await old.delete()
-        except discord.NotFound:
-            pass
-        except discord.HTTPException as e:
-            log.warning("game bump delete failed on message %s: %s", old_mid, e)
-        return True
-    # The old post stands (someone's conversation hangs off it, or sweeps are
-    # off): its buttons come down so nobody presses a dead round.
-    render = render_pitchin if kind == "pitchin" else render_doemup
-    try:
-        await old.edit(
-            content=render(g0) + "\n⤵️ Bumped — the live post is further down.",
-            view=None, allowed_mentions=NO_PINGS,
-        )
-    except discord.HTTPException as e:
-        log.warning("game bump strip failed on message %s: %s", old_mid, e)
-    return True
+# --- Games stay put; an hourly /listopen keeps them findable ---------------
+# A game that runs all day (or all week) used to be re-posted under every
+# chore fire and nag. That was a lot of duplicate posts. The live round now
+# stays where it is; once per guild-local hour the scheduler posts a public
+# /listopen digest (jump links) *iff* a chore is also scheduled for that
+# hour — see ``listing.run_hourly_listopen``. 🤫 on the post sets the game's
+# lifetime ``no_nag`` flag so the auto-digest skips it (manual /listopen
+# still lists it); 🔊 clears the flag.
 
 
 async def _game_shush(kind: str, gid: str, press: Press, *, shush: bool) -> None:
-    """🤫 on a live game post sets its lifetime ``no_nag`` flag (the post stays
-    where it is when chores post), 🔊 clears it. The pressed post is re-rendered
+    """🤫 on a live game post sets its lifetime ``no_nag`` flag (the auto-posted
+    hourly /listopen skips it), 🔊 clears it. The pressed post is re-rendered
     with the flag's line and its button face flipped; a same-direction press is
     a whispered no-op."""
     section = "pitchins" if kind == "pitchin" else "doemups"
@@ -698,8 +615,8 @@ class PitchinButton(
 
 
 def make_pitchin_view(pid: str, *, no_nag: bool = False) -> discord.ui.View:
-    """✅ 🏁 plus the bump switch: 🤫 on a game that still follows the chores, 🔊 on
-    a shushed one (the two directions never share a face)."""
+    """✅ 🏁 plus 🤫 (omit from the hourly open list) / 🔊 (include it again).
+    The two directions never share a face."""
     view = discord.ui.View(timeout=None)
     view.add_item(PitchinButton(pid, "join"))
     view.add_item(PitchinButton(pid, "end"))
@@ -712,7 +629,7 @@ async def handle_pitchin_button(
 ) -> None:
     """A ✅ toggle (pitch in / back out), a creator's 🏁, or a 🤫/🔊 on a
     pitch-in post. The message-id check refuses a stale button from an
-    already-rolled (or bumped) round."""
+    already-rolled round."""
     press = Press.from_interaction(interaction)
     await press.ack()  # first act: beat the 3s deadline; replies follow up
     user = interaction.user
@@ -908,8 +825,7 @@ class DoEmUpButton(
 
 
 def make_doemup_view(did: str, *, no_nag: bool = False) -> discord.ui.View:
-    """➕ ➖ 🏁 plus the bump switch: 🤫 on a game that still follows the chores, 🔊
-    on a shushed one."""
+    """➕ ➖ 🏁 plus 🤫 (omit from the hourly open list) / 🔊 (include it again)."""
     view = discord.ui.View(timeout=None)
     view.add_item(DoEmUpButton(did, "plus"))
     view.add_item(DoEmUpButton(did, "minus"))
@@ -960,9 +876,6 @@ __all__ = [
     "PitchinButton",
     "_arm_game_requeue_in",
     "_game_shush",
-    "bump_eligible",
-    "bump_game",
-    "bump_live_games",
     "_doemup_press",
     "_game_next_round",
     "_game_record",

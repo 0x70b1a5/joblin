@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import discord
 
@@ -11,19 +12,24 @@ from ..models import (
     EMOJI_HANDSHAKE,
     EMOJI_LIST,
     PUNTOBOMB_PENALTY,
+    UTC,
     describe_repeat,
     discord_ts,
     doemup_title,
     from_iso,
     now_utc,
     recurrence_of,
+    to_iso,
 )
 from .core import (
     NO_PINGS,
     bot,
+    log,
     store,
 )
 from .helpers import (
+    config_ready,
+    declutter_enabled,
     guild_config,
     schedule_label,
     web_base_url,
@@ -247,13 +253,13 @@ def _open_embeds(blocks: list[str], total: int) -> list[discord.Embed]:
     return embeds or [discord.Embed(title=title, description="—", color=0x6B8E23)]
 
 
-@bot.tree.command(
-    name="listopen",
-    description="Post a checklist of everything open now, each linking to where to do it",
-)
-async def listopen(interaction: discord.Interaction) -> None:
-    snap = await store.snapshot()
-    gid = interaction.guild_id
+def _collect_open(
+    snap: dict, gid: int, *, skip_shushed_games: bool = False,
+) -> tuple[int, Optional[list[discord.Embed]]]:
+    """Build the /listopen embed(s) for ``gid``. Returns ``(0, None)`` when
+    nothing is open (the command posts a 'caught up' note; the hourly auto-post
+    stays quiet). ``skip_shushed_games`` drops 🤫'd pitch-ins / do-em-ups — the
+    hourly digest honours that flag, a manual ``/listopen`` does not."""
     cfg = guild_config(snap, gid)
     fallback_ch = cfg.get("channel_id") if cfg else None
 
@@ -292,6 +298,8 @@ async def listopen(interaction: discord.Interaction) -> None:
         for g in snap[section].values():
             if str(g["guild_id"]) != str(gid) or g.get("ended") or not g.get("message_id"):
                 continue
+            if skip_shushed_games and g.get("no_nag"):
+                continue
             link = message_link(g["guild_id"], g.get("channel_id") or fallback_ch, g["message_id"])
             label = _safe_link_label(doemup_title(g) if section == "doemups" else g["brief"])
             head = f"[{label}]({link})" if link else f"**{label}**"
@@ -303,12 +311,7 @@ async def listopen(interaction: discord.Interaction) -> None:
     web = web_base_url()
     total = len(chores) + len(pitch) + len(doem)
     if total == 0:
-        note = f"\n_✏️ Peek at what's ahead: <{web}>_" if web else ""
-        await interaction.response.send_message(
-            "✅ Nothing's open right now — you're all caught up! 🎉" + note,
-            allowed_mentions=NO_PINGS,
-        )
-        return
+        return 0, None
 
     sections: list[tuple[str, list[tuple[dt.datetime, str]]]] = [
         ("⏳ **Chores awaiting a ✅**", chores),
@@ -322,9 +325,153 @@ async def listopen(interaction: discord.Interaction) -> None:
     ]
     if web:  # masked links render fine inside an embed, no unfurl to suppress
         blocks.append(f"✏️ [Browse & edit the schedule]({web})")
+    return total, _open_embeds(blocks, total)
+
+
+@bot.tree.command(
+    name="listopen",
+    description="Post a checklist of everything open now, each linking to where to do it",
+)
+async def listopen(interaction: discord.Interaction) -> None:
+    snap = await store.snapshot()
+    gid = interaction.guild_id
+    _total, embeds = _collect_open(snap, gid)
+    if embeds is None:
+        web = web_base_url()
+        note = f"\n_✏️ Peek at what's ahead: <{web}>_" if web else ""
+        await interaction.response.send_message(
+            "✅ Nothing's open right now — you're all caught up! 🎉" + note,
+            allowed_mentions=NO_PINGS,
+        )
+        return
     await interaction.response.send_message(
-        embeds=_open_embeds(blocks, total), allowed_mentions=NO_PINGS
+        embeds=embeds, allowed_mentions=NO_PINGS
     )
+
+
+# ---------------------------------------------------------------------------
+# Hourly auto-/listopen — games stay put; a digest rides hours that have chores
+# ---------------------------------------------------------------------------
+def _local_hour_bounds(
+    now: dt.datetime, tz: ZoneInfo,
+) -> tuple[dt.datetime, dt.datetime, str]:
+    """UTC ``[start, end)`` of the guild-local hour containing ``now``, plus a
+    DST-stable key (the UTC ISO of ``start``) used as the once-per-hour gate.
+
+    Adding an hour to the *local* start (not the UTC instant) is what keeps
+    the window honest across a spring-forward / fall-back: the local hour is
+    the unit the family scheduled against."""
+    local = now.astimezone(tz)
+    start_local = local.replace(minute=0, second=0, microsecond=0)
+    start = start_local.astimezone(UTC)
+    end = (start_local + dt.timedelta(hours=1)).astimezone(UTC)
+    return start, end, to_iso(start)
+
+
+def _chore_scheduled_in_hour(
+    task: dict, start: dt.datetime, end: dt.datetime,
+) -> bool:
+    """True if this chore's due instant (the original fire, not a nag) falls
+    in ``[start, end)``. A still-pending occurrence uses ``due_at``; one that
+    hasn't fired yet uses ``next_due`` — so an 08:30 chore counts as hour 8
+    before it posts. Snooze only pushes ``remind_at``, so a 07:00 chore still
+    pending at 08:00 does *not* unlock the 8 o'clock digest."""
+    iso = (task.get("pending") or {}).get("due_at") or task.get("next_due")
+    if not iso:
+        return False
+    try:
+        t = from_iso(iso)
+    except (TypeError, ValueError):
+        return False
+    return start <= t < end
+
+
+async def run_hourly_listopen(now: dt.datetime) -> None:
+    """Called once per scheduler tick, *after* fires / nags / game-round posts.
+
+    For each ready guild: if this local hour has a chore on the schedule and
+    we haven't already posted a digest this hour, and anything is actually
+    open, post the same public /listopen embed the slash command would — then
+    sweep the previous hour's digest (declutter on, untouched). 🤫'd games
+    are omitted here (they asked not to be kept in view); a manual
+    ``/listopen`` still lists them.
+
+    Restart-safe via the persisted ``hourly_open[guild].hour`` key: the hour
+    is claimed *before* the Discord send so a slow post can't double-fire on
+    the next tick. An empty hour is *not* claimed, so a chore due later in
+    the hour can still unlock the digest once it (or something else) is open.
+    """
+    snap = await store.snapshot()
+    for gid_str, cfg in list(snap.get("configs", {}).items()):
+        if not config_ready(cfg):
+            continue
+        try:
+            tz = ZoneInfo(cfg["timezone"])
+        except Exception:
+            continue
+        start, end, hour_key = _local_hour_bounds(now, tz)
+        rec = (snap.get("hourly_open") or {}).get(gid_str) or {}
+        if rec.get("hour") == hour_key:
+            continue
+        if not any(
+            str(t.get("guild_id")) == gid_str
+            and _chore_scheduled_in_hour(t, start, end)
+            for t in snap.get("tasks", {}).values()
+        ):
+            continue
+        try:
+            gid = int(gid_str)
+        except (TypeError, ValueError):
+            continue
+        _total, embeds = _collect_open(snap, gid, skip_shushed_games=True)
+        if embeds is None:
+            continue  # nothing open yet — don't consume the hour
+        channel = bot.get_channel(int(cfg["channel_id"]))
+        if channel is None:
+            continue  # cache not warm — retry next tick, hour unclaimed
+        try:
+            await _post_hourly_listopen(gid, cfg, channel, hour_key, embeds, rec)
+        except Exception:
+            log.exception("hourly listopen failed for guild %s", gid_str)
+
+
+async def _post_hourly_listopen(
+    guild_id: int,
+    cfg: dict,
+    channel: discord.abc.Messageable,
+    hour_key: str,
+    embeds: list[discord.Embed],
+    prev: dict,
+) -> None:
+    """Claim the hour, post, record the message, sweep last hour's digest."""
+    gid_str = str(guild_id)
+    async with store.txn() as data:
+        slot = (data.setdefault("hourly_open", {})).get(gid_str) or {}
+        if slot.get("hour") == hour_key:
+            return  # another coroutine claimed it while we were deciding
+        data["hourly_open"][gid_str] = {
+            "hour": hour_key,
+            "message_id": None,
+            "channel_id": getattr(channel, "id", None),
+        }
+    msg = await channel.send(embeds=embeds, allowed_mentions=NO_PINGS)
+    async with store.txn() as data:
+        slot = (data.get("hourly_open") or {}).get(gid_str)
+        if slot is not None and slot.get("hour") == hour_key:
+            slot["message_id"] = msg.id
+            slot["channel_id"] = getattr(channel, "id", None)
+    prev_mid = prev.get("message_id")
+    if not prev_mid or not declutter_enabled(cfg):
+        return
+    snap = await store.snapshot()
+    if str(prev_mid) in snap.get("touched", {}):
+        return
+    try:
+        await channel.get_partial_message(int(prev_mid)).delete()
+    except discord.NotFound:
+        pass
+    except discord.HTTPException as e:
+        log.warning("hourly listopen sweep failed on message %s: %s", prev_mid, e)
 
 
 @bot.tree.command(name="joblinhelp", description="How to use Joblin — commands, scheduling, and reactions")
@@ -386,9 +533,9 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "🎁 **Award** — credit someone else; on a full row shares the 🤫/🔊 slot\n"
             "🤫 **Shush** — on a reminder: mutes the hourly nags for that chore "
             "for good (it still posts when due); on a live pitch-in / do-em-up: "
-            "keeps its post put instead of following each chore post down\n"
+            "leaves it off the hourly open-list digest\n"
             "🔊 **Un-shush** — appears on a shushed chore's or game's posts: turns "
-            "the nags / bumps back on\n"
+            "the nags / hourly listing back on\n"
             "↩️ **Undo** — appears after ✅/⏩/⏭️/❌ to reverse it\n"
             "🔄 **Requeue** — appears on a completed chore or a closed pitch-in / "
             "do-em-up round; re-runs it right now\n"
@@ -480,10 +627,11 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "the next round. Puntos from both feed the `/leaderboard` — and a closed "
             "round grows a 👏 anyone who sat it out can tap to tip every scorer a "
             "bonus punto.\n"
-            "Whenever a chore posts (a due chore or a reminder), every live "
-            "round is re-posted beneath it (the old post swept) so a long game "
-            "never needs scrolling back to — no extra noise; tap 🤫 on one to "
-            "keep it where it is (🔊 lets it follow again)."
+            "Live rounds stay put. Once an hour, if a chore is also scheduled "
+            "for that hour, a `/listopen` digest lands with jump links so a "
+            "long game never needs scrolling back to. Tap 🤫 on one to leave "
+            "it off that digest (🔊 puts it back); `/listopen` always lists "
+            "everything that's open."
         ),
         inline=False,
     )
@@ -543,11 +691,15 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
 
 __all__ = [
     "ListPaginator",
+    "_chore_scheduled_in_hour",
     "_chunk_rows",
+    "_collect_open",
+    "_local_hour_bounds",
     "_open_embeds",
     "_safe_link_label",
     "joblinhelp",
     "listopen",
     "listtasks",
     "message_link",
+    "run_hourly_listopen",
 ]

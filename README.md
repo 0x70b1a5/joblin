@@ -58,7 +58,7 @@ bar — to gamify the family chores.
 | `/edit` | anyone | One command with a subcommand per type — **`/edit task`**, **`/edit pitchin`**, **`/edit doemup`** — each showing only its own fields (so `bounty` appears only on tasks, `max_scorers` only on pitch-ins, etc.). Change the `brief`, `at`/slot, `repeat`, `description`, puntos, cap, or close time; pick the item from autocomplete or paste its `id` from `/listtasks`. A schedule change to a **live** round applies from the next round. |
 | `/deletetask` | anyone | Permanently delete a task, pitch-in, or do-em-up (autocompletes all three; deleting a recurring game stops the whole series). |
 | `/listtasks` | anyone | List all tasks **plus pitch-ins (🤝) and do-em-ups (💪)** with their **`id`**, schedule, and state (next post / 🟢 open / next round) — **paged** with ◀/▶ buttons so every id stays reachable, and showing 🔔×_n_, the lifetime number of times each chore has had to be nagged. |
-| `/listopen` | anyone | Post a public checklist of everything **open right now** — pending chores plus live pitch-ins / do-em-ups — each an **inline jump link** to the original post where it's done (never a nag), grouped and ordered by when it's due. Cuts the scrollback when lots are doable any time of day. |
+| `/listopen` | anyone | Post a public checklist of everything **open right now** — pending chores plus live pitch-ins / do-em-ups — each an **inline jump link** to the original post where it's done (never a nag), grouped and ordered by when it's due. Cuts the scrollback when lots are doable any time of day. The bot also auto-posts this **once an hour** when a chore is scheduled for that hour (so a long game stays findable without being re-posted). |
 | `/leaderboard` | anyone | Monthly **puntos** per person — one per chore, **two** per bounty, plus pitch-in / do-em-up puntos — with each past month's winner shown by their **⭐ stars**, and the month's bountiful **zone** (`month` defaults to current). |
 | `/vitrine` | anyone | Gaze upon a collection of **trinkets** — the inert *objets d'art* earned at each month's end, one per whole multiple of the bar cleared, grouped by month. `user` defaults to yourself. |
 | `/joblinhelp` | anyone | Quick reference for the commands, the `at`/`repeat` syntax, and the reactions. |
@@ -131,13 +131,13 @@ worth 1 punto).
   - `/doemup brief:"Thistle bush removed"`
   - `/doemup brief:"Bale stacked" deadline:"tomorrow 18:00" point_limit:200`
 
-While a round is open, its post **follows the chores**: whenever a chore fires
-or a reminder posts, every live round is re-posted right beneath it with its
-buttons and the superseded post is swept (a post someone reacted to or replied
-on stays; `/joblinconfig declutter:False` keeps them all, buttons stripped) —
-so an all-day or all-week game never needs scrolling back to, and the channel
-gets no extra noise for it. Tap **🤫** on the post to shush a game that should
-stay put (a weeks-long tally, say); **🔊** lets it follow again.
+While a round is open, its post **stays put**. Once an hour, *if a chore is
+also scheduled for that hour*, the bot posts a public `/listopen` digest —
+jump links to every open chore and live game — so an all-day or all-week
+round is one tap away without being re-posted under every chore. Quiet hours
+(nothing on the chore schedule) stay quiet. Tap **🤫** on a game to leave it
+off that hourly digest (a weeks-long tally you already know about); **🔊**
+puts it back. Manual `/listopen` always lists everything that's open.
 
 When a pitch-in or do-em-up closes, its post is rewritten in place as a one-line
 result (e.g. *"🤝 Laundry bonanza — pitched in! +1 each to Ann, Bo & Cy"*) and its
@@ -263,10 +263,11 @@ good for 14 days; the signing secret is auto-generated into
   persistent message buttons (the do-em-up ➕/➖/🏁, revived after a restart with
   one `add_dynamic_items` call — the do-em-up id rides in each button's custom_id).
 - A **30-second scheduler tick** (`discord.ext.tasks`) fires due tasks, sends
-  hourly nags, and closes expired pitch-ins / past-deadline do-em-ups. It compares
-  `now` against each task's persisted `next_due` / `remind_at` (and each game's
-  `expires_at` / `deadline`), so it's naturally restart-safe and never replays a
-  backlog.
+  hourly nags, closes expired pitch-ins / past-deadline do-em-ups, and posts a
+  `/listopen` digest once per hour *if a chore is also scheduled for that hour*.
+  It compares `now` against each task's persisted `next_due` / `remind_at` (and
+  each game's `expires_at` / `deadline`), so it's naturally restart-safe and
+  never replays a backlog.
 - **Storage** is a single JSON document (`data/store.json`) for config, tasks, and
   live pitch-ins / do-em-ups, plus an append-only JSONL **completion log**
   (`data/completions.jsonl`) for stats — chore completions and pitch-in / do-em-up

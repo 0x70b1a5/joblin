@@ -46,6 +46,9 @@ EMPTY: dict[str, Any] = {
     "pitchins": {},  # pitch-in id -> pitch-in dict (see models.py)
     "doemups": {},  # do-em-up id -> do-em-up dict (see models.py)
     "game_messages": {},  # message id -> {"kind": "pitchin"|"doemup", "id": <game id>}
+    "hourly_open": {},  # guild id -> {"hour": ISO of local-hour start UTC,
+    #   "message_id": int | None, "channel_id": int | None} — the auto-posted
+    #   /listopen digest for that hour (once, and only if a chore is scheduled)
 }
 
 
