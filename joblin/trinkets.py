@@ -204,10 +204,14 @@ _AXIS_POOL = {
 # The zones (item taxa) — each a rotating "genus class"
 # ---------------------------------------------------------------------------
 # A zone supplies the genus nouns and declares which genus-locked axes it opens.
-# The four Flayed-Sun produce zones additionally carry a `crop` column (the
-# game's own cultivar descriptors) that is *always* attached — this is the
-# "Cocoa Bean Table" feel: in the Bean Zone you roll the bean column every time,
-# then optionally season with universal modifiers.
+# The four Flayed-Sun produce zones (and the Succulent Salvage) additionally
+# carry a `crop` column (cultivar / salvage descriptors) that is *always*
+# attached — the "Cocoa Bean Table" feel: in the Bean Zone you roll the bean
+# column every time, then optionally season with universal modifiers. The Lost
+# Mint instead always-attaches a strike (figure, year, country) from its own
+# tables. Two zones landed in 2026-09 (succulent, coin), taking the roster
+# from 10 to 12 so a calendar year is one full cycle; months before that stay
+# on the original 10-zone wheel so closed vitrines never redraw.
 
 _BEAN_CROP = [
     "with stalks that reach the clouds", "grown up around an obelisk",
@@ -237,6 +241,34 @@ _CORN_CROP = [
     "weeping a clear nectar", "on a towering stalk", "on a bone-white stalk",
     "sheathed in floating silk", "sheathed in matted, filthy silk",
     "with silk long enough for a wig", "passed off as counterfeit cocoa",
+]
+# Salvage-locked — always attached in the Succulent Salvage. Deliberately avoids
+# the genera (bouba/kiki/greeble/nurnie/2d/facet/crystal, plus the later
+# morphology/artifact types): those words live on the noun.
+_SUCCULENT_CROP = [
+    "potted in a rusted ration-tin", "growing from a cracked sun-disk",
+    "with roots clutching a spent shell-casing", "sand-scoured on the windward face",
+    "holding a bead of water that will not fall",
+    "grafted onto a second, unwilling plant",
+    "blooming a flower the colour of old brass",
+    "with offsets arranged like hull-rivets",
+    "hollow, a wasp-priest nested once",
+    "stencilled with a serial number, half-faded",
+    "wired into a dead console as if to cool it", "oozing a sap that sets as amber",
+    "potted in a goblet from the Fifth Temple", "still tagged from the Royal Gardens",
+    "pruned by something with very small shears",
+    "leaning toward a sun that is not ours",
+    "lashed to a sky-barge bulkhead with copper wire", "veined with solder",
+    "lodged in a cracked helmet", "with a nameplate riveted to the pot",
+    "caked in sky-barge dust", "nursed under a cracked cloche of black glass",
+    "with a drip-tray hammered from a shield-boss",
+    "tied with a pilgrim's faded ribbon", "its soil glittering with filing-dust",
+    "with a single leaf gilt by some previous owner",
+    "humming a scale no instrument uses", "watered, once, with ink",
+    "sold as a cooling-fin and never corrected",
+    "braced with a copper armature", "labelled in three dead scripts",
+    "the soil still warm from the kiln",
+    "bearing a customs-stamp from a port that sank",
 ]
 
 ZONES: dict[str, dict] = {
@@ -388,9 +420,122 @@ ZONES: dict[str, dict] = {
             "a Gyroscope that points, doggedly, at the Fifth Temple",
         ],
     },
+    "succulent": {
+        "emoji": "🌵", "name": "the Succulent Salvage",
+        "blurb": "desert plants looted from wrecks and ruins",
+        "genera": [
+            "Bouba Succulent", "Kiki Succulent", "Greebled Succulent",
+            "Nurnie Succulent", "2d Succulent", "Facet-cut Succulent",
+            "Crystal Succulent", "Living-stone Succulent", "Windowpane Succulent",
+            "Spiral Succulent", "Crested Succulent", "Monstrose Succulent",
+            "Wireframe Succulent", "Tessellated Succulent", "Medusa Succulent",
+            "Carrion Succulent", "Sand-cast Succulent", "Clockwork Succulent",
+            "Split-rock Succulent", "Tiger-jaw Succulent", "Pearl-string Succulent",
+            "Low-poly Succulent", "Lantern Succulent", "Nested Succulent",
+        ],
+        "crop": _SUCCULENT_CROP,
+        "turnkey": [
+            "a Bouba Succulent that has engulfed a complete toolkit from a downed sky-barge",
+            "a Kiki Succulent that draws blood from anyone who tries to water it",
+            "a Crystal Succulent whose facets replay a short, silent war",
+            "a 2d Succulent used as a bookmark; the page behind it is still wet",
+            "a Living-stone Succulent indistinguishable from the gravel until it blinks",
+            "a Clockwork Succulent that ticks only in the presence of a lie",
+            "a Carrion Succulent whose bloom smells of a market that closed a century ago",
+            "a Windowpane Succulent showing a tiny, well-lit room in which someone is still packing",
+            "a Medusa Succulent whose arms have each rooted in a different century",
+            "a Wireframe Succulent you can hang a coat on, though it resents this",
+        ],
+    },
+    "coin": {
+        "emoji": "🪙", "name": "the Lost Mint",
+        "blurb": "coins of countries that may or may not still exist",
+        "genera": [
+            "Sovereign", "Franc", "Peso", "Yen", "Goldmark", "Rupee",
+            "Drachma", "Denarius", "Solidus", "Dollar", "Crown", "Ducat",
+            "Florin", "Thaler", "Dirham", "Doubloon", "Aureus", "Farthing",
+            "Mohur", "Oban", "Piece-of-eight", "Escudo", "Stater", "Tael",
+            "Shekel", "Daric", "Tetradrachm", "Sestertius", "Obol",
+            "Antoninianus", "Hyperpyron", "Koban", "Sycee", "Cash-coin",
+            "Pagoda", "Guilder", "Guinea", "Noble", "Groat", "Ruble",
+            "Dinar", "Piastre", "Ecu", "Louis-d'or", "Cob-coin", "Trade-dollar",
+            "Knife-money", "Manilla", "Zecchino", "Jetton", "Fanam", "Birr",
+            "Scudo", "Asper", "Livre", "Testoon",
+        ],
+        "figures": [
+            "Queen Victoria", "Abraham Lincoln", "Napoleon Bonaparte",
+            "Simón Bolívar", "Emperor Meiji", "Cleopatra VII", "Haile Selassie",
+            "Catherine the Great", "Moctezuma II", "Charlemagne", "Saladin",
+            "Hatshepsut", "Shaka", "Tokugawa Ieyasu", "Empress Theodora",
+            "Mansa Musa", "Julius Caesar", "Hypatia", "Sitting Bull", "Akbar",
+            "Sejong the Great", "Queen Nzinga", "Ashoka", "Boudica",
+            "Ramesses II", "Suleiman", "Peter the Great", "Benito Juárez",
+            "Sun Yat-sen", "Queen Liliuokalani", "Harald Bluetooth", "Zenobia",
+            "Empress Wu Zetian", "Kublai Khan", "Maria Theresa",
+            "Alexander the Great", "Hannibal", "Nefertiti", "Emperor Trajan",
+            "Kamehameha I", "Genghis Khan", "Túpac Amaru II",
+            "Cyrus the Great", "Darius I", "Croesus", "Constantine", "Justinian",
+            "Eleanor of Aquitaine", "Elizabeth I", "Louis XIV", "Alfred the Great",
+            "Cnut", "Baibars", "Shah Jahan", "Rani Lakshmibai", "Shivaji",
+            "Oda Nobunaga", "Yi Sun-sin", "Empress Myeongseong",
+            "Jayavarman VII", "Sundiata Keita", "Yaa Asantewaa", "Menelik II",
+            "Amanirenas", "Toussaint Louverture", "José de San Martín",
+            "Atahualpa", "Pachacuti", "Cuauhtémoc", "Pacal the Great",
+            "Tecumseh", "Sequoyah", "Miguel Hidalgo", "Pedro II",
+            "Kaahumanu", "Irene of Athens", "Frederick Barbarossa",
+            "Vercingetorix", "Theodoric", "Askia Muhammad", "Queen Amina",
+        ],
+        "years": [
+            "330 BCE", "269 BCE", "221 BCE", "196 BCE", "44 BCE", "27 BCE",
+            "79", "312", "330", "476", "537", "622", "697", "751", "793", "800",
+            "960", "1000", "1066", "1099", "1204", "1206", "1258", "1282",
+            "1347", "1415", "1453", "1492", "1519", "1532", "1588", "1607",
+            "1648", "1683", "1707", "1756", "1776", "1789", "1799", "1804",
+            "1810", "1815", "1821", "1830", "1848", "1857", "1861", "1868",
+            "1871", "1873", "1883", "1887", "1896", "1898", "1905", "1912",
+            "1914", "1917", "1918", "1922", "1923", "1933", "1936", "1945",
+            "1947", "1948", "1953", "1959", "1960", "1964",
+        ],
+        "countries": [
+            "Britain", "France", "Mexico", "Japan", "Prussia", "Spain",
+            "Sweden", "Ethiopia", "Peru", "China", "India", "Rome", "Egypt",
+            "Persia", "Mali", "Hawaii", "Byzantium", "the Ottoman Empire",
+            "the United States", "Greece", "Portugal", "Russia", "Denmark",
+            "Morocco", "Korea", "Siam", "the Mughal Empire", "Axum", "Venice",
+            "Florence", "the Netherlands", "Bolivia", "Austria", "Poland",
+            "Ireland", "Zanzibar", "Genoa", "Hungary", "Bohemia", "Saxony",
+            "Naples", "Sicily", "Carthage", "Lydia", "Parthia", "Tibet",
+            "Ceylon", "Nepal", "the Kushan Empire", "Angkor", "the Pagan Kingdom",
+            "Majapahit", "Songhai", "Benin", "Kilwa", "Haiti", "Brazil",
+            "Chile", "Colombia", "Argentina", "Liberia", "Ryukyu", "Joseon",
+            "Goryeo", "Trebizond", "Cyprus", "Malta", "Aragon", "Castile",
+            "Granada", "the Delhi Sultanate", "Vijayanagara", "the Chola Empire",
+            "Bukhara", "Samarkand", "Bactria", "Champa", "Tonga", "Tahiti",
+        ],
+        "turnkey": [
+            "a 1933 Double Eagle, still warm from a mint the dunes swallowed",
+            "an 1804 Silver Dollar whose reverse shows a coastline that has since receded into myth",
+            "a denarius of Caesar with the Ides scratched over the date",
+            "the last Hawaiian dollar of Queen Liliuokalani, smelling of salt and burnt sugar",
+            "a Maria Theresa thaler, the date frozen at 1780 no matter the year it was struck",
+            "a holey dollar with the punched centre still inside it, rattling",
+            "a Cash-coin whose square hole frames a star that is not in the sky tonight",
+            "a Cob-coin, badly struck, on which two kings are trying to occupy the same face",
+            "a Manilla that will not come off once worn",
+            "an electrum Stater of Croesus, still sweating a little gold",
+        ],
+    },
 }
 
 ZONE_KEYS = list(ZONES.keys())
+# Frozen 10-zone roster used for every month before :data:`ZONE_EXPANSION_YM`.
+# Append-only on purpose: inserting into ``ZONES`` above this pair would
+# reshuffle closed vitrines.
+_LEGACY_ZONE_KEYS = [
+    "bean", "pepper", "corn", "orchard", "relic",
+    "curio", "bestial", "devotional", "inscribed", "vessel",
+]
+ZONE_EXPANSION_YM = "2026-09"  # succulent + coin; 12-zone years from here
 
 
 # ---------------------------------------------------------------------------
@@ -402,19 +547,47 @@ def _month_index(ym: str) -> int:
     return y * 12 + (m - 1)
 
 
+def _zone_keys_for(ym: str) -> list[str]:
+    """The zone roster in force for ``ym`` — 10 keys before the 2026-09
+    expansion, all 12 after. Off-season picks use the same list, so a closed
+    month's vitrine cannot grow a succulent or a coin it never rolled."""
+    if ym < ZONE_EXPANSION_YM:
+        return _LEGACY_ZONE_KEYS
+    return ZONE_KEYS
+
+
+def _cycle_order(keys: list[str], ym: str) -> tuple[list[str], int]:
+    """Shuffled roster and position for ``ym`` under ``keys``."""
+    idx = _month_index(ym)
+    n = len(keys)
+    cycle, pos = divmod(idx, n)
+    order = list(keys)
+    random.Random(_seed("zone-cycle", cycle)).shuffle(order)
+    return order, pos
+
+
 def zone_for_month(ym: str) -> str:
     """The active zone key for month ``ym`` ('YYYY-MM').
 
-    Each block of ``len(ZONE_KEYS)`` consecutive months is one *cycle*: the zone
+    Each block of ``len(keys)`` consecutive months is one *cycle*: the zone
     order within a cycle is a shuffle seeded by the cycle number, so every zone
     appears exactly once per cycle (true rotation), the order is unpredictable,
     and no zone repeats back-to-back *within* a cycle — all with no stored state.
+    From :data:`ZONE_EXPANSION_YM` the roster is 12, so a calendar year is one
+    cycle; earlier months keep the original 10-zone wheel. 2026's remaining
+    four months take the four zones that wheel hadn't featured yet (leftover
+    old + succulent + coin), in 12-shuffle order, so the cutover year is still
+    twelve distinct seasons.
     """
-    idx = _month_index(ym)
-    n = len(ZONE_KEYS)
-    cycle, pos = divmod(idx, n)
-    order = list(ZONE_KEYS)
-    random.Random(_seed("zone-cycle", cycle)).shuffle(order)
+    keys = _zone_keys_for(ym)
+    order, pos = _cycle_order(keys, ym)
+    if ZONE_EXPANSION_YM <= ym < "2027-01":
+        used = set()
+        for m in range(1, 9):
+            o, p = _cycle_order(_LEGACY_ZONE_KEYS, f"2026-{m:02d}")
+            used.add(o[p])
+        leftover = [z for z in order if z not in used]
+        return leftover[int(ym[5:7]) - 9]
     return order[pos]
 
 
@@ -486,6 +659,12 @@ def roll_trinket(rng: random.Random, zone: dict) -> dict:
         tail_parts.append(zone["inscription"][rng.randrange(len(zone["inscription"]))])
     if zone.get("motif"):
         tail_parts.append("bearing " + zone["motif"][rng.randrange(len(zone["motif"]))])
+    if zone.get("figures"):
+        figure = zone["figures"][rng.randrange(len(zone["figures"]))]
+        year = zone["years"][rng.randrange(len(zone["years"]))]
+        country = zone["countries"][rng.randrange(len(zone["countries"]))]
+        tail_parts.append(f"bearing {figure}")
+        tail_parts.append(f"struck {year} in {country}")
 
     ornament = ""
     if rarity != "humble" and rng.random() < (0.7 if rarity == "wondrous" else 0.35):
@@ -540,11 +719,12 @@ def zone_pick_for(guild_id: int, user_id: int, ym: str, idx: int) -> tuple[str, 
     Deterministic per (guild, user, month, index), seeded in its own keyspace so
     the choice never perturbs the item roll itself.
     """
+    keys = _zone_keys_for(ym)
     featured = zone_for_month(ym)
     rng = random.Random(_seed("zone-pick", guild_id, user_id, ym, idx))
     if rng.random() < FEATURED_WEIGHT:
         return featured, True
-    others = [z for z in ZONE_KEYS if z != featured]
+    others = [z for z in keys if z != featured]
     return others[rng.randrange(len(others))], False
 
 

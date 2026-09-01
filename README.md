@@ -94,7 +94,7 @@ bar — to gamify the family chores.
   puntos reached — 50 puntos on a 25 bar earns two. They cost no puntos and do
   nothing — so the chore economy stays sealed and no puntos are ever created from
   nothing. Each month a different **zone** is *in season*
-  (the Bean Zone, the Vaults, the Menagerie, the Scriptorium…), chosen
+  (the Bean Zone, the Vaults, the Succulent Salvage, the Lost Mint…), chosen
   deterministically from the year-month and announced on the `/leaderboard`. The
   in-season zone is a **bonus, not a monopoly**: each trinket independently lands
   on it ~70% of the time (`FEATURED_WEIGHT`) and otherwise strays in from one of

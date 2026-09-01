@@ -2532,16 +2532,118 @@ def test_trinkets() -> None:
             assert "{" not in d and "}" not in d, f"unfilled placeholder: {d!r}"
             assert " a a" not in f" {d}" and "of a a" not in d, f"bad article: {d!r}"
 
-    # Zone rotation: each cycle of len(ZONES) months is a permutation of all
-    # zones (true rotation), with no back-to-back repeats inside a cycle.
-    n = len(T.ZONE_KEYS)
-    start = (T._month_index("2026-01") // n) * n
+    # Zone rotation: each cycle of the month's roster is a permutation of that
+    # roster, with no back-to-back repeats inside a cycle. Pre-2026-09 months
+    # stay on the original 10-zone wheel so closed vitrines don't redraw.
+    assert T.ZONE_KEYS[:len(T._LEGACY_ZONE_KEYS)] == T._LEGACY_ZONE_KEYS, (
+        "new zones append; inserting would reshuffle closed months"
+    )
+    assert T.zone_for_month("2026-06") == "inscribed", "June 2026 stays the Scriptorium"
+    assert T.zone_for_month("2026-08") == "pepper"
+    pinned = T.roll_for(7, 99, "2026-06")
+    assert pinned["display"] == "Paisley Codex with a half-finished poem on the flyleaf"
+    assert pinned["zone_key"] in T._LEGACY_ZONE_KEYS
+    year_2026 = [T.zone_for_month(f"2026-{m:02d}") for m in range(1, 13)]
+    assert sorted(year_2026) == sorted(T.ZONE_KEYS), (
+        "cutover year still has twelve distinct seasons"
+    )
+    assert set(year_2026[8:]) == {"orchard", "relic", "succulent", "coin"}
+    for u in range(200):
+        zk, _ = T.zone_pick_for(1, u, "2026-06", 0)
+        assert zk in T._LEGACY_ZONE_KEYS, "pre-expansion off-season picks stay on the 10"
+
+    n_legacy = len(T._LEGACY_ZONE_KEYS)
+    start = (T._month_index("2026-01") // n_legacy) * n_legacy
     cycle = []
-    for i in range(start, start + n):
+    for i in range(start, start + n_legacy):
         y, mo = divmod(i, 12)
         cycle.append(T.zone_for_month(f"{y:04d}-{mo + 1:02d}"))
-    assert sorted(cycle) == sorted(T.ZONE_KEYS), "a cycle must cover every zone once"
-    assert all(cycle[i] != cycle[i + 1] for i in range(n - 1)), "no back-to-back repeats"
+    assert sorted(cycle) == sorted(T._LEGACY_ZONE_KEYS), "legacy cycle covers the original 10"
+    assert all(cycle[i] != cycle[i + 1] for i in range(n_legacy - 1)), "no back-to-back repeats"
+
+    # 2026-09 added succulent + coin; a calendar year is now one 12-zone cycle.
+    assert "succulent" in T.ZONE_KEYS and "coin" in T.ZONE_KEYS
+    assert T.ZONES["succulent"]["name"] == "the Succulent Salvage"
+    assert T.ZONES["coin"]["name"] == "the Lost Mint"
+    # Artifact zones run 12–18 genera; the new two should not be the thin ones.
+    artifact_floor = min(
+        len(T.ZONES[k]["genera"])
+        for k in T._LEGACY_ZONE_KEYS
+        if k not in ("bean", "pepper", "corn")
+    )
+    assert len(T.ZONES["succulent"]["genera"]) >= artifact_floor
+    assert len(T.ZONES["coin"]["genera"]) >= artifact_floor
+    n = len(T.ZONE_KEYS)
+    assert n == 12
+    cycle12 = [T.zone_for_month(f"2027-{mo:02d}") for mo in range(1, 13)]
+    assert sorted(cycle12) == sorted(T.ZONE_KEYS), "a 12-zone year covers every zone once"
+    assert all(cycle12[i] != cycle12[i + 1] for i in range(n - 1)), "no back-to-back repeats"
+
+    # Coin tails always name a figure, a year, and a country (turnkeys excepted).
+    for u in range(80):
+        rng = random.Random(T._seed("t", 1, u, "x", "coin"))
+        t = T.roll_trinket(rng, T.ZONES["coin"])
+        if t.get("turnkey"):
+            continue
+        assert "bearing " in t["tail"] and "struck " in t["tail"], t["display"]
+
+
+def test_closed_vitrines_frozen() -> None:
+    """Live June–August cabinets must not redraw when the roster grows.
+
+    Three real vitrines from guild 874854056097628170, pinned as render_line
+    strings. 2026-09 is still open (no awards yet); its in-season zone is the
+    cutover, not a stock.
+    """
+    from joblin import trinkets as T
+
+    gid = 874854056097628170
+    # Featured-zone headers on the closed months (the emoji left of **2026-0N**).
+    assert T.zone_for_month("2026-06") == "inscribed" and T.zone_emoji("inscribed") == "📜"
+    assert T.zone_for_month("2026-07") == "bestial" and T.zone_emoji("bestial") == "🐾"
+    assert T.zone_for_month("2026-08") == "pepper" and T.zone_emoji("pepper") == "🌶️"
+
+    cabinets = [
+        (229337524533854208, [
+            ("2026-06", 0, "🏺 **Waxen Idol**"),
+            ("2026-06", 1, "📜 ✦ **Outsized Alabaster Map-case** with a half-finished poem on the flyleaf, studded with milk-teeth  _It is said to whisper at night; no one believes it._"),
+            ("2026-07", 0, "📜 **Velvet Grimoire-leaf** smelling powerfully of cedar and rot"),
+            ("2026-07", 1, "🫘 **Champagne-pink Pod** green and faintly furred"),
+            ("2026-08", 0, "⛩️ ✦ **Thumb-sized Decrepit Votive figurine** bearing a Hollow Crown"),
+            ("2026-08", 1, "📜 **Ashen Almanac** annotated by an angry, long-dead hand"),
+            ("2026-08", 2, "🌶️ **Rubbery Sprig of peppers** with seeds that ignite in open air, mouth-puckeringly sour"),
+        ]),
+        (279772853421998082, [
+            ("2026-06", 0, "📜 **Diminutive Codex** written in a tongue no one now reads"),
+            ("2026-06", 1, "📜 **Meerschaum Wax-tablet** its ink still faintly luminous"),
+            ("2026-06", 2, "📜 **Hematite Map-case** written in a tongue no one now reads"),
+            ("2026-06", 3, "📜 ✦ **Pearlescent Waxen Folio** its ink still faintly luminous"),
+            ("2026-07", 0, "💎 ✦✦ **a tiny Brass Orrery of a solar system that does not, anywhere, exist**"),
+            ("2026-07", 1, "🐾 **Cobalt Whisker of an enormous salamander**"),
+            ("2026-07", 2, "🐾 **Glass-smooth Scrimshawed rib of a great tortoise**"),
+            ("2026-07", 3, "📜 ✦✦ **the diary of a child who claims to have been born inside Scriberspace**"),
+            ("2026-08", 0, "🌶️ **Bone Pepper** with seeds that hiss in open air, mouth-puckeringly sour"),
+            ("2026-08", 1, "🌶️ **Sun-faded Pepper** shaped like a severed finger, smoky"),
+            ("2026-08", 2, "🌶️ **Faceted Chile** with seeds that hiss in open air, grassy"),
+        ]),
+        (136968392891432960, [
+            ("2026-06", 0, "📜 ✦ **Bone Glitching Clay tablet** written in a tongue no one now reads  _Traded for at a ruinous loss, and quietly regretted._"),
+            ("2026-06", 1, "📜 ✦ **Squat Antimony Almanac** annotated by an angry, long-dead hand  _Kept as a keepsake from a corpse's forehead._"),
+            ("2026-06", 2, "📜 **Petrified-wood Ledger** smelling powerfully of cedar and rot"),
+            ("2026-06", 3, "🌽 **Cobweb-veiled Kernel** with pyramidal kernels, sappy and sweet"),
+            ("2026-07", 0, "🐾 **Worryingly-fresh Glass eye of an emperor penguin**"),
+            ("2026-07", 1, "🐾 ✦ **Colossal Waxen Whisker of a jaguar** crowned with dried flowers"),
+            ("2026-07", 2, "🐾 ✦ **Colossal Salt-crystal Tooth of a gargantuan lobster** crowned with dried flowers"),
+            ("2026-07", 3, "🐾 **Bone Bezoar of an enormous salamander**"),
+            ("2026-08", 0, "🌶️ **Ulfire Sprig of peppers** green shot with orange, starchy"),
+            ("2026-08", 1, "🌶️ **Cracked Peppercorn** numbing to the tongue, ashen on the finish"),
+            ("2026-08", 2, "🌶️ **Cobweb-veiled Peppercorn** perfectly globular, smoky"),
+        ]),
+    ]
+    for uid, rows in cabinets:
+        for month, idx, line in rows:
+            got = T.render_line(T.roll_for(gid, uid, month, idx))
+            assert got == line, f"{uid} {month}[{idx}]:\n  got {got}\n  exp {line}"
 
 
 def test_vitrine_award() -> None:
@@ -5344,6 +5446,7 @@ def main() -> None:
     test_chore_count_shares_games()
     test_trinkets()
     test_zone_pick()
+    test_closed_vitrines_frozen()
     test_vitrine_award()
     test_bar_for_history()
     test_vitrine_frozen_bars()
