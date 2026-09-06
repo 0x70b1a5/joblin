@@ -2125,7 +2125,9 @@ async def test_claps() -> None:
         snap = await st.snapshot()
         assert str(posted) not in snap["claps"], "undo drops the clap record"
         assert snap["tasks"][tid]["pending"] is not None, "the occurrence is live again"
-        assert st.read_completions() == [], "completion + both clap bonuses are gone"
+        rows = st.read_completions()
+        assert [(r["kind"], r["user_id"], r["points"]) for r in rows] == [("undo", 42, 0)], \
+            "completion + both clap bonuses are gone; only Pat's ↩️ marker remains"
 
 
 async def test_game_claps() -> None:
@@ -3220,7 +3222,8 @@ async def test_award() -> None:
         # ↩️ voids the awarded row.
         undo = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
         await bot.handle_post_button("undo", undo)
-        assert [r for r in st.read_completions() if r.get("task_id") == tid] == []
+        assert [r["kind"] for r in st.read_completions() if r.get("task_id") == tid] == ["undo"], \
+            "the awarded row is voided; Pat's ↩️ marker is all that remains"
         assert (await st.snapshot())["tasks"][tid]["pending"] is not None
 
         # Self-pick is refused; the occurrence stays live.
@@ -3932,8 +3935,8 @@ def test_badge_titles() -> None:
             ("Punctualist", "Early Bird", "Night Owl", "Bounty Hunter",
              "Pitcher-Inner", "Unit Crusher", "Crowd Favorite",
              "Jack of All Chores", "One-Track Mind", "Closer",
-             "Recurring Nightmare", "The Reanimator", "Team Player", "Lone Wolf",
-             "Archaeologist")
+             "Recurring Nightmare", "The Reanimator", "Skipper-dee-doo-dah",
+             "Whoopsie-doodler", "Team Player", "Lone Wolf", "Archaeologist")
         )}
         assert lee == sorted(lee, key=lambda n: order[n])
 
@@ -4065,6 +4068,74 @@ def test_skipper() -> None:
     at = dt.datetime(2026, 4, 2, 12, tzinfo=dt.timezone.utc)
     day = dl.log_day(at, tz)
     assert dl._day_groups([sk(2, "Sam")], g, day, tz) == []
+
+
+def test_whoopsie_doodler() -> None:
+    """Whoopsie-doodler: ↩️ marker rows (undos that took) crown the top undoer
+    (ties share, month scope holds) — an undo never mints a punto, seeds no one
+    onto the board, and stays out of the 📜 Daily Log."""
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    from joblin.bot import daily_log as dl
+    from joblin.bot.scoring import (
+        _completion_points,
+        badge_titles,
+        build_leaderboard,
+        monthly_scores,
+        star_counts,
+    )
+
+    g = 1
+
+    def un(uid, name, month="2026-04"):
+        return {"guild_id": g, "month": month, "user_id": uid, "user_name": name,
+                "kind": "undo", "points": 0, "task_id": "a",
+                "ts": f"{month}-02T12:00:00+00:00"}
+
+    # Worth 0 — even a mangled marker with no points field never falls back to 1.
+    assert _completion_points(un(1, "Pat")) == 0
+    assert _completion_points({"kind": "undo"}) == 0
+
+    recs = [
+        {"guild_id": g, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "recurring", "points": 1, "task_id": "a", "late_seconds": 0},
+        un(2, "Sam"), un(2, "Sam"), un(1, "Pat"),
+        # Fumbles only ever undoes — never completes a thing.
+        un(3, "Fumbles"),
+        un(3, "Fumbles", month="2026-05"), un(3, "Fumbles", month="2026-05"),
+    ]
+
+    def holders(month):
+        by: dict[str, set[int]] = {}
+        for uid, names in badge_titles(recs, g, month).items():
+            for n in names:
+                by.setdefault(n, set()).add(uid)
+        return by
+
+    assert holders("2026-04")["Whoopsie-doodler"] == {2}, "Sam's two April ↩️ beat one"
+    assert badge_titles(recs, g, "2026-05") == {3: ["Whoopsie-doodler"]}
+    assert holders(None)["Whoopsie-doodler"] == {3}, "all-time: Fumbles' 3 lead"
+
+    # The economy is untouched: markers score nothing, seed nobody, star nobody.
+    months = monthly_scores(recs, g)
+    assert set(months["2026-04"]) == {1}, "undo-only users never reach the board"
+    assert months["2026-04"][1] == {"points": 1, "chores": 1, "claps": 0, "name": "Pat"}
+    assert "2026-05" not in months, "a month of nothing but markers scores nothing"
+    assert star_counts(recs, g, current_month="2026-06") == {1: 1}
+
+    # A board-listed holder wears the title on the rendered board.
+    text, empty = build_leaderboard(recs, g, None, month="2026-04")
+    assert not empty and "Whoopsie-doodler" not in text  # Pat holds none — Sam isn't listed
+    recs.append(un(1, "Pat"))
+    text, empty = build_leaderboard(recs, g, None, month="2026-04")
+    assert not empty and "↩️ Whoopsie-doodler" in text  # tie pulls Pat in
+
+    # The 📜 Daily Log never shows an undo: a day of only markers has no groups.
+    tz = ZoneInfo("UTC")
+    at = dt.datetime(2026, 4, 2, 12, tzinfo=dt.timezone.utc)
+    day = dl.log_day(at, tz)
+    assert dl._day_groups([un(2, "Sam")], g, day, tz) == []
 
 
 def test_early_bird_night_owl() -> None:
@@ -4770,7 +4841,25 @@ async def test_puntobomb_lifecycle() -> None:
         await bot.handle_post_button("undo", undo)
         snap = await st.snapshot()
         assert snap["tasks"][tid]["pending"] is not None
-        assert st.read_completions() == []
+        rows = st.read_completions()
+        assert [(r["kind"], r["user_id"], r["points"]) for r in rows] == [("undo", 42, 0)], \
+            "the defusal punto is voided; only Pat's ↩️ whoopsie marker remains"
+
+        # Defuse again, then spend the fuse: the ↩️ is refused (it would re-arm
+        # an instant kaboom) — and a refused undo un-happens nothing, so it
+        # leaves no whoopsie marker either.
+        again = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_task_button(tid, "done", again)
+        async with st.txn() as data:
+            data["undo"][str(mid)]["before"]["explodes_at"] = m.to_iso(
+                m.now_utc() - dt.timedelta(seconds=1))
+        refused = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
+        await bot.handle_post_button("undo", refused)
+        snap = await st.snapshot()
+        assert tid not in snap["tasks"], "the refused ↩️ leaves the defusal standing"
+        assert str(mid) not in snap["undo"], "the spent ↩️ record is dropped"
+        assert sorted(r["kind"] for r in st.read_completions()) == ["puntobomb", "undo"], \
+            "one marker from the undo that took; none from the refusal"
 
 
 async def test_puntobomb_explodes() -> None:
@@ -5039,14 +5128,16 @@ async def test_list_lifecycle() -> None:
         await bot.handle_post_button("undo", undo)
         snap = await st.snapshot()
         assert snap["tasks"][tid]["pending"] is not None
-        assert st.read_completions() == [], "an undone list voids every ticker's punto"
+        assert [(r["kind"], r["user_id"]) for r in st.read_completions()] == [("undo", 1)], \
+            "an undone list voids every ticker's punto; only Boss's ↩️ marker stays"
         assert len(snap["tasks"][tid]["pending"]["ticks"]) == 3
 
         # ✅ on the restored post re-completes it; the presser swept nothing,
         # so only the real tickers are paid.
         redo = FakeInteraction(user=FakeUser(9, "Lee"), channel=ch, message=ch.msgs[mid])
         await bot.handle_task_button(tid, "done", redo)
-        recs = sorted(st.read_completions(), key=lambda r: r["user_id"])
+        recs = sorted((r for r in st.read_completions() if r["kind"] != "undo"),
+                      key=lambda r: r["user_id"])
         assert [r["user_id"] for r in recs] == [7, 42], "✅ can't mint a punto for a non-ticker"
 
 
@@ -5455,6 +5546,7 @@ def main() -> None:
     test_badge_titles()
     test_reanimator()
     test_skipper()
+    test_whoopsie_doodler()
     test_early_bird_night_owl()
     test_rank_spice()
     asyncio.run(test_daily_backup())

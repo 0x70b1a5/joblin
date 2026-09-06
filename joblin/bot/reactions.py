@@ -1432,6 +1432,26 @@ async def _handle_undo(press: Press) -> None:
                 await store.void_completion(cid)
         for lid in clap_log_ids:  # retract every bonus punto the claps awarded
             await store.void_completion(lid)
+        # The whoopsie itself is on the record: a zero-punto marker row (kind
+        # "undo"), same deal as a 🔄's or ⏭️'s — it feeds the Whoopsie-doodler
+        # tally and nothing else. Only an undo that *took* counts (a refused
+        # ↩️ un-happened nothing), and it is credited to whoever pressed it.
+        # Never voided: there is no undoing an undo.
+        undone_at = now_utc()
+        cfg = guild_config(snap, before["guild_id"])
+        tz = ZoneInfo(cfg["timezone"]) if cfg and cfg.get("timezone") else dt.timezone.utc
+        await store.log_completion({
+            "id": new_id(),
+            "ts": to_iso(undone_at),
+            "month": undone_at.astimezone(tz).strftime("%Y-%m"),  # local-tz bucket
+            "guild_id": before["guild_id"],
+            "task_id": tid,
+            "brief": before.get("brief"),
+            "user_id": press.user_id,
+            "user_name": press.display,
+            "kind": "undo",
+            "points": 0,
+        })
         await _restore_anchor(channel, press.message_id, tid, before,
                               legacy_record=legacy_record)
         if completion_ids or clap_log_ids:
