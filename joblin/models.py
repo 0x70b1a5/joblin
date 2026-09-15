@@ -33,10 +33,11 @@ Task dict schema
                                     #   cleared by reacting 🔊. Absent means False.
     "puntobomb":    bool,           # 💣: a strictly one-off, non-bounty chore with
                                     #   a fuse (see bot/bombs.py). Absent means False.
+    "penalty":      int,            # puntos lost per player; positive, absent = 5.
     "explodes_at":  str,            # puntobombs only (required there): ISO-8601 UTC.
                                     #   If nobody has ✅-defused by then the scheduler
                                     #   blows it — everyone in the game is docked
-                                    #   PUNTOBOMB_PENALTY (kind "kaboom"). The fuse is
+                                    #   penalty (kind "kaboom"). The fuse is
                                     #   never cleared, snoozed, or rescheduled.
     "items":        list[str],      # 🧾: a checklist chore ("list"). Each item is a
                                     #   button on the post; ticking the last one (or
@@ -114,8 +115,9 @@ EMOJI_LIST = "🧾"  # marker on a checklist chore's posts and list rows
 
 # Puntobombs: ✅ before the fuse runs out defuses for 1 punto (a normal chore
 # completion, kind "puntobomb"); past it, everyone in the game — every user in
-# the guild's completion log — is docked this many (kind "kaboom", the economy's
-# one sanctioned negative). The fuse can't be shorter than the minimum.
+# the guild's completion log — is docked the task penalty, defaulting to this
+# amount (kind "kaboom", the economy's one sanctioned negative). The fuse
+# can't be shorter than the minimum.
 PUNTOBOMB_PENALTY = 5
 PUNTOBOMB_MIN_FUSE_SECS = 3600
 
@@ -1200,7 +1202,7 @@ def render_kaboom(task: dict, victims: list[dict]) -> str:
     names = ", ".join(v["user_name"] for v in victims)
     return (
         f"💥 ~~**{brief}**~~ — **KABOOM!** Nobody defused it in time.\n"
-        f"−{PUNTOBOMB_PENALTY} puntos each: {names}"
+        f"−{task.get('penalty', PUNTOBOMB_PENALTY)} puntos each: {names}"
     )
 
 

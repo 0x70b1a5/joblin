@@ -75,7 +75,7 @@ def puntobomb_tag(task: dict) -> str:
         return ""
     boom = discord_ts(from_iso(task["explodes_at"]), "R")
     return (f" {EMOJI_BOMB} *puntobomb · blows {boom} — ✅ defuses it for a "
-            f"punto, or everyone loses {PUNTOBOMB_PENALTY}*")
+            f"punto, or everyone loses {task.get('penalty', PUNTOBOMB_PENALTY)}*")
 
 
 def list_tag(task: dict) -> str:

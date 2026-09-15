@@ -2,8 +2,8 @@
 
 At ~23:59 guild-local, **if anything got logged that day** (the completion
 log's hash moved since the last backup), zip the two state files and post them
-to the configured channel as an attachment, then auto-post the current
-leaderboard. The channel becomes a dated archive of the economy's source of
+to the configured channel as an attachment, repost the closing daily log,
+then auto-post the current leaderboard. The channel becomes a dated archive of the economy's source of
 truth — restore a data dir by un-zipping the latest attachment.
 
 Two existing properties make this honest:
@@ -40,7 +40,8 @@ import discord
 
 from ..models import _next_clock, from_iso, to_iso
 from .core import NIGHTLY_HOUR, NIGHTLY_MINUTE, NO_PINGS, bot, log, store
-from .daily_log import unpin_day_logs
+from .daily_log import (build_daily_log_embed, daily_log_lines, day_puntos,
+                        log_day, unpin_day_logs)
 from .helpers import config_ready
 from .scoring import build_leaderboard
 
@@ -157,8 +158,20 @@ async def _do_backup(guild_id: int, cfg: dict, channel: discord.abc.Messageable,
     file = discord.File(io.BytesIO(archive), filename=f"joblin-backup-{stamp}.zip")
     await channel.send(content=caption, file=file, allowed_mentions=NO_PINGS)
 
-    # Auto-post the current month's leaderboard alongside the snapshot.
+    # Repost the closing day's log immediately before the board. Use the
+    # scheduled deadline so a delayed tick across midnight keeps the right day.
+    # This is an unpinned EOD snapshot; the live log retains its editable address.
     records = store.read_completions()
+    day = log_day(from_iso(cfg["next_backup_at"]), tz)
+    lines = daily_log_lines(records, guild_id, day, tz)
+    if lines:
+        await channel.send(
+            embed=build_daily_log_embed(
+                lines, day, day_puntos(records, guild_id, day, tz)),
+            allowed_mentions=NO_PINGS,
+        )
+
+    # Auto-post the current month's leaderboard alongside the snapshot.
     msg, empty = build_leaderboard(records, guild_id, cfg)
     if not empty:
         await channel.send(msg, allowed_mentions=NO_PINGS)

@@ -7,8 +7,8 @@ defusal (a 1-punto completion, kind ``"puntobomb"`` — handled in
 ``reactions._handle_done``); past it, the scheduler calls
 :func:`explode_puntobomb` and everyone in the game — every user in the guild's
 completion log (:func:`scoring.puntobomb_casualties`) — is docked
-``PUNTOBOMB_PENALTY`` via a ``kind: "kaboom"`` log row, the economy's one
-sanctioned negative. Deleting the bomb instead (❌ on the post, ``/deletetask``,
+the task's ``penalty`` (default ``PUNTOBOMB_PENALTY``) via a
+``kind: "kaboom"`` log row, the economy's one sanctioned negative. Deleting the bomb instead (❌ on the post, ``/deletetask``,
 or the web UI) is always permitted — The Coward's Way Out — and moves no puntos.
 
 Restart-safe the usual way: the fuse is the persisted ``explodes_at`` compared
@@ -45,7 +45,7 @@ from .reactions import _delete_panels, _take_task_panels
 
 def kaboom_records(task: dict, victims: list[dict], tz: ZoneInfo,
                    now: dt.datetime) -> list[dict]:
-    """The penalty rows a blown puntobomb owes: one −PUNTOBOMB_PENALTY per
+    """The penalty rows a blown puntobomb owes: one negative task penalty per
     player in the game, same shape as every other completion-log row."""
     return [
         {
@@ -58,7 +58,7 @@ def kaboom_records(task: dict, victims: list[dict], tz: ZoneInfo,
             "user_id": v["user_id"],
             "user_name": v["user_name"],
             "kind": "kaboom",
-            "points": -PUNTOBOMB_PENALTY,
+            "points": -task.get("penalty", PUNTOBOMB_PENALTY),
             "due_at": task.get("explodes_at"),
             "late_seconds": 0,
         }

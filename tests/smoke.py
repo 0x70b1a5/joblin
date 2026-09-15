@@ -4333,6 +4333,43 @@ async def test_daily_backup() -> None:
         assert len(ch.files) == 2, "second backup posted after fresh activity"
 
 
+async def test_daily_backup_log_repost() -> None:
+    """A delayed EOD tick reposts the closing log, unpinned, before the board."""
+    import joblin.bot as bot
+
+    with tempfile.TemporaryDirectory() as d:
+        _, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        deadline = dt.datetime(2026, 9, 15, 23, 59, tzinfo=tz)
+        event = deadline - dt.timedelta(hours=1)
+        async with st.txn() as data:
+            data["configs"]["1"]["next_backup_at"] = m.to_iso(deadline)
+        await st.log_completion({
+            "id": "eod", "ts": m.to_iso(event), "guild_id": 1,
+            "month": m.now_utc().astimezone(tz).strftime("%Y-%m"),
+            "task_id": "chore", "brief": "Closing day's chore",
+            "user_id": 1, "user_name": "Pat", "points": 1, "kind": "once",
+        })
+        await bot.refresh_daily_log(1, event)
+        original = next(iter(ch.msgs.values()))
+        book = (await st.snapshot())["daily_log"]["1"]
+        # Cross both midnight and the scoring grace period before the tick.
+        await bot.run_daily_backups(deadline + dt.timedelta(minutes=5),
+                                    await st.snapshot())
+        posts = list(ch.msgs.values())
+        assert len(posts) == 4, "live log, backup, EOD log, leaderboard"
+        assert "Nightly backup" in posts[-3].content
+        assert posts[-2].embed.to_dict() == original.embed.to_dict()
+        assert "Chore leaderboard" in posts[-1].content
+        assert posts[-2].id not in ch.pins
+        saved = (await st.snapshot())["daily_log"]["1"]["2026-09-15"]
+        assert saved["message_id"] == book["2026-09-15"]["message_id"]
+        assert not saved.get("pinned")
+        await bot.run_daily_backups(deadline + dt.timedelta(minutes=6),
+                                    await st.snapshot())
+        assert len(ch.msgs) == 4, "next tick does not duplicate the recap"
+
+
 def test_month_close_embeds() -> None:
     """Pure builder: stars + trinkets for a closed month, quiet when empty."""
     import joblin.bot as bot
@@ -4809,18 +4846,29 @@ async def test_puntobomb_lifecycle() -> None:
         assert short.response.ephemeral and "hour" in short.response.content
         assert (await st.snapshot())["tasks"] == {}
 
+        for value in (0, -3, 1.5, True):
+            invalid = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch)
+            await bot.puntobomb.callback(invalid, brief="Dud", expires="in 2h",
+                                        penalty=value)
+            assert invalid.response.ephemeral and "positive whole" in invalid.response.content
+            assert not (await st.snapshot())["tasks"]
+
         inter = FakeInteraction(user=FakeUser(1, "Boss"), channel=ch)
-        await bot.puntobomb.callback(inter, brief="Unclog the gutter", expires="in 2 hours")
+        await bot.puntobomb.callback(inter, brief="Unclog the gutter", expires="in 2 hours",
+                                    penalty=12)
+        assert "**12**" in inter.response.content
         assert not inter.response.ephemeral and "Coward" in inter.response.content
         snap = await st.snapshot()
         (tid, task), = snap["tasks"].items()
         assert task["puntobomb"] and not task["recurring"] and not task["bounty"]
+        assert task["penalty"] == 12
         assert m.from_iso(task["next_due"]) <= m.now_utc(), "arms now by default"
         assert m.from_iso(task["explodes_at"]) > m.now_utc() + dt.timedelta(minutes=110)
 
         await bot.fire_task(tid, ch, cfg)
         mid = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][0]
         assert "puntobomb" in ch.msgs[mid].content and m.EMOJI_BOMB in ch.msgs[mid].content
+        assert "everyone loses 12" in ch.msgs[mid].content
         assert str(btn(ch.msgs[mid], f"task:skip:{tid}").emoji) == m.EMOJI_DELETE
 
         press = FakeInteraction(user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid])
@@ -4911,10 +4959,14 @@ async def test_puntobomb_explodes() -> None:
         async with st.txn() as data:
             data["tasks"]["boom2"] = _bomb_task("boom2", now, fuse_hours=-0.01,
                                                 due_in=3600)
+            data["tasks"]["boom2"]["penalty"] = 12
         posted_before = len(ch.msgs)
         assert await bot.explode_puntobomb("boom2", ch, cfg)
         assert len(ch.msgs) == posted_before + 1, "the blast is announced fresh"
         assert "boom2" not in (await st.snapshot())["tasks"]
+        custom = [r for r in st.read_completions() if r.get("task_id") == "boom2"]
+        assert len(custom) == 2 and all(r["points"] == -12 for r in custom)
+        assert "−12 puntos each" in list(ch.msgs.values())[-1].content
 
         # A guild with an empty log: the blast finds no one and docks no one.
         async with st.txn() as data:
@@ -5550,6 +5602,7 @@ def main() -> None:
     test_early_bird_night_owl()
     test_rank_spice()
     asyncio.run(test_daily_backup())
+    asyncio.run(test_daily_backup_log_repost())
     test_month_close_embeds()
     asyncio.run(test_month_close_announce())
     test_month_close_batching()

@@ -179,12 +179,13 @@ async def newtask(
 
 @bot.tree.command(
     name="puntobomb",
-    description="Plant a puntobomb: defuse it (✅) before it blows, or everyone in the game loses 5 puntos",
+    description="Plant a puntobomb: defuse it (✅) before it blows, or everyone in the game loses puntos",
 )
 @app_commands.describe(
     brief="What defusing it takes, e.g. 'unclog the gutter' (required)",
     expires="When it blows — in 3h, tonight, tomorrow 8am (required; at least an hour of fuse)",
     at="When the bomb posts and starts ticking (default: now)",
+    penalty="Puntos each player loses if it explodes (positive whole number; default: 5)",
     description="Optional longer details, revealed by the ℹ️ button",
 )
 async def puntobomb(
@@ -193,12 +194,19 @@ async def puntobomb(
     expires: str,
     at: Optional[str] = None,
     description: Optional[str] = None,
+    penalty: app_commands.Range[int, 1] = PUNTOBOMB_PENALTY,
 ) -> None:
     snap = await store.snapshot()
     cfg = guild_config(snap, interaction.guild_id)
     if not config_ready(cfg):
         await interaction.response.send_message(
             "❌ Run `/joblinconfig` to set a channel and timezone first.", ephemeral=True
+        )
+        return
+
+    if type(penalty) is not int or penalty < 1:
+        await interaction.response.send_message(
+            "❌ The penalty must be a positive whole number of puntos.", ephemeral=True
         )
         return
 
@@ -230,6 +238,7 @@ async def puntobomb(
         "description": description[:1500] if description else None,
         "bounty": False,  # never — "Defuser gets a punto" means exactly one
         "puntobomb": True,
+        "penalty": penalty,
         "explodes_at": to_iso(exp),
         "recurring": False,
         "freq": "once",
@@ -252,7 +261,7 @@ async def puntobomb(
         f"{EMOJI_BOMB} Planted **{brief}** — {ticking} · "
         f"blows {discord_ts(exp, 'F')} ({discord_ts(exp, 'R')}, a {fuse} fuse).\n"
         f"First ✅ defuses it for a punto — or everyone in the game loses "
-        f"**{PUNTOBOMB_PENALTY}**. (❌ / `/deletetask` is The Coward's Way Out.)"
+        f"**{penalty}**. (❌ / `/deletetask` is The Coward's Way Out.)"
     )
     if description:
         body += "\nℹ️ Details attached."

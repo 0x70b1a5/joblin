@@ -552,7 +552,8 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
         name="📜 The Daily Log (and tidy sweeps)",
         value=(
             "Every punto event of the day lands as a line in one growing 📜 embed "
-            "(it corrects itself on ↩️/👏). Superseded chore posts — old nags, "
+            "(it corrects itself on ↩️/👏). At EOD a snapshot is reposted just before "
+            "the leaderboard. Superseded chore posts — old nags, "
             "spent buttons — are swept away automatically, *except* any post "
             "someone reacted to or replied to, which stays. "
             "`/joblinconfig declutter:False` turns the sweeps off."
@@ -597,7 +598,7 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "bomb — a one-off chore with a **required fuse** (an hour minimum; "
             "`at:` arms it later). The first ✅ defuses it for **1 punto**. If "
             f"nobody does before it blows, **everyone in the game loses "
-            f"{PUNTOBOMB_PENALTY} puntos** — \"in the game\" meaning everyone "
+            f"{PUNTOBOMB_PENALTY} puntos by default** (set `penalty:` to choose) — \"in the game\" meaning everyone "
             "who has ever earned (or lost) a punto here. ❌ on the post or "
             "`/deletetask` deletes it with no puntos moved: always allowed, "
             "forever known as **The Coward's Way Out**. 🏳️"
