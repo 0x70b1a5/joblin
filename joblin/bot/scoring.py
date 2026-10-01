@@ -31,16 +31,16 @@ from .helpers import guild_config
 # Leaderboard scoring — puntos (bounties count double) and monthly ⭐ stars
 # ---------------------------------------------------------------------------
 # Zero-punto marker rows: they record an *action*, not a completion — a 🔄 tap
-# (The Reanimator), a ⏭️ skip (Skipper-dee-doo-dah) or a ↩️ undo that took
-# (Whoopsie-doodler). Worth 0 everywhere and excluded from every board/spice/log
+# (The Reanimator), a ⏭️ skip (Skipper-dee-doo-dah), a ↩️ undo that took
+# (Whoopsie-doodler) or a ⏩ snooze (Procrastinator). Worth 0 everywhere and excluded from every board/spice/log
 # scan; only their badge tallies read them.
-MARKER_KINDS = ("requeue", "skip", "undo")
+MARKER_KINDS = ("requeue", "skip", "undo", "snooze")
 
 
 def _completion_points(rec: dict) -> int:
     """Puntos a logged completion is worth. Bounties record ``points: 2``; older
     records predate the field and count as the normal 1 punto. Marker rows
-    (:data:`MARKER_KINDS`) are worth 0 everywhere, so a 🔄, ⏭️ or ↩️ can never
+    (:data:`MARKER_KINDS`) are worth 0 everywhere, so a 🔄, ⏭️, ↩️ or ⏩ can never
     mint a punto. Kaboom rows (a blown puntobomb's per-player penalty) are the
     economy's one sanctioned negative, so only they keep a signed value —
     everything else floors at 1."""
@@ -71,7 +71,7 @@ def monthly_scores(records: list[dict], guild_id: int) -> dict[str, dict[int, di
         if rec.get("guild_id") != guild_id:
             continue
         if rec.get("kind") in MARKER_KINDS:
-            continue  # zero-punto 🔄/⏭️/↩️ markers feed titles only — never the board
+            continue  # zero-punto 🔄/⏭️/↩️/⏩ markers feed titles only — never the board
         bucket = months.setdefault(_rec_month(rec), {})
         ent = bucket.setdefault(
             rec["user_id"], {"points": 0, "chores": 0, "claps": 0, "name": str(rec["user_id"])}
@@ -357,6 +357,7 @@ BADGE_EMOJI = {
     "The Reanimator": "🧟",
     "Skipper-dee-doo-dah": "⏭️",
     "Whoopsie-doodler": "↩️",
+    "Procrastinator": "🦥",
     "Team Player": "⚽",
     "Lone Wolf": "🐺",
     "Archaeologist": "🧾",
@@ -365,7 +366,7 @@ BADGE_ORDER = tuple(BADGE_EMOJI)
 
 
 def _is_chore(rec: dict) -> bool:
-    """A solo chore row (not a pitch-in, do-em-up, clap bonus, 🔄/⏭️/↩️ marker, or
+    """A solo chore row (not a pitch-in, do-em-up, clap bonus, 🔄/⏭️/↩️/⏩ marker, or
     💥 kaboom penalty — a defused puntobomb, kind "puntobomb", *is* one)."""
     return rec.get("kind") not in ("pitchin", "doemup", "clap", "kaboom") + MARKER_KINDS
 
@@ -390,6 +391,7 @@ def _empty_badge_stats() -> dict:
         "requeue": 0,
         "skipped": 0,
         "undone": 0,
+        "snoozed": 0,
         "early": 0,
         "night": 0,
         "task_counts": {},  # task_id -> n (chores only)
@@ -436,6 +438,10 @@ def badge_stats(records: list[dict], guild_id: int,
         if kind == "undo":
             # A ↩️ marker (an undo that actually took): Whoopsie-doodler fodder.
             ent["undone"] += 1
+            continue
+        if kind == "snooze":
+            # A ⏩ marker (one per snooze that landed): Procrastinator fodder.
+            ent["snoozed"] += 1
             continue
         if kind == "kaboom":
             # A blast is a penalty, not an achievement: its (negative) puntos
@@ -537,6 +543,7 @@ def badge_titles(records: list[dict], guild_id: int,
     award("The Reanimator", _leaders(stats, lambda e: e["requeue"]))
     award("Skipper-dee-doo-dah", _leaders(stats, lambda e: e["skipped"]))
     award("Whoopsie-doodler", _leaders(stats, lambda e: e["undone"]))
+    award("Procrastinator", _leaders(stats, lambda e: e["snoozed"]))
     # Share badges: non-competitors score -1 so they never win; min_score 0
     # rejects the all-ineligible case (top == -1).
     award("Team Player", _leaders(

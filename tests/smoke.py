@@ -3427,15 +3427,32 @@ async def test_snooze_numpad() -> None:
         assert f"task:done:{tid}" in ids and f"post:undo:{tid}" in ids, \
             "snoozed post stays actionable and gains ↩️"
         assert pick.response.view is None and "Snoozed" in pick.response.content
+        # The snooze left a zero-punto marker row credited to the snoozer —
+        # Procrastinator's raw material.
+        snoozes = [r for r in st.read_completions() if r.get("kind") == "snooze"]
+        assert len(snoozes) == 1 and snoozes[0]["user_id"] == 42
+        assert snoozes[0]["points"] == 0 and snoozes[0]["task_id"] == tid
 
         # ↩️ restores the post to a live, unsnoozed occurrence.
         undo = FakeInteraction(user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid])
         await bot.handle_post_button("undo", undo)
         snap = await st.snapshot()
         assert snap["tasks"][tid]["pending"]["ffwd_count"] == 0, "snooze undone"
+        kinds = [r.get("kind") for r in st.read_completions()]
+        assert "snooze" not in kinds, "↩️ voids the snooze marker"
+        assert kinds.count("undo") == 1, "…and leaves its own Whoopsie marker"
         assert "Milk the cow" in ch.msgs[mid].content and "Snoozed" not in ch.msgs[mid].content
         ids = btn_ids(ch.msgs[mid])
         assert f"post:undo:{tid}" not in ids and f"task:done:{tid}" in ids
+
+        # A ⏭️'s marker is voided by its ↩️ the same way.
+        await bot.handle_task_button(tid, "skip", FakeInteraction(
+            user=FakeUser(42, "Pat"), channel=ch, message=ch.msgs[mid]))
+        assert [r.get("kind") for r in st.read_completions()].count("skip") == 1
+        await bot.handle_post_button("undo", FakeInteraction(
+            user=FakeUser(7, "Sam"), channel=ch, message=ch.msgs[mid]))
+        kinds = [r.get("kind") for r in st.read_completions()]
+        assert "skip" not in kinds and kinds.count("undo") == 2
 
 
 async def test_post_buttons() -> None:
@@ -3936,7 +3953,8 @@ def test_badge_titles() -> None:
              "Pitcher-Inner", "Unit Crusher", "Crowd Favorite",
              "Jack of All Chores", "One-Track Mind", "Closer",
              "Recurring Nightmare", "The Reanimator", "Skipper-dee-doo-dah",
-             "Whoopsie-doodler", "Team Player", "Lone Wolf", "Archaeologist")
+             "Whoopsie-doodler", "Procrastinator", "Team Player", "Lone Wolf",
+             "Archaeologist")
         )}
         assert lee == sorted(lee, key=lambda n: order[n])
 
@@ -4136,6 +4154,74 @@ def test_whoopsie_doodler() -> None:
     at = dt.datetime(2026, 4, 2, 12, tzinfo=dt.timezone.utc)
     day = dl.log_day(at, tz)
     assert dl._day_groups([un(2, "Sam")], g, day, tz) == []
+
+
+def test_procrastinator() -> None:
+    """Procrastinator: ⏩ marker rows crown the top snoozer (ties share, month
+    scope holds) — a snooze never mints a punto, seeds no one onto the board,
+    and stays out of the 📜 Daily Log."""
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    from joblin.bot import daily_log as dl
+    from joblin.bot.scoring import (
+        _completion_points,
+        badge_titles,
+        build_leaderboard,
+        monthly_scores,
+        star_counts,
+    )
+
+    g = 1
+
+    def sn(uid, name, month="2026-04"):
+        return {"guild_id": g, "month": month, "user_id": uid, "user_name": name,
+                "kind": "snooze", "points": 0, "task_id": "a",
+                "ts": f"{month}-02T12:00:00+00:00"}
+
+    # Worth 0 — even a mangled marker with no points field never falls back to 1.
+    assert _completion_points(sn(1, "Pat")) == 0
+    assert _completion_points({"kind": "snooze"}) == 0
+
+    recs = [
+        {"guild_id": g, "month": "2026-04", "user_id": 1, "user_name": "Pat",
+         "kind": "recurring", "points": 1, "task_id": "a", "late_seconds": 0},
+        sn(2, "Sam"), sn(2, "Sam"), sn(1, "Pat"),
+        # Sloth only ever snoozes — never completes a thing.
+        sn(3, "Sloth"),
+        sn(3, "Sloth", month="2026-05"), sn(3, "Sloth", month="2026-05"),
+    ]
+
+    def holders(month):
+        by: dict[str, set[int]] = {}
+        for uid, names in badge_titles(recs, g, month).items():
+            for n in names:
+                by.setdefault(n, set()).add(uid)
+        return by
+
+    assert holders("2026-04")["Procrastinator"] == {2}, "Sam's two April ⏩ beat one"
+    assert badge_titles(recs, g, "2026-05") == {3: ["Procrastinator"]}
+    assert holders(None)["Procrastinator"] == {3}, "all-time: Sloth's 3 lead"
+
+    # The economy is untouched: markers score nothing, seed nobody, star nobody.
+    months = monthly_scores(recs, g)
+    assert set(months["2026-04"]) == {1}, "snooze-only users never reach the board"
+    assert months["2026-04"][1] == {"points": 1, "chores": 1, "claps": 0, "name": "Pat"}
+    assert "2026-05" not in months, "a month of nothing but markers scores nothing"
+    assert star_counts(recs, g, current_month="2026-06") == {1: 1}
+
+    # A board-listed holder wears the title on the rendered board.
+    text, empty = build_leaderboard(recs, g, None, month="2026-04")
+    assert not empty and "Procrastinator" not in text  # Pat holds none — Sam isn't listed
+    recs.append(sn(1, "Pat"))
+    text, empty = build_leaderboard(recs, g, None, month="2026-04")
+    assert not empty and "🦥 Procrastinator" in text  # tie pulls Pat in
+
+    # The 📜 Daily Log never shows a snooze: a day of only markers has no groups.
+    tz = ZoneInfo("UTC")
+    at = dt.datetime(2026, 4, 2, 12, tzinfo=dt.timezone.utc)
+    day = dl.log_day(at, tz)
+    assert dl._day_groups([sn(2, "Sam")], g, day, tz) == []
 
 
 def test_early_bird_night_owl() -> None:
@@ -5599,6 +5685,7 @@ def main() -> None:
     test_reanimator()
     test_skipper()
     test_whoopsie_doodler()
+    test_procrastinator()
     test_early_bird_night_owl()
     test_rank_spice()
     asyncio.run(test_daily_backup())

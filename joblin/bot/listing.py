@@ -667,6 +667,7 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "🧟 **The Reanimator** — most 🔄 requeues\n"
             "⏭️ **Skipper-dee-doo-dah** — most chores ⏭️ skipped\n"
             "↩️ **Whoopsie-doodler** — most ↩️ undos\n"
+            "🦥 **Procrastinator** — most chores ⏩ snoozed\n"
             "⚽ **Team Player** — biggest slice of their puntos from pitch-ins & "
             "do-em-ups\n"
             "🐺 **Lone Wolf** — biggest slice from solo chores *(either slice "

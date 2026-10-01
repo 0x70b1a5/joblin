@@ -20,7 +20,7 @@ log and the auto-leaderboard can never disagree about what "today" meant.
 Lines are strictly chronological — rows are sorted by their logged instant, and
 rows written together (same instant, task, kind: a 🧾 list's tickers, a
 pitch-in's scorers, one clap's beneficiaries) collapse into a single line.
-Zero-punto marker rows (🔄 requeues, ⏭️ skips, ↩️ undos) are skipped, like everywhere
+Zero-punto marker rows (🔄 requeues, ⏭️ skips, ↩️ undos, ⏩ snoozes) are skipped, like everywhere
 else outside their badge tallies.
 """
 from __future__ import annotations

@@ -393,13 +393,20 @@ async def _delete_panels(panels: list[tuple[int, Optional[int]]]) -> None:
 
 
 async def _apply_snooze(
-    tid: str, n: int, unit: str, *, panel_mid: Optional[int] = None
-) -> Optional[tuple[dict, dt.datetime, str]]:
+    tid: str, n: int, unit: str, user_id: int, user_name: str,
+    *, panel_mid: Optional[int] = None,
+) -> Optional[tuple[dict, dt.datetime, str, str]]:
     """The snooze txn shared by the button numpad and the legacy reaction panel:
     bump ffwd_count and push remind_at out. When ``panel_mid`` is given the
     panel record is popped in the same txn, so two racing digit taps can't both
-    land. Returns (before-snapshot, new remind instant, human amount), or None
-    if the occurrence resolved (or the panel was spent) in the meantime."""
+    land. Returns (before-snapshot, new remind instant, human amount, marker
+    completion id), or None if the occurrence resolved (or the panel was spent)
+    in the meantime.
+
+    The snooze itself is on the record: a zero-punto marker row (kind
+    "snooze") credited to the snoozer, same deal as a ⏭️'s — it feeds the
+    Procrastinator tally and nothing else, and an ↩️ voids it along with the
+    restore."""
     hours = n if unit == "hours" else n * 24
     remind = None
     async with store.txn() as data:
@@ -411,24 +418,42 @@ async def _apply_snooze(
             return None
         before = json.loads(json.dumps(live))  # snapshot for undo
         p["ffwd_count"] = p.get("ffwd_count", 0) + 1
-        remind = now_utc() + dt.timedelta(hours=hours)
+        snoozed_at = now_utc()
+        remind = snoozed_at + dt.timedelta(hours=hours)
         p["remind_at"] = to_iso(remind)
+        cfg = guild_config(data, live["guild_id"])
+    tz = ZoneInfo(cfg["timezone"]) if cfg and cfg.get("timezone") else dt.timezone.utc
+    marker = {
+        "id": new_id(),
+        "ts": to_iso(snoozed_at),
+        "month": snoozed_at.astimezone(tz).strftime("%Y-%m"),  # local-tz bucket
+        "guild_id": before["guild_id"],
+        "task_id": tid,
+        "brief": before["brief"],
+        "user_id": user_id,
+        "user_name": user_name,
+        "kind": "snooze",
+        "points": 0,
+    }
+    await store.log_completion(marker)
     amount = (f"{hours} hour{'' if hours == 1 else 's'}" if unit == "hours"
               else f"{n} day{'' if n == 1 else 's'}")
-    return before, remind, amount
+    return before, remind, amount, marker["id"]
 
 
 async def _announce_snooze(
-    tid: str, before: dict, remind: dt.datetime, amount: str, mention: str,
-    anchor_id: int, channel: discord.abc.Messageable,
+    tid: str, before: dict, remind: dt.datetime, amount: str, marker_id: str,
+    mention: str, anchor_id: int, channel: discord.abc.Messageable,
 ) -> None:
     """Stamp the anchor post with the snooze result — keeping its live action
-    row (the occurrence is still pending) plus a fresh ↩️ — and arm the undo."""
+    row (the occurrence is still pending) plus a fresh ↩️ — and arm the undo
+    (which voids the snooze's marker row if it takes)."""
     status = (
         f"**{before['brief']}**\n"
         f"⏩ Snoozed {amount} by {mention} — next reminder {discord_ts(remind, 'R')}"
     )
-    await _arm_undo("snooze", tid, before, anchor_id, channel)
+    await _arm_undo("snooze", tid, before, anchor_id, channel,
+                    completion_ids=[marker_id])
     view = make_task_view(tid, before)
     try:
         # A 🧾 list's ↩️ joins the bottom control row rather than the items;
@@ -498,11 +523,13 @@ class SnoozeView(discord.ui.View):
             except discord.HTTPException as e:
                 log.warning("snooze pick ack failed (user %s): %s",
                             interaction.user.id, e)
-            applied = await _apply_snooze(self.tid, n, unit)
+            applied = await _apply_snooze(
+                self.tid, n, unit, interaction.user.id, interaction.user.display_name
+            )
             if applied is None:
                 confirm = "↩️ Too late — that occurrence was already resolved."
             else:
-                before, remind, amount = applied
+                before, remind, amount, marker_id = applied
                 confirm = (f"⏩ Snoozed **{self.brief}** {amount} — next reminder "
                            f"{discord_ts(remind, 'R')}.")
             try:
@@ -513,7 +540,7 @@ class SnoozeView(discord.ui.View):
             if applied is None:
                 return
             await _announce_snooze(
-                self.tid, before, remind, amount, interaction.user.mention,
+                self.tid, before, remind, amount, marker_id, interaction.user.mention,
                 self.anchor_id, interaction.channel,
             )
         return pick
@@ -600,13 +627,16 @@ async def _handle_snooze_panel(
     mention = member.mention if member else f"<@{payload.user_id}>"
     anchor_id = rec.get("anchor_id")
 
-    applied = await _apply_snooze(tid, n, unit, panel_mid=payload.message_id)
+    name = member.display_name if member else str(payload.user_id)
+    applied = await _apply_snooze(tid, n, unit, payload.user_id, name,
+                                  panel_mid=payload.message_id)
     await safe_delete(panel)
     if applied is None:
         return  # resolved between opening the panel and picking a number
     if anchor_id:
-        before, remind, amount = applied
-        await _announce_snooze(tid, before, remind, amount, mention, anchor_id, channel)
+        before, remind, amount, marker_id = applied
+        await _announce_snooze(tid, before, remind, amount, marker_id, mention,
+                               anchor_id, channel)
 
 
 # ---------------------------------------------------------------------------
@@ -1427,9 +1457,10 @@ async def _handle_undo(press: Press) -> None:
             await press.whisper("Nothing left to undo here.")
         return
     if outcome == "ok":
-        if action == "done":
-            for cid in completion_ids:  # one row, or one per 🧾 ticker
-                await store.void_completion(cid)
+        # A ✅'s puntos row (or one per 🧾 ticker), or the ⏭️/⏩ marker row of
+        # the skip/snooze being reversed.
+        for cid in completion_ids:
+            await store.void_completion(cid)
         for lid in clap_log_ids:  # retract every bonus punto the claps awarded
             await store.void_completion(lid)
         # The whoopsie itself is on the record: a zero-punto marker row (kind
@@ -1454,7 +1485,7 @@ async def _handle_undo(press: Press) -> None:
         })
         await _restore_anchor(channel, press.message_id, tid, before,
                               legacy_record=legacy_record)
-        if completion_ids or clap_log_ids:
+        if (action == "done" and completion_ids) or clap_log_ids:
             # The voided rows leave the 📜 Daily Log too — every tracked day is
             # redrawn, since the undo may reach back past the nightly roll.
             await refresh_all_daily_logs(before["guild_id"])
