@@ -102,6 +102,7 @@ from . import scoring
 from . import daily_log
 from . import backup
 from . import month_close
+from . import watch
 from . import scheduler
 from . import reactions
 from . import bombs
@@ -113,7 +114,7 @@ from . import admin
 # used by __main__.py) so `import joblin.bot as bot; bot.<name>` and the
 # smoke tests keep resolving exactly as before the split.
 _SUBMODULES = (core, helpers, claps, games, scoring, daily_log, backup,
-               month_close, scheduler, reactions, bombs, commands, listing,
+               month_close, watch, scheduler, reactions, bombs, commands, listing,
                admin)
 for _mod in _SUBMODULES:
     for _name in getattr(_mod, "__all__", ()):

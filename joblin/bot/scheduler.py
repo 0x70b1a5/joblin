@@ -28,6 +28,7 @@ from .games import sweep_games
 from .backup import run_daily_backups
 from .month_close import run_month_closes
 from .listing import run_hourly_listopen
+from .watch import run_watches
 
 
 
@@ -95,6 +96,8 @@ async def run_scheduler_tick() -> None:
     await run_hourly_listopen(now)
     await run_daily_backups(now, snap)
     await run_month_closes(now, snap)
+    # Ops alerts (WATCHES probes); deferred by quiet time.
+    await run_watches(now, snap)
 
 
 @tasks.loop(seconds=30)

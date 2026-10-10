@@ -5652,6 +5652,89 @@ async def test_reply_marks_touched() -> None:
             bot.bot._connection.user = None
 
 
+async def test_watches() -> None:
+    """WATCHES: a file watch alerts (with a ping) when its file appears or
+    changes, stays quiet while unchanged — across a restart too — defers during
+    quiet time, and posts an all-clear once it's gone. Custom kinds plug in via
+    @watch_kind; unknown kinds are skipped."""
+    import os
+    import joblin.bot as bot
+
+    with tempfile.TemporaryDirectory() as d:
+        _, st, ch = await _game_setup(d)
+        marker = pathlib.Path(d) / "job_failed.flag"
+        old_env = {k: os.environ.get(k) for k in ("WATCHES", "OWNER_IDS")}
+        os.environ["WATCHES"] = f"file:{marker}, nosuchkind:x"
+        os.environ["OWNER_IDS"] = "4242"
+        try:
+            async def tick(s):
+                await bot.run_watches(m.now_utc(), await s.snapshot())
+
+            def last():
+                return list(ch.msgs.values())[-1].content
+
+            await tick(st)
+            assert not ch.msgs, "no file (and an unknown kind), nothing posted"
+
+            marker.write_text("job failed: ```boom```")
+            await tick(st)
+            assert len(ch.msgs) == 1
+            assert "<@4242>" in last() and f"file:{marker}" in last() and "boom" in last()
+            assert last().count("```") == 2, "file can't break out of the code block"
+
+            await tick(st)
+            assert len(ch.msgs) == 1, "unchanged file is not re-alerted"
+
+            # A restart reloads the persisted signature — still no repeat.
+            st2 = Store(st.path, st.log_path)
+            st2.load()
+            bot.store = st2
+            await tick(st2)
+            assert len(ch.msgs) == 1, "no repeat alert after restart"
+
+            # A later failure rewrites the file → alert again; quiet time defers it.
+            marker.write_text("job failed again, differently")
+            async with st2.txn() as data:
+                data["configs"]["1"]["quiet"] = True
+            await tick(st2)
+            assert len(ch.msgs) == 1, "quiet time defers the alert"
+            async with st2.txn() as data:
+                data["configs"]["1"]["quiet"] = False
+            await tick(st2)
+            assert len(ch.msgs) == 2 and "differently" in last()
+
+            marker.unlink()
+            await tick(st2)
+            assert len(ch.msgs) == 3
+            assert "All clear" in last() and "<@" not in last()
+            assert not (await st2.snapshot()).get("watches"), "state cleared"
+            await tick(st2)
+            assert len(ch.msgs) == 3, "all-clear posts once"
+
+            # A custom kind rides the same engine.
+            state = {"bad": "disk 97% full"}
+
+            @bot.watch_kind("fake")
+            async def _probe_fake(arg):
+                return bot.Finding(sig=state["bad"], body=state["bad"]) if state["bad"] else None
+
+            try:
+                os.environ["WATCHES"] = "fake:disk"
+                await tick(st2)
+                assert len(ch.msgs) == 4 and "`fake:disk`" in last() and "97%" in last()
+                state["bad"] = None
+                await tick(st2)
+                assert len(ch.msgs) == 5 and "All clear" in last()
+            finally:
+                bot.WATCH_KINDS.pop("fake", None)
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 def main() -> None:
     test_emoji_key()
     test_time_parsing()
@@ -5760,6 +5843,7 @@ def main() -> None:
     asyncio.run(test_declutter_rolling_and_touched())
     asyncio.run(test_declutter_off())
     asyncio.run(test_reply_marks_touched())
+    asyncio.run(test_watches())
     print("✅ all smoke tests passed")
 
 
