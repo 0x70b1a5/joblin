@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -52,6 +53,23 @@ def _safe_link_label(text: str) -> str:
     unescaped ``]``, so a chore like ``buy milk [today]`` would otherwise break
     or truncate the jump link."""
     return text.replace("[", "\\[").replace("]", "\\]")
+
+
+# Markup that can't live inside a masked-link label: a URL (bare or masked) nests
+# a link in a link, and mentions / channels / timestamps / slash-command chips
+# render as raw ``<@…>`` text there — either way the row goes unclickable.
+_LINKY = re.compile(r"https?://|<(?:@|#|/|t:)")
+
+
+def _linked_head(text: str, link: Optional[str]) -> str:
+    """A list row's clickable title: the brief itself as the masked jump link, or
+    — when the brief carries its own links/mentions — the brief left as written
+    with a separate ``(jump)`` link after it, so both stay clickable."""
+    if not link:
+        return f"**{text}**"
+    if _LINKY.search(text):
+        return f"{text} ([jump]({link}))"
+    return f"[{_safe_link_label(text)}]({link})"
 
 
 def _chunk_rows(rows: list[str], *, budget: int = 1700) -> list[list[str]]:
@@ -285,8 +303,7 @@ def _collect_open(
             flag += f" {EMOJI_LIST} {len(p.get('ticks') or {})}/{len(t['items'])}"
         if t.get("puntobomb") and t.get("explodes_at"):
             flag += f" {EMOJI_BOMB} blows {discord_ts(from_iso(t['explodes_at']), 'R')}"
-        label = _safe_link_label(t["brief"])
-        head = f"[{label}]({link})" if link else f"**{label}**"
+        head = _linked_head(t["brief"], link)
         chores.append((due, f"• {head}{info}{flag} — ⏳ since {discord_ts(due, 'R')}"))
 
     # Live pitch-ins / do-em-ups: posted, not yet closed (a dormant recurring round
@@ -301,8 +318,7 @@ def _collect_open(
             if skip_shushed_games and g.get("no_nag"):
                 continue
             link = message_link(g["guild_id"], g.get("channel_id") or fallback_ch, g["message_id"])
-            label = _safe_link_label(doemup_title(g) if section == "doemups" else g["brief"])
-            head = f"[{label}]({link})" if link else f"**{label}**"
+            head = _linked_head(doemup_title(g) if section == "doemups" else g["brief"], link)
             when = g.get(key)
             sort_at = from_iso(when) if when else now_utc()
             closes = f" — closes {discord_ts(from_iso(when), 'R')}" if when else ""
@@ -704,6 +720,7 @@ __all__ = [
     "_local_hour_bounds",
     "_open_embeds",
     "_safe_link_label",
+    "_linked_head",
     "joblinhelp",
     "listopen",
     "listtasks",

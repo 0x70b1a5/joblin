@@ -3634,6 +3634,16 @@ async def test_listopen() -> None:
         assert f"/{pmsg.id}" in desc, "the live pitch-in links to its own post"
         assert not inter.response.ephemeral, "listopen posts publicly to the channel"
 
+    # A brief with its own link/mention can't be a masked-link label (it nests and
+    # goes dead) — it stays as written with a separate (jump) link after it.
+    link = "https://discord.com/channels/1/2/3"
+    assert bot._linked_head("Fill animal water", link) == f"[Fill animal water]({link})"
+    assert bot._linked_head("buy [milk]", link) == f"[buy \\[milk\\]]({link})"
+    for brief in ("Order from https://x.example/feed", "Help <@42> stack hay",
+                  "Ask in <#7>", "Ping <@&9>", "[Order](https://x.example) feed"):
+        assert bot._linked_head(brief, link) == f"{brief} ([jump]({link}))", brief
+    assert bot._linked_head("Help <@42>", None) == "**Help <@42>**"
+
 
 async def test_listtasks_pagination() -> None:
     """Many tasks paginate: /listtasks attaches a ◀/▶ pager whose buttons flip
