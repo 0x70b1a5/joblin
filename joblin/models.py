@@ -980,8 +980,10 @@ def next_due(rule: dict, tz: ZoneInfo, prev_due: dt.datetime,
 #                                  #   still lists it.
 # When a recurring game's round auto-closes (expiry/deadline/cap) it awards
 # puntos, rewrites its post as a result line, then goes dormant with ``next_due``
-# set; the scheduler re-posts a fresh round at that instant. A creator's 🏁 ends
-# the whole series instead. ``recurrence_of`` reads a game just like a task.
+# set; the scheduler re-posts a fresh round at that instant. A round with no
+# ``duration_secs`` runs until the next slot and the next round opens at that
+# same slot (back to back). A creator's 🏁 closes only the live round; the series
+# ends with /deletetask. ``recurrence_of`` reads a game just like a task.
 #
 # pitch-in dict schema
 # --------------------

@@ -171,6 +171,23 @@ def _game_next_round(game: dict, tz: ZoneInfo, now: dt.datetime) -> dt.datetime:
     return next_due(recurrence_of(game), tz, from_iso(game["created_at"]), now)
 
 
+def _game_round_after_close(game: dict, closes: Optional[str], tz: ZoneInfo,
+                            now: dt.datetime) -> dt.datetime:
+    """When the next round of a recurring game opens, given the round that just
+    closed and its scheduled close (``expires_at`` / ``deadline``).
+
+    A round with no fixed duration runs *until the next slot*, so the next
+    round opens at the first slot at or after that scheduled close: back to
+    back. Asking for the slot after ``now`` instead skipped the very slot the
+    round ran to, so a daily game was live one day and dark the next. Closing
+    early (🏁, a cap) waits for that same slot; after downtime the slot is
+    already past and the round reposts on the next tick. A fixed-duration
+    round keeps the gap its schedule implies: next slot after ``now``."""
+    if game.get("duration_secs") or not closes:
+        return _game_next_round(game, tz, now)
+    return _game_next_round(game, tz, from_iso(closes) - dt.timedelta(microseconds=1))
+
+
 def _arm_game_requeue_in(data: dict, event: dict, kind: str) -> list[int]:
     """Write, into the close txn's ``data``, how a 🔄 on this just-closed
     round's post reopens the game — the same table a chore's 🔄 uses, tagged
@@ -219,7 +236,7 @@ async def finalize_pitchin(pid: str, channel: discord.abc.Messageable) -> bool:
         data["game_messages"].pop(str(p.get("message_id")), None)
         stale_rq = _arm_game_requeue_in(data, event, "pitchin")
         if p.get("recurring"):
-            nxt = _game_next_round(p, tz, now)
+            nxt = _game_round_after_close(p, p.get("expires_at"), tz, now)
             p.update({"scorers": [], "ended": False, "message_id": None,
                       "expires_at": None, "next_due": to_iso(nxt)})
         else:
@@ -275,7 +292,7 @@ async def finalize_doemup(did: str, channel: discord.abc.Messageable) -> bool:
         data["game_messages"].pop(str(d.get("message_id")), None)
         stale_rq = _arm_game_requeue_in(data, event, "doemup")
         if d.get("recurring"):
-            nxt = _game_next_round(d, tz, now)
+            nxt = _game_round_after_close(d, d.get("deadline"), tz, now)
             d.update({"tallies": {}, "ended": False, "message_id": None,
                       "deadline": None, "next_due": to_iso(nxt)})
         else:
@@ -648,8 +665,8 @@ async def handle_pitchin_button(
         await finalize_pitchin(pid, interaction.channel)  # edits the post itself
         return
 
-    body = None
-    do_finalize = gone = no_nag = False
+    body = closes = None
+    do_finalize = gone = no_nag = backed_out = False
     async with store.txn() as data:
         p = data["pitchins"].get(pid)
         if not p or p.get("ended") or p.get("message_id") != interaction.message.id:
@@ -657,6 +674,7 @@ async def handle_pitchin_button(
         elif any(s["user_id"] == user.id for s in p.get("scorers", [])):
             pitchin_remove(p, user.id)  # toggle off — back out before the close
             body = render_pitchin(p)
+            backed_out, closes = True, p.get("expires_at")
         else:
             res = pitchin_add(p, user.id, user.display_name)
             if res["changed"]:
@@ -674,6 +692,11 @@ async def handle_pitchin_button(
         await finalize_pitchin(pid, interaction.channel)  # edits the post itself
     else:
         await press.edit_pressed(content=body, view=make_pitchin_view(pid, no_nag=no_nag))
+        if backed_out:
+            # A second ✅ in the same round backs out. Say so: a round can run a
+            # whole day, so "pitching in again" tomorrow may still be this round.
+            until = f" (this round runs until {discord_ts(from_iso(closes), 'f')})" if closes else ""
+            await press.whisper(f"You backed out of this pitch-in{until}. Tap ✅ again to rejoin.")
 
 
 async def _handle_pitchin_reaction(

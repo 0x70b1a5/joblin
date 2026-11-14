@@ -1403,6 +1403,58 @@ async def test_pitchin_recurring() -> None:
         assert "Deleted" in inter.response.content
 
 
+async def test_recurring_games_run_back_to_back() -> None:
+    """A recurring round with no fixed duration runs until the next slot, and the
+    next round opens AT that slot. The old math asked for the slot after the
+    close instant, which skipped it: a daily pitch-in was live one day and dark
+    the next ("can't check two days in a row"). Fixed-duration rounds still
+    wait for the next slot after the close."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        local = (now - dt.timedelta(minutes=2)).astimezone(tz).replace(second=0, microsecond=0)
+        slot = local.astimezone(dt.timezone.utc)  # today's slot, two minutes ago
+        rule = {"freq": "days", "interval_days": 1, "weekdays": [], "monthdays": [],
+                "time_of_day": local.strftime("%H:%M")}
+        long_ago = m.to_iso(now - dt.timedelta(days=3))
+
+        # Until-next-slot pitch-in whose round ran to today's slot.
+        pid, _ = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Livern it up", description=None,
+            expires_at=m.to_iso(slot), points_each=1, max_scorers=None, now=now,
+            recurrence=rule, duration_secs=None,
+        )
+        # Fixed 1h rounds on the same schedule, closed at the same instant.
+        pid2, _ = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Quick sweep", description=None,
+            expires_at=m.to_iso(slot), points_each=1, max_scorers=None, now=now,
+            recurrence=rule, duration_secs=3600,
+        )
+        # Until-next-slot do-em-up, same story through its deadline.
+        did, _ = await bot.post_doemup(
+            ch, guild_id=1, creator_id=1, brief="thistles", description=None,
+            points_each=1, deadline=m.to_iso(slot), point_limit=None, now=now,
+            recurrence=rule, duration_secs=None, verb="pull",
+        )
+        async with st.txn() as data:  # an established series, not one made today
+            for table, gid in (("pitchins", pid), ("pitchins", pid2), ("doemups", did)):
+                data[table][gid]["created_at"] = long_ago
+
+        await bot.sweep_games(m.now_utc(), await st.snapshot())
+        snap = await st.snapshot()
+        assert m.from_iso(snap["pitchins"][pid]["next_due"]) == slot, "pitch-in: next round at the slot it ran to"
+        assert m.from_iso(snap["doemups"][did]["next_due"]) == slot, "do-em-up: next round at the slot it ran to"
+        fixed = m.from_iso(snap["pitchins"][pid2]["next_due"])
+        assert fixed == slot + dt.timedelta(days=1), "fixed-duration rounds keep their gap"
+
+        # The next tick opens the new round straight away, running to tomorrow's slot.
+        await bot.sweep_games(m.now_utc(), await st.snapshot())
+        p = (await st.snapshot())["pitchins"][pid]
+        assert p["message_id"] is not None and p["next_due"] is None, "new round is live"
+        assert m.from_iso(p["expires_at"]) == slot + dt.timedelta(days=1)
+
+
 async def test_pitchin_at_deferred() -> None:
     """`/pitchin at:` defers the first round to its slot instead of posting now:
     a recurring one sits dormant until the scheduler opens it (then runs its fixed
@@ -5830,6 +5882,7 @@ def main() -> None:
     asyncio.run(test_quiet_blocks_scheduler())
     asyncio.run(test_doemup_limit_and_deadline())
     asyncio.run(test_pitchin_recurring())
+    asyncio.run(test_recurring_games_run_back_to_back())
     asyncio.run(test_pitchin_at_deferred())
     asyncio.run(test_doemup_recurring())
     asyncio.run(test_doemup_at_deferred())
